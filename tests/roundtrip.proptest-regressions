@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 2574b286a2c5d9523736a4d41bf27f822ea456f03ce33e4a1d15500fa24283b7 # shrinks to poly = Polynomial { ring: PolynomialRing { inner: RingInner { modulus: 32003, variables: ["x"] } }, terms: [Term { coeff: Felt(32002), mono: Monomial { exps: [0], deg: 0 } }] }

@@ -1,0 +1,28 @@
+[package]
+name = "sylvester"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/t0rsion/sylvester"
+description = "Signature-based Gröbner bases over finite prime fields, with an independently verified certificate for the classic F5 backend"
+readme = "README.md"
+exclude = ["/benchmarks", "/docs", "/.github", "/CHANGELOG.md", "/KNOWN_ISSUES.md", "/PLAN.md", "/AGENTS.md", "/CLAUDE.md", "/rust-toolchain.toml"]
+keywords = ["groebner", "algebra", "polynomial", "f5", "certificate"]
+categories = ["mathematics", "science", "algorithms"]
+
+[dependencies]
+rustc-hash = "2.0"
+smallvec = "1.11"
+rayon = { version = "1.10", optional = true }
+
+[dev-dependencies]
+criterion = "0.5"
+proptest = "1.5"
+
+[features]
+parallel = ["dep:rayon"]
+
+[[bench]]
+name = "groebner"
+harness = false
