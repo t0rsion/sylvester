@@ -817,7 +817,9 @@ fn the_engines_do_not_reach_into_the_verifier() {
     let mut checked = 0;
     for (path, text) in source_files(&root) {
         if std::path::Path::new(&path).starts_with(&verifier)
-            || allowed.iter().any(|tail| path.ends_with(tail))
+            || allowed
+                .iter()
+                .any(|tail| std::path::Path::new(&path).ends_with(tail))
         {
             continue;
         }
