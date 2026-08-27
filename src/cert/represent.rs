@@ -17,9 +17,8 @@ pub(crate) struct SpairEntry {
 /// Divide every input polynomial by the basis and keep the quotients.
 ///
 /// Entry i holds one cofactor per basis element, so that
-/// f_i = sum_j q_ij * g_j. A nonzero remainder is a defect of the
-/// candidate: it reports [`EmitterFault::InputHasRemainder`] and writes
-/// nothing.
+/// f_i = sum_j q_ij * g_j. A nonzero remainder is a defect of the claimed
+/// basis: it reports [`EmitterFault::InputHasRemainder`].
 ///
 /// The work holds to `budget`, which also carries the quotients of the
 /// entries already built.
@@ -47,9 +46,9 @@ pub(crate) fn membership_representations(
 /// Build one entry per pair whose leading monomials share a variable.
 ///
 /// A pair with coprime leading monomials carries no entry. The product
-/// criterion justifies the omission and the verifier re-enumerates the
-/// pairs itself. A nonzero remainder proves the basis is not a Gröbner
-/// basis: it reports [`EmitterFault::NotAGroebnerBasis`] with the pair.
+/// criterion justifies the omission, and the verifier re-enumerates the
+/// pairs. A nonzero remainder proves the basis is not a Gröbner basis: it
+/// reports [`EmitterFault::NotAGroebnerBasis`] with the pair.
 ///
 /// The work is quadratic in the size of the basis, and each entry holds one
 /// cofactor per basis element. It holds to `budget` at every pair.

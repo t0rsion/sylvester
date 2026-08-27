@@ -17,8 +17,8 @@ const WORKER_STACK_BYTES: usize = 1 << 20;
 
 const TIMEOUT: Duration = Duration::from_secs(3);
 
-/// Parse the runner input format: line 1 is the variable count, each
-/// further line is one polynomial as `;`-separated `coeff,e1,...,en` terms.
+/// The runner input format: line 1 is the variable count, each further
+/// line is one polynomial as `;`-separated `coeff,e1,...,en` terms.
 fn parse_syl(text: &str, modulus: u64) -> Ideal {
     let mut lines = text.lines().filter(|line| !line.trim().is_empty());
     let nvars: usize = lines

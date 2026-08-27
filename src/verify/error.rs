@@ -16,7 +16,7 @@ pub enum Syntax {
     Truncated,
     /// Bytes follow the closing brace.
     TrailingBytes,
-    /// Insignificant whitespace. The canonical encoding has none.
+    /// The canonical encoding has no insignificant whitespace.
     Whitespace,
     /// A key appears twice.
     DuplicateKey(String),
@@ -24,20 +24,20 @@ pub enum Syntax {
     UnknownKey(String),
     /// A key the schema requires is absent.
     MissingKey(&'static str),
-    /// A key appears before the key the schema puts first.
+    /// A key is not the one the schema puts at this position.
     KeyOutOfOrder {
         /// The key the decoder read.
         found: String,
         /// The key the schema puts at this position.
         expected: &'static str,
     },
-    /// An integer carries a leading zero.
+    /// The canonical encoding has no leading zero except `0`.
     LeadingZero,
-    /// A number carries a fraction part.
+    /// The canonical encoding has no fraction part.
     Float,
-    /// A number carries an exponent part.
+    /// The canonical encoding has no exponent part.
     Exponent,
-    /// A number carries a sign. Every value in the schema is positive or zero.
+    /// Every value in the schema is positive or zero.
     Sign,
     /// An integer does not fit 64 bits.
     IntegerOverflow {
@@ -147,7 +147,7 @@ impl fmt::Display for Location {
 /// A polynomial that the encoding rules reject.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PolyFault {
-    /// The coefficient is zero. The encoding drops zero terms.
+    /// The encoding drops zero terms.
     CoefficientZero {
         /// The index of the term.
         term: usize,
@@ -213,7 +213,7 @@ impl fmt::Display for PolyFault {
 /// A basis that is not the reduced basis shape the contract requires.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BasisFault {
-    /// The element is the zero polynomial.
+    /// A reduced basis has no zero element.
     Zero,
     /// The leading coefficient is not 1.
     NotMonic {
@@ -260,23 +260,316 @@ impl fmt::Display for BasisFault {
     }
 }
 
+/// A syntax fault in the v2 binary encoding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BinaryFault {
+    /// The first eight bytes are not the v2 magic.
+    Magic,
+    /// The magic names another format number or another revision.
+    Version {
+        /// The format number in the magic.
+        format: u8,
+        /// The revision in the magic.
+        revision: u8,
+    },
+    /// The bytes end inside an item, or an item crosses a section boundary.
+    Truncated,
+    /// The header size plus the six section lengths is not the byte count.
+    SectionLengths,
+    /// A section leaves bytes unread inside its own range.
+    SectionNotConsumed,
+    /// The canonical form has no trailing zero byte.
+    NonMinimalVarint,
+    /// A varint is longer than ten bytes.
+    VarintTooLong,
+    /// A varint does not fit 64 bits.
+    VarintOverflow,
+    /// A sum or a product of decoded integers does not fit 64 bits.
+    Overflow {
+        /// The name of the value.
+        what: &'static str,
+    },
+}
+
+impl fmt::Display for BinaryFault {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            BinaryFault::Magic => write!(f, "the bytes do not carry the v2 magic"),
+            BinaryFault::Version { format, revision } => write!(
+                f,
+                "the magic names format {format} revision {revision}, this verifier reads format 2 revision 0"
+            ),
+            BinaryFault::Truncated => write!(f, "the bytes end inside an item"),
+            BinaryFault::SectionLengths => {
+                write!(f, "the section lengths do not add up to the byte count")
+            }
+            BinaryFault::SectionNotConsumed => {
+                write!(f, "the section leaves bytes unread")
+            }
+            BinaryFault::NonMinimalVarint => write!(f, "a varint carries a trailing zero byte"),
+            BinaryFault::VarintTooLong => write!(f, "a varint is longer than ten bytes"),
+            BinaryFault::VarintOverflow => write!(f, "a varint does not fit 64 bits"),
+            BinaryFault::Overflow { what } => write!(f, "{what} does not fit 64 bits"),
+        }
+    }
+}
+
+/// A monomial pool entry that breaks a rule of the pool encoding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PoolFault {
+    /// The support holds more entries than the certificate has variables.
+    SupportTooLarge {
+        /// The support size the decoder read.
+        found: u64,
+        /// The number of variables the certificate declares.
+        max: usize,
+    },
+    /// The variable index is not below the variable count.
+    VariableOutOfRange {
+        /// The variable index.
+        variable: u64,
+    },
+    /// The variable index is not above the one before it.
+    VariableNotIncreasing,
+    /// The sparse form drops zero exponents.
+    ExponentZero,
+    /// The exponent is above the contract range.
+    ExponentTooLarge {
+        /// The exponent the decoder read.
+        exponent: u64,
+    },
+    /// The monomial is not above the monomial before it.
+    NotAscending,
+    /// No term, node, or step references the entry.
+    Unreferenced,
+}
+
+impl fmt::Display for PoolFault {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PoolFault::SupportTooLarge { found, max } => write!(
+                f,
+                "the support holds {found} entries, the certificate declares {max} variables"
+            ),
+            PoolFault::VariableOutOfRange { variable } => {
+                write!(f, "variable {variable} is not below the variable count")
+            }
+            PoolFault::VariableNotIncreasing => {
+                write!(f, "the variable index is not above the one before it")
+            }
+            PoolFault::ExponentZero => write!(f, "the exponent is zero"),
+            PoolFault::ExponentTooLarge { exponent } => {
+                write!(f, "the exponent is {exponent}, the maximum is 65535")
+            }
+            PoolFault::NotAscending => {
+                write!(f, "the monomial is not above the one before it")
+            }
+            PoolFault::Unreferenced => write!(f, "nothing references the entry"),
+        }
+    }
+}
+
+/// A trace node that breaks a rule of the trace encoding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NodeFault {
+    /// The node kind is not one the contract defines.
+    UnknownKind {
+        /// The kind the decoder read.
+        kind: u64,
+    },
+    /// Every node has at least one reference.
+    UseCountZero,
+    /// The declared use count is not the number of references the verifier
+    /// counted.
+    UseCountMismatch,
+    /// The source id is not below the node's own id.
+    SourceNotEarlier {
+        /// The source id.
+        src: u64,
+    },
+    /// The `Input` nodes are not first, or their indices do not increase.
+    InputOutOfOrder,
+    /// The `Mul` monomial is the identity monomial.
+    IdentityMultiplier,
+    /// The `Scale` scalar is 1, or it is not below the modulus.
+    ScalarOutOfRange {
+        /// The scalar the decoder read.
+        scalar: u64,
+    },
+    /// The `Comb` holds fewer than two steps.
+    CombTooShort {
+        /// The step count the decoder read.
+        steps: u64,
+    },
+}
+
+impl fmt::Display for NodeFault {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            NodeFault::UnknownKind { kind } => write!(f, "node kind {kind} is not defined"),
+            NodeFault::UseCountZero => write!(f, "the use count is zero"),
+            NodeFault::UseCountMismatch => {
+                write!(f, "the use count is not the number of references")
+            }
+            NodeFault::SourceNotEarlier { src } => {
+                write!(f, "source {src} is not below the node's own id")
+            }
+            NodeFault::InputOutOfOrder => {
+                write!(f, "the input nodes are not first in increasing input index")
+            }
+            NodeFault::IdentityMultiplier => {
+                write!(f, "the multiplier is the identity monomial")
+            }
+            NodeFault::ScalarOutOfRange { scalar } => {
+                write!(
+                    f,
+                    "the scalar is {scalar}, the range is 2 to the modulus minus 1"
+                )
+            }
+            NodeFault::CombTooShort { steps } => {
+                write!(f, "the combination holds {steps} steps, the minimum is 2")
+            }
+        }
+    }
+}
+
+/// The place a division trace holds in the certificate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DivisionSite {
+    /// The membership trace of an input polynomial.
+    Membership {
+        /// The index of the input polynomial.
+        input: usize,
+    },
+    /// The `Reduce` witness of a pair.
+    Pair {
+        /// The first index of the pair.
+        i: usize,
+        /// The second index of the pair.
+        j: usize,
+    },
+}
+
+impl fmt::Display for DivisionSite {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DivisionSite::Membership { input } => {
+                write!(f, "the membership trace of input polynomial {input}")
+            }
+            DivisionSite::Pair { i, j } => write!(f, "the reduce witness of pair ({i},{j})"),
+        }
+    }
+}
+
+/// A division trace that breaks a step rule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DivisionFault {
+    /// The step runs on a zero residual.
+    ResidualZero,
+    /// The step's multiple does not lead with the residual's leading
+    /// monomial.
+    LeadMismatch,
+    /// The residual after the last step is not zero.
+    NotZero,
+}
+
+impl fmt::Display for DivisionFault {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DivisionFault::ResidualZero => write!(f, "the residual is already zero"),
+            DivisionFault::LeadMismatch => write!(
+                f,
+                "the multiple does not lead with the leading monomial of the residual"
+            ),
+            DivisionFault::NotZero => write!(f, "the residual is not zero"),
+        }
+    }
+}
+
+/// A pair witness that breaks a rule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WitnessFault {
+    /// The witness kind is not one the contract defines.
+    UnknownKind {
+        /// The kind the decoder read.
+        kind: u64,
+    },
+    /// A `Coprime` witness names a pair whose leading monomials share a
+    /// variable.
+    NotCoprime,
+    /// A `Chain` witness names one of the two elements of its own pair.
+    ChainNamesPair {
+        /// The basis index the witness names.
+        k: usize,
+    },
+    /// The leading monomial of the named element does not divide the least
+    /// common multiple of the pair.
+    ChainNotDividing {
+        /// The basis index the witness names.
+        k: usize,
+    },
+    /// The witness lies on a cycle of the dependency graph.
+    Cycle,
+}
+
+impl fmt::Display for WitnessFault {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WitnessFault::UnknownKind { kind } => write!(f, "witness kind {kind} is not defined"),
+            WitnessFault::NotCoprime => {
+                write!(f, "the leading monomials share a variable")
+            }
+            WitnessFault::ChainNamesPair { k } => {
+                write!(f, "the chain names element {k} of its own pair")
+            }
+            WitnessFault::ChainNotDividing { k } => write!(
+                f,
+                "the leading monomial of element {k} does not divide the least common multiple"
+            ),
+            WitnessFault::Cycle => write!(f, "the witness lies on a dependency cycle"),
+        }
+    }
+}
+
 /// A resource cap the verifier enforces before it allocates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Cap {
-    /// The size of the certificate.
+    /// Certificate size in bytes.
     Bytes,
-    /// The number of polynomials in the certificate.
+    /// Polynomials in the input, the basis, and every cofactor.
     Polynomials,
-    /// The number of terms in one polynomial.
+    /// Terms in one polynomial.
     TermsPerPolynomial,
-    /// The number of terms in the certificate.
+    /// Terms in the certificate.
     TotalTerms,
-    /// The number of entries in the `origin`, `membership`, and `spairs`
-    /// arrays together. One entry holds one list of cofactors.
+    /// Entries in the `origin`, `membership`, and `spairs` arrays together.
+    /// One entry holds one list of cofactors.
     Entries,
-    /// The number of bytes the verifier arithmetic holds at once. One
-    /// prospective term costs `size_of::<Term>() + nvars * size_of::<Exp>()`.
+    /// Bytes of verifier arithmetic held at once. One prospective term
+    /// costs `size_of::<Term>() + nvars * size_of::<Exp>()`.
     IntermediateBytes,
+    /// Monomials in the v2 pool.
+    PoolMonomials,
+    /// Variable/exponent entries in the v2 pool.
+    PoolEntries,
+    /// Polynomials in the v2 input section.
+    InputPolynomials,
+    /// Nodes in the v2 trace.
+    Nodes,
+    /// Steps in one v2 combination node.
+    CombSteps,
+    /// Combination steps in the v2 trace.
+    TraceSteps,
+    /// Elements in the v2 basis.
+    BasisElements,
+    /// Pairs of v2 basis elements.
+    Pairs,
+    /// Steps in one v2 division trace.
+    DivisionSteps,
+    /// Division steps across the v2 certificate.
+    TotalDivisionSteps,
+    /// Work units charged by the v2 verifier.
+    WorkUnits,
 }
 
 impl fmt::Display for Cap {
@@ -288,6 +581,17 @@ impl fmt::Display for Cap {
             Cap::TotalTerms => write!(f, "total terms"),
             Cap::Entries => write!(f, "array entries"),
             Cap::IntermediateBytes => write!(f, "bytes of verifier arithmetic"),
+            Cap::PoolMonomials => write!(f, "monomials in the pool"),
+            Cap::PoolEntries => write!(f, "entries in the monomial pool"),
+            Cap::InputPolynomials => write!(f, "input polynomials"),
+            Cap::Nodes => write!(f, "trace nodes"),
+            Cap::CombSteps => write!(f, "steps in one combination"),
+            Cap::TraceSteps => write!(f, "combination steps in the trace"),
+            Cap::BasisElements => write!(f, "basis elements"),
+            Cap::Pairs => write!(f, "basis pairs"),
+            Cap::DivisionSteps => write!(f, "steps in one division trace"),
+            Cap::TotalDivisionSteps => write!(f, "division steps in the certificate"),
+            Cap::WorkUnits => write!(f, "verifier work units"),
         }
     }
 }
@@ -299,6 +603,55 @@ impl fmt::Display for Cap {
 /// reports an invalid certificate.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VerifyError {
+    /// The first byte selects no supported certificate format.
+    Format {
+        /// The first byte, or `None` for empty input.
+        first: Option<u8>,
+    },
+    /// The bytes are not a canonical v2 binary encoding.
+    MalformedBinary {
+        /// The binary syntax fault.
+        reason: BinaryFault,
+        /// The byte offset of the fault.
+        offset: usize,
+    },
+    /// A v2 monomial pool entry breaks an encoding rule.
+    Pool {
+        /// The pool entry index.
+        index: usize,
+        /// The rule the entry breaks.
+        fault: PoolFault,
+    },
+    /// A v2 trace node breaks an encoding rule.
+    Trace {
+        /// The node id.
+        node: usize,
+        /// The rule the node breaks.
+        fault: NodeFault,
+    },
+    /// A division trace does not reduce its polynomial to zero.
+    Division {
+        /// The trace's place in the certificate.
+        at: DivisionSite,
+        /// The failing step, or the step count for a nonzero residual.
+        step: usize,
+        /// The rule the trace breaks.
+        fault: DivisionFault,
+    },
+    /// A pair witness does not justify its pair.
+    Witness {
+        /// The first basis index.
+        i: usize,
+        /// The second basis index.
+        j: usize,
+        /// The rule the witness breaks.
+        fault: WitnessFault,
+    },
+    /// A monomial formed by the verifier exceeds the exponent bound.
+    ExponentOverflow {
+        /// The largest permitted exponent.
+        max: u64,
+    },
     /// The bytes are not a canonical encoding of the schema.
     Malformed {
         /// The syntax fault.
@@ -323,7 +676,7 @@ pub enum VerifyError {
         /// True if the modulus is in range and composite.
         composite: bool,
     },
-    /// The variable count is out of range.
+    /// The variable count is outside the contract range.
     Nvars {
         /// The variable count in the certificate.
         found: u64,
@@ -361,7 +714,7 @@ pub enum VerifyError {
         /// The second index of the pair.
         j: usize,
     },
-    /// Two S-pair entries name the same pair.
+    /// Entries contain no duplicate pair.
     SpairDuplicate {
         /// The first index of the pair.
         i: usize,
@@ -398,7 +751,7 @@ pub enum VerifyError {
         /// The index of the summand.
         summand: usize,
     },
-    /// An index does not address an element.
+    /// An index does not address an element of the collection it names.
     IndexOutOfRange {
         /// The name of the index.
         what: &'static str,
@@ -407,7 +760,8 @@ pub enum VerifyError {
         /// The number of elements the index must address.
         bound: usize,
     },
-    /// An array holds the wrong number of entries.
+    /// An array holds a different number of entries than the contract
+    /// requires.
     CountMismatch {
         /// The name of the array.
         what: &'static str,
@@ -432,6 +786,27 @@ pub enum VerifyError {
 impl fmt::Display for VerifyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            VerifyError::Format { first } => match first {
+                Some(byte) => write!(
+                    f,
+                    "the bytes start with {byte:#04x}, which selects no certificate format"
+                ),
+                None => f.write_str("the bytes are empty"),
+            },
+            VerifyError::MalformedBinary { reason, offset } => {
+                write!(f, "malformed certificate at byte {offset}: {reason}")
+            }
+            VerifyError::Pool { index, fault } => write!(f, "pool entry {index}: {fault}"),
+            VerifyError::Trace { node, fault } => write!(f, "trace node {node}: {fault}"),
+            VerifyError::Division { at, step, fault } => {
+                write!(f, "{at}, step {step}: {fault}")
+            }
+            VerifyError::Witness { i, j, fault } => {
+                write!(f, "the witness of pair ({i},{j}): {fault}")
+            }
+            VerifyError::ExponentOverflow { max } => {
+                write!(f, "a monomial passes the exponent bound {max}")
+            }
             VerifyError::Malformed { reason, offset } => {
                 write!(f, "malformed certificate at byte {offset}: {reason}")
             }

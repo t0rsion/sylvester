@@ -182,42 +182,18 @@ fn f5_reduce<T: Track>(
             since_check = 0;
             poll_deadline(deadline)?;
         }
-        let mut reduced = false;
         let lead_key = lt_p.mono.divisor_key();
-
-        for (index, g) in basis.iter().enumerate() {
-            let (deg, key) = leads[index];
-            if deg > lt_p.mono.deg || !key_divides(key, lead_key) {
-                continue;
-            }
-            let Some(lt_g) = g.poly.lt() else {
-                continue;
-            };
-            if !lt_g.mono.divides(&lt_p.mono) {
-                continue;
-            }
-            if !g.sig.shifted_is_below(&lt_p.mono, &lt_g.mono, &p.sig) {
-                continue;
-            }
-            let m = lt_p
-                .mono
-                .quotient(&lt_g.mono)
-                // divides() implies a quotient exists.
-                .expect("divides() implies quotient()");
-
-            let scale = lt_p.coeff.div(lt_g.coeff, modulus);
-            p.poly = p.poly.sub_scaled(&g.poly, scale, &m, modulus)?;
-            T::sub_scaled(&mut cofactors, basis_origins, index, scale, &m, modulus)?;
-            reduced = true;
-            break;
-        }
-
-        if !reduced {
-            let term = p
-                .poly
-                .pop_lt()
-                // lt_p was Some, so the polynomial is non-empty here.
-                .expect("polynomial should not be empty");
+        if !reduce_lead::<T>(
+            &mut p,
+            &mut cofactors,
+            &lt_p,
+            lead_key,
+            basis,
+            basis_origins,
+            &leads,
+            modulus,
+        )? {
+            let term = p.poly.pop_lt().expect("polynomial should not be empty");
             remainder.push(term);
         }
     }
@@ -225,6 +201,56 @@ fn f5_reduce<T: Track>(
     remainder.reverse();
     p.poly = Polynomial::from_sorted_terms(p.poly.ring().clone(), remainder);
     Ok((p, cofactors))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reduce_lead<T: Track>(
+    target: &mut LabeledPoly,
+    cofactors: &mut T::Origin,
+    lead: &Term,
+    lead_key: u64,
+    basis: &[LabeledPoly],
+    basis_origins: &[T::Origin],
+    leads: &[(u32, u64)],
+    modulus: u64,
+) -> Result<bool, ComputeError> {
+    for (index, reducer) in basis.iter().enumerate() {
+        let Some(mono) = reducer_multiple(reducer, leads[index], lead, lead_key, &target.sig)
+        else {
+            continue;
+        };
+        let reducer_lead = reducer.poly.lt().expect("a selected reducer is nonzero");
+        let scale = lead.coeff.div(reducer_lead.coeff, modulus);
+        target.poly = target
+            .poly
+            .sub_scaled(&reducer.poly, scale, &mono, modulus)?;
+        T::sub_scaled(cofactors, basis_origins, index, scale, &mono, modulus)?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn reducer_multiple(
+    reducer: &LabeledPoly,
+    lead: (u32, u64),
+    target: &Term,
+    target_key: u64,
+    signature: &Signature,
+) -> Option<Monomial> {
+    if lead.0 > target.mono.deg || !key_divides(lead.1, target_key) {
+        return None;
+    }
+    let reducer_lead = reducer.poly.lt()?;
+    if !reducer_lead.mono.divides(&target.mono) {
+        return None;
+    }
+    if !reducer
+        .sig
+        .shifted_is_below(&target.mono, &reducer_lead.mono, signature)
+    {
+        return None;
+    }
+    target.mono.quotient(&reducer_lead.mono)
 }
 
 fn spolynomial<T: Track>(
@@ -235,14 +261,10 @@ fn spolynomial<T: Track>(
     p: u64,
 ) -> Result<(Polynomial, T::Origin), ComputeError> {
     let (f, g) = (&basis[i], &basis[j]);
-    // f and g are non-zero when called from the F5 pipeline.
     let lt_f = f.poly.lt().expect("non-zero polynomial must have lt");
-    // f and g are non-zero when called from the F5 pipeline.
     let lt_g = g.poly.lt().expect("non-zero polynomial must have lt");
     let lcm = lt_f.mono.lcm(&lt_g.mono);
-    // lcm is a multiple of lm(f).
     let m_f = lcm.quotient(&lt_f.mono).expect("lm(f) divides lcm");
-    // lcm is a multiple of lm(g).
     let m_g = lcm.quotient(&lt_g.mono).expect("lm(g) divides lcm");
 
     let f_scaled = f.poly.scale_monomial(lt_g.coeff, &m_f, p)?;
@@ -340,9 +362,7 @@ fn push_pair(
         });
     }
 
-    // lcm is a multiple of lm_f.
     let m_f = lcm.quotient(lm_f).expect("lm_f divides lcm");
-    // lcm is a multiple of lm_g.
     let m_g = lcm.quotient(lm_g).expect("lm_g divides lcm");
 
     // A signature's degree is unrelated to the lcm's, so the lcm gate above
@@ -359,12 +379,12 @@ fn push_pair(
         Ordering::Greater => sig_f,
         Ordering::Less => sig_g,
         // Non-regular pair: the component signatures agree as module
-        // monomials (coefficients are not tracked, so this covers both the
-        // singular case, where the module leading terms cancel and the
-        // S-polynomial's true signature is strictly smaller, and the
-        // super-regular case). Either way the common value is not a trusted
-        // signature for the S-polynomial: keeping the pair could mislabel it
-        // and, on a zero reduction, record an inflated syzygy signature that
+        // monomials. Coefficients are not tracked, so this covers both
+        // the singular case (the module leading terms cancel and the
+        // S-polynomial's true signature is strictly smaller) and the
+        // super-regular case. The common value is not a trusted signature
+        // for the S-polynomial. Keeping the pair could mislabel it and,
+        // on a zero reduction, record an inflated syzygy signature that
         // later discards necessary pairs. The signature-based Buchberger
         // criterion only requires regular S-pairs, so rejecting is sound.
         Ordering::Equal => return Ok(()),
@@ -378,6 +398,160 @@ fn push_pair(
     Ok(())
 }
 
+struct ClassicState<T: Track> {
+    basis: Vec<LabeledPoly>,
+    origins: Vec<T::Origin>,
+    syzygy_rules: Vec<Signature>,
+    queue: BinaryHeap<std::cmp::Reverse<CriticalPair>>,
+    witness: T::Witness,
+    modulus: u64,
+    nvars: usize,
+    deadline: Option<Instant>,
+    max_memory_bytes: Option<usize>,
+}
+
+impl<T: Track> ClassicState<T> {
+    fn new(
+        ring: &PolynomialRing,
+        generators: &[Polynomial],
+        deadline: Option<Instant>,
+        max_memory_bytes: Option<usize>,
+    ) -> Self {
+        ClassicState {
+            basis: Vec::new(),
+            origins: Vec::new(),
+            syzygy_rules: Vec::new(),
+            queue: BinaryHeap::new(),
+            witness: T::witness(generators),
+            modulus: ring.modulus(),
+            nvars: ring.nvars(),
+            deadline,
+            max_memory_bytes,
+        }
+    }
+
+    fn check_limits(&self) -> Result<(), ComputeError> {
+        check_limits::<T>(
+            self.deadline,
+            self.max_memory_bytes,
+            &self.basis,
+            &self.origins,
+            &self.syzygy_rules,
+            self.queue.len(),
+            self.nvars,
+        )
+    }
+
+    fn seed(
+        &mut self,
+        ring: &PolynomialRing,
+        generator: &Polynomial,
+        index: usize,
+        count: usize,
+    ) -> Result<(), ComputeError> {
+        self.check_limits()?;
+        let signature = Signature {
+            index,
+            term: Monomial::one(self.nvars),
+        };
+        let mut origin = T::unit(ring, index, count);
+        T::monic(&mut origin, generator, self.modulus);
+        let labeled = LabeledPoly {
+            sig: signature,
+            poly: generator.make_monic(self.modulus),
+            index: self.basis.len(),
+        };
+        let (reduced, origin) = f5_reduce::<T>(
+            labeled,
+            origin,
+            &self.basis,
+            &self.origins,
+            self.modulus,
+            self.deadline,
+        )?;
+        if reduced.poly.is_zero() {
+            add_syzygy_rule(&mut self.syzygy_rules, reduced.sig);
+            return Ok(());
+        }
+        self.insert(reduced, origin)
+    }
+
+    fn insert(
+        &mut self,
+        mut labeled: LabeledPoly,
+        mut origin: T::Origin,
+    ) -> Result<(), ComputeError> {
+        T::monic(&mut origin, &labeled.poly, self.modulus);
+        labeled.poly = labeled.poly.make_monic(self.modulus);
+        debug_assert!(
+            T::holds(&origin, &self.witness, &labeled.poly, self.modulus),
+            "a basis element must equal the combination its cofactors name"
+        );
+        labeled.index = self.basis.len();
+        let new_index = labeled.index;
+        self.basis.push(labeled);
+        self.origins.push(origin);
+        for index in 0..new_index {
+            push_pair(
+                &mut self.queue,
+                &self.syzygy_rules,
+                &self.basis,
+                index,
+                new_index,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn drain_pairs(&mut self) -> Result<(), ComputeError> {
+        while let Some(std::cmp::Reverse(pair)) = self.queue.pop() {
+            self.process_pair(pair)?;
+        }
+        Ok(())
+    }
+
+    fn process_pair(&mut self, pair: CriticalPair) -> Result<(), ComputeError> {
+        self.check_limits()?;
+        if is_syzygy(&pair.sig, &self.syzygy_rules) {
+            return Ok(());
+        }
+        let (polynomial, origin) =
+            spolynomial::<T>(&self.basis, &self.origins, pair.i, pair.j, self.modulus)?;
+        if polynomial.is_zero() {
+            add_syzygy_rule(&mut self.syzygy_rules, pair.sig);
+            return Ok(());
+        }
+        let labeled = LabeledPoly {
+            sig: pair.sig,
+            poly: polynomial,
+            index: self.basis.len(),
+        };
+        let (reduced, origin) = f5_reduce::<T>(
+            labeled,
+            origin,
+            &self.basis,
+            &self.origins,
+            self.modulus,
+            self.deadline,
+        )?;
+        if reduced.poly.is_zero() {
+            add_syzygy_rule(&mut self.syzygy_rules, reduced.sig);
+            return Ok(());
+        }
+        if is_sig_redundant(&reduced, &self.basis) {
+            return Ok(());
+        }
+        self.insert(reduced, origin)
+    }
+
+    fn finish(self) -> (Vec<Polynomial>, Vec<T::Origin>) {
+        (
+            self.basis.into_iter().map(|labeled| labeled.poly).collect(),
+            self.origins,
+        )
+    }
+}
+
 fn solve_raw_with_limits<T: Track>(
     ring: &PolynomialRing,
     generators: &[Polynomial],
@@ -385,129 +559,14 @@ fn solve_raw_with_limits<T: Track>(
     max_memory_bytes: Option<usize>,
 ) -> Result<(Vec<Polynomial>, Vec<T::Origin>), ComputeError> {
     super::check_input_degrees(generators)?;
-    let modulus = ring.modulus();
-    let nvars = ring.nvars();
     let count = generators.len();
-    let witness = T::witness(generators);
-
-    let mut basis: Vec<LabeledPoly> = vec![];
-    let mut origins: Vec<T::Origin> = vec![];
-    let mut syzygy_rules: Vec<Signature> = vec![];
-    let mut queue: BinaryHeap<std::cmp::Reverse<CriticalPair>> = BinaryHeap::new();
-
-    for (k, generator) in generators.iter().enumerate() {
-        check_limits::<T>(
-            deadline,
-            max_memory_bytes,
-            &basis,
-            &origins,
-            &syzygy_rules,
-            queue.len(),
-            nvars,
-        )?;
-        let sig = Signature {
-            index: k,
-            term: Monomial::one(nvars),
-        };
-        let mut cofactors = T::unit(ring, k, count);
-        T::monic(&mut cofactors, generator, modulus);
-        let labeled = LabeledPoly {
-            sig,
-            poly: generator.make_monic(modulus),
-            index: basis.len(),
-        };
-        let (reduced, cofactors) =
-            f5_reduce::<T>(labeled, cofactors, &basis, &origins, modulus, deadline)?;
-        if reduced.poly.is_zero() {
-            add_syzygy_rule(&mut syzygy_rules, reduced.sig);
-            continue;
-        }
-
-        let mut reduced = reduced;
-        let mut cofactors = cofactors;
-        T::monic(&mut cofactors, &reduced.poly, modulus);
-        reduced.poly = reduced.poly.make_monic(modulus);
-        debug_assert!(
-            T::holds(&cofactors, &witness, &reduced.poly, modulus),
-            "a basis element must equal the combination its cofactors name"
-        );
-        reduced.index = basis.len();
-        let new_idx = reduced.index;
-        basis.push(reduced);
-        origins.push(cofactors);
-
-        for i in 0..new_idx {
-            push_pair(&mut queue, &syzygy_rules, &basis, i, new_idx)?;
-        }
-
-        while let Some(std::cmp::Reverse(pair)) = queue.pop() {
-            check_limits::<T>(
-                deadline,
-                max_memory_bytes,
-                &basis,
-                &origins,
-                &syzygy_rules,
-                queue.len(),
-                nvars,
-            )?;
-            if is_syzygy(&pair.sig, &syzygy_rules) {
-                continue;
-            }
-
-            let (s, cofactors) = spolynomial::<T>(&basis, &origins, pair.i, pair.j, modulus)?;
-            if s.is_zero() {
-                add_syzygy_rule(&mut syzygy_rules, pair.sig);
-                continue;
-            }
-
-            let labeled = LabeledPoly {
-                sig: pair.sig,
-                poly: s,
-                index: basis.len(),
-            };
-            let (reduced, cofactors) =
-                f5_reduce::<T>(labeled, cofactors, &basis, &origins, modulus, deadline)?;
-            if reduced.poly.is_zero() {
-                add_syzygy_rule(&mut syzygy_rules, reduced.sig);
-                continue;
-            }
-            if is_sig_redundant(&reduced, &basis) {
-                continue;
-            }
-
-            let mut reduced = reduced;
-            let mut cofactors = cofactors;
-            T::monic(&mut cofactors, &reduced.poly, modulus);
-            reduced.poly = reduced.poly.make_monic(modulus);
-            debug_assert!(
-                T::holds(&cofactors, &witness, &reduced.poly, modulus),
-                "a basis element must equal the combination its cofactors name"
-            );
-            reduced.index = basis.len();
-            let new_idx = reduced.index;
-            basis.push(reduced);
-            origins.push(cofactors);
-
-            for i in 0..new_idx {
-                push_pair(&mut queue, &syzygy_rules, &basis, i, new_idx)?;
-            }
-        }
+    let mut state = ClassicState::<T>::new(ring, generators, deadline, max_memory_bytes);
+    for (index, generator) in generators.iter().enumerate() {
+        state.seed(ring, generator, index, count)?;
+        state.drain_pairs()?;
     }
-
-    // An input that never enters the pair loop still spends time and
-    // memory. Without this check a run over a single generator, or over no
-    // generator at all, reports success past an exhausted budget.
-    check_limits::<T>(
-        deadline,
-        max_memory_bytes,
-        &basis,
-        &origins,
-        &syzygy_rules,
-        queue.len(),
-        nvars,
-    )?;
-
-    Ok((basis.into_iter().map(|lp| lp.poly).collect(), origins))
+    state.check_limits()?;
+    Ok(state.finish())
 }
 
 /// Run the classic backend under a deadline and a memory cap.
@@ -542,7 +601,6 @@ pub(super) fn solve_tracked(
 /// Run the classic backend with no budget.
 #[cfg(test)]
 pub(crate) fn solve(ring: &PolynomialRing, generators: &[Polynomial]) -> Vec<Polynomial> {
-    // unlimited runs should only fail on internal invariants.
     solve_checked(ring, generators, None, None).expect("a run without a budget cannot stop early")
 }
 
@@ -609,8 +667,7 @@ mod tests {
             index: 0,
         }];
 
-        // Same signature: the reduction is forbidden and the polynomial
-        // stays as it is.
+        // Same signature: the reduction is forbidden.
         let labeled = LabeledPoly {
             sig: Signature {
                 index: 0,
@@ -623,8 +680,7 @@ mod tests {
             f5_reduce::<Untracked>(labeled, (), &basis, &[()], 7, None).expect("the product fits");
         assert_eq!(out.poly.terms.len(), 1);
 
-        // Larger signature: the reduction runs and the polynomial goes to
-        // zero.
+        // Larger signature: the reduction is allowed.
         let labeled = LabeledPoly {
             sig: Signature {
                 index: 1,

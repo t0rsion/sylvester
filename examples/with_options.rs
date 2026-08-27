@@ -15,9 +15,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .timeout(Duration::from_secs(2))
         .memory_limit(512 << 20);
 
-    // `groebner_basis_certified` always runs the classic backend and does not
-    // read `backend`; the option here picks the backend for `groebner_basis`
-    // alone.
     let basis = ideal.groebner_basis(options.clone())?;
     println!("the basis holds {} polynomials", basis.len());
 

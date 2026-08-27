@@ -70,9 +70,9 @@ fn permutations(items: &mut Vec<usize>, start: usize, out: &mut Vec<Vec<usize>>)
     }
 }
 
-/// The two hand-verified counterexample systems, in every generator order:
-/// the incremental outer loop and POT signatures make backend behavior
-/// order-sensitive, the ideal (and thus the oracle) is not.
+/// The two hand-verified counterexample systems, in every generator order.
+/// The incremental outer loop and POT signatures make backend behavior
+/// order-sensitive. The ideal, and thus the oracle, is not.
 #[test]
 fn both_backends_match_the_oracle_in_every_generator_order() {
     let f2_system = vec![
@@ -91,7 +91,7 @@ fn both_backends_match_the_oracle_in_every_generator_order() {
 }
 
 /// Regression fixture for the rewritten criterion: reverting canonical-
-/// rewriter substitution to pair deletion makes the matrix backend return a
+/// rewriter substitution to pair deletion made the legacy batch engine return a
 /// basis of the wrong ideal on exactly this F_3 system (found by mutation
 /// testing; the degree-batch sweep below, seed 559).
 #[test]
@@ -107,10 +107,18 @@ fn pair_deletion_instead_of_rewriter_substitution_returns_the_wrong_ideal() {
 
 /// All monomials and binomials over the 10 monomials of degree <= 2 in three
 /// variables: 55 polynomials, all 55^3 ordered triples, exhaustively, F_2.
-/// The sweep takes minutes. Run it with `--ignored` on a release build.
+/// The sweep takes minutes. `cargo test --release --test differential -- --ignored` runs it.
 #[test]
 #[ignore = "exhaustive sweep; minutes of runtime, run with --ignored"]
 fn both_backends_match_the_oracle_on_every_f2_triple() {
+    let monos = degree_two_monomials();
+    assert_eq!(monos.len(), 10);
+    let polys = monomials_and_binomials(&monos);
+    assert_eq!(polys.len(), 55);
+    check_ordered_triples(&polys);
+}
+
+fn degree_two_monomials() -> Vec<Exps> {
     let mut monos: Vec<Exps> = Vec::new();
     for a in 0..=2u16 {
         for b in 0..=2u16 {
@@ -121,10 +129,12 @@ fn both_backends_match_the_oracle_on_every_f2_triple() {
             }
         }
     }
-    assert_eq!(monos.len(), 10);
+    monos
+}
 
+fn monomials_and_binomials(monos: &[Exps]) -> Vec<Poly> {
     let mut polys: Vec<Poly> = Vec::new();
-    for m in &monos {
+    for m in monos {
         polys.push(poly_from_terms(&[(1, m)], 2));
     }
     for i in 0..monos.len() {
@@ -132,8 +142,10 @@ fn both_backends_match_the_oracle_on_every_f2_triple() {
             polys.push(poly_from_terms(&[(1, &monos[i]), (1, &monos[j])], 2));
         }
     }
-    assert_eq!(polys.len(), 55);
+    polys
+}
 
+fn check_ordered_triples(polys: &[Poly]) {
     for i in 0..polys.len() {
         for j in 0..polys.len() {
             for k in 0..polys.len() {

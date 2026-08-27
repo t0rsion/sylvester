@@ -1,8 +1,5 @@
 //! Arithmetic for the verifier: prime field, monomials, polynomials.
 //!
-//! This module is self-contained. It duplicates the engine arithmetic on
-//! purpose, so an engine defect cannot reach the trusted side.
-//!
 //! Every operation that builds a polynomial takes a [`Budget`]. It charges
 //! the buffers it is about to reserve, plus the `live` terms the caller
 //! holds beside them, before it reserves anything. Every loop over the
@@ -59,13 +56,13 @@ pub(crate) fn is_prime(n: u64) -> bool {
         return false;
     }
     for small in WITNESSES {
-        if n % small == 0 {
+        if n.is_multiple_of(small) {
             return n == small;
         }
     }
     let mut d = n - 1;
     let mut shift = 0u32;
-    while d % 2 == 0 {
+    while d.is_multiple_of(2) {
         d /= 2;
         shift += 1;
     }
@@ -93,7 +90,6 @@ pub struct Mono {
 }
 
 impl Mono {
-    /// Build a monomial from an exponent vector.
     pub(crate) fn new(exps: Vec<Exp>) -> Self {
         let deg = exps.iter().map(|&e| e as u64).sum();
         Mono { exps, deg }
@@ -199,7 +195,6 @@ pub struct Term {
 }
 
 impl Term {
-    /// Build a term from a coefficient and a monomial.
     pub(crate) fn new(coeff: u64, mono: Mono) -> Self {
         Term { coeff, mono }
     }
@@ -230,7 +225,6 @@ impl Poly {
         Poly { terms }
     }
 
-    /// The zero polynomial.
     pub(crate) fn zero() -> Self {
         Poly { terms: Vec::new() }
     }
@@ -675,9 +669,9 @@ mod tests {
 
     #[test]
     fn a_sum_is_charged_for_its_arguments_as_well_as_for_itself() {
-        // The sum holds two terms, and the two arguments it copies from
-        // hold two each. A budget for four terms is not enough for the
-        // three buffers together.
+        // The sum holds two terms, and the two arguments still live hold
+        // two each. A budget for four terms is not enough for the three
+        // buffers together.
         let p = 7;
         let a = poly(&[(1, &[1, 0]), (1, &[0, 1])]);
         assert!(add(a.clone(), a.clone(), p, &mut budget_for(4), 0).is_err());

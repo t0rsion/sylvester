@@ -47,12 +47,10 @@ fn minimalize_leading_terms(mut basis: Vec<Polynomial>) -> Vec<Polynomial> {
         return basis;
     }
 
-    // zero polynomials were filtered, so lm exists for all entries.
     basis.sort_by(|a, b| a.lm().unwrap().cmp(b.lm().unwrap()));
     let mut minimal: Vec<Polynomial> = Vec::with_capacity(basis.len());
     for f in basis {
         let Some(lm_f) = f.lm() else { continue };
-        // minimal contains only non-zero polynomials.
         if minimal.iter().any(|g| g.lm().unwrap().divides(lm_f)) {
             continue;
         }
@@ -70,7 +68,6 @@ pub(crate) fn reduced_groebner_basis(
     ring: &PolynomialRing,
     basis: Vec<Polynomial>,
 ) -> Vec<Polynomial> {
-    // without a budget the only error paths cannot fire.
     reduced_groebner_basis_checked(ring, basis, None, None)
         .expect("interreduction without a budget cannot stop early")
 }
@@ -93,7 +90,6 @@ pub(crate) fn reduced_groebner_basis_checked(
 
     basis = minimalize_leading_terms(basis);
 
-    // Interreduce until stable.
     loop {
         check_limits(deadline, max_memory_bytes, &basis, &[], nvars)?;
         let mut next: Vec<Polynomial> = Vec::with_capacity(basis.len());
@@ -111,11 +107,9 @@ pub(crate) fn reduced_groebner_basis_checked(
         }
 
         next = minimalize_leading_terms(next);
-        // zero polynomials were filtered, so lm exists for all entries.
         next.sort_by(|a, b| b.lm().unwrap().cmp(a.lm().unwrap()));
 
         let mut current = basis;
-        // zero polynomials were filtered, so lm exists for all entries.
         current.sort_by(|a, b| b.lm().unwrap().cmp(a.lm().unwrap()));
 
         if next == current {
@@ -188,7 +182,7 @@ pub(crate) fn reduced_groebner_basis_tracked(
     }
 }
 
-/// Drop the elements whose leading monomial another element's divides,
+/// Drop the elements whose leading monomial another element divides,
 /// keeping the cofactors with them.
 ///
 /// This repeats the choices of [`minimalize_leading_terms`]: the same
@@ -198,12 +192,10 @@ fn minimalize_leading_terms_tracked(
 ) -> (Vec<Polynomial>, Vec<Origin>) {
     basis.retain(|(f, _)| !f.is_zero());
     if basis.len() > 1 {
-        // zero polynomials were filtered, so lm exists for all entries.
         basis.sort_by(|(a, _), (b, _)| a.lm().unwrap().cmp(b.lm().unwrap()));
         let mut minimal: Vec<(Polynomial, Origin)> = Vec::with_capacity(basis.len());
         for (f, cofactors) in basis {
             let Some(lm_f) = f.lm() else { continue };
-            // minimal holds only non-zero polynomials.
             if minimal.iter().any(|(g, _)| g.lm().unwrap().divides(lm_f)) {
                 continue;
             }
@@ -217,7 +209,6 @@ fn minimalize_leading_terms_tracked(
 /// Sort by leading monomial, largest first, keeping the cofactors aligned.
 fn sort_descending(basis: &mut Vec<Polynomial>, origins: &mut Vec<Origin>) {
     let mut pairs: Vec<(Polynomial, Origin)> = basis.drain(..).zip(origins.drain(..)).collect();
-    // zero polynomials were filtered, so lm exists for all entries.
     pairs.sort_by(|(a, _), (b, _)| b.lm().unwrap().cmp(a.lm().unwrap()));
     for (poly, cofactors) in pairs {
         basis.push(poly);
@@ -258,7 +249,6 @@ fn normal_form_excluding(
                 let m = lt_p
                     .mono
                     .quotient(&lt_g.mono)
-                    // divides() implies a quotient exists.
                     .expect("divides() implies quotient()");
                 let scale = lt_p.coeff.div(lt_g.coeff, modulus);
                 poly = poly.sub_scaled(g, scale, &m, modulus)?;
@@ -269,10 +259,7 @@ fn normal_form_excluding(
         }
 
         if !reduced {
-            let term = poly
-                .pop_lt()
-                // lt_p was Some, so poly is non-empty here.
-                .expect("polynomial should not be empty");
+            let term = poly.pop_lt().expect("lt_p came from this polynomial");
             remainder.push_term(term, modulus);
         }
     }

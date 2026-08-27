@@ -1,1 +1,10 @@
 target/
+**/__pycache__/
+**/.pytest_cache/
+**/.ruff_cache/
+/crates/
+/benchmarks/gb-comparison/outputs/
+/benchmarks/gb-comparison/runner/bin/
+/benchmarks/gb-comparison/runner/target-*/
+/benchmarks/gb-comparison/results.json
+/benchmarks/gb-comparison/records/2026-08-19-v0.2/results.json

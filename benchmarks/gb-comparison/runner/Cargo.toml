@@ -1,0 +1,11 @@
+[package]
+name = "sylv-runner"
+version = "0.2.0"
+edition = "2021"
+
+[dependencies]
+sylvester = { path = "../../.." }
+
+[profile.release]
+debug = false
+lto = "thin"

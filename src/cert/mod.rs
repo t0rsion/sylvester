@@ -1,14 +1,13 @@
 //! Certificate emission for the `sylv-gb-cert-v1` contract.
 //!
 //! This module is untrusted. It reads engine values and writes the
-//! canonical bytes of the `sylv-gb-cert-v1` contract. The verifier in
-//! [`crate::verify`] is the trust boundary: it reads those bytes back and
-//! accepts or rejects them. A wrong cofactor here becomes a rejection
-//! there, never a silent repair. This module never imports `crate::verify`,
-//! in its code or in its tests:
+//! canonical bytes of the contract. The verifier in [`crate::verify`] is
+//! the trust boundary: it reads those bytes back and accepts or rejects
+//! them. A wrong cofactor here becomes a rejection there. This module
+//! never imports `crate::verify`.
 //! [`crate::compute::groebner_basis_certified`] runs the emitter here, then
-//! hands the bytes to the verifier itself. `tests/certified.rs` runs the
-//! two sides against each other and enforces the import boundary.
+//! hands the bytes to the verifier. `tests/certified.rs` runs the two
+//! sides against each other and enforces the import boundary.
 //!
 //! The caller supplies the origin cofactors, which the engines track
 //! through reduction. The emitter generates the membership and S-pair
@@ -22,6 +21,7 @@ mod divide;
 mod json;
 pub(crate) mod origin;
 mod represent;
+pub(crate) mod v2;
 
 use std::time::Instant;
 
@@ -120,9 +120,8 @@ impl Budget {
     /// Charge a raw byte count to the budget, and return an error if the
     /// limit is passed.
     ///
-    /// [`assemble`] calls this with the length of the certificate bytes it
-    /// wrote, so the certificate itself, not just the data it came from,
-    /// counts against the limit.
+    /// [`assemble`] calls this with the certificate length. The budget charges
+    /// both the source data and the output bytes.
     pub(crate) fn hold_bytes(&mut self, bytes: usize) -> Result<(), ComputeError> {
         self.held = self.held.saturating_add(bytes);
         self.check_bytes(0)
@@ -132,6 +131,13 @@ impl Budget {
     pub(crate) fn held(&self) -> usize {
         self.held
     }
+
+    /// Take `bytes` off the data the emitter holds.
+    ///
+    /// A release of more than the budget holds leaves the budget at zero.
+    pub(crate) fn release_bytes(&mut self, bytes: usize) {
+        self.held = self.held.saturating_sub(bytes);
+    }
 }
 
 /// Write the certificate for one computation.
@@ -139,7 +145,7 @@ impl Budget {
 /// `input` is the input F, `basis` the claimed reduced basis G, and
 /// `origins` one cofactor list per basis element over the input, so that
 /// g_j = sum_i c_ji * f_i. The emitter generates the membership and S-pair
-/// cofactors itself.
+/// cofactors by division after interreduction.
 ///
 /// The certificate carries the basis in the order the contract requires:
 /// strictly descending by leading monomial. The origin entries move with
@@ -153,9 +159,9 @@ impl Budget {
 /// the index the caller passed; a division defect names the index the
 /// certificate carries, after the sort.
 ///
-/// The contract requires a monic basis, and an S-polynomial depends on the
-/// leading coefficients. The emitter writes the basis it is given; the
-/// verifier rejects one that is not monic.
+/// An S-polynomial depends on the leading coefficients, so the emitter
+/// writes the basis it is given. The verifier rejects a basis that is not
+/// monic.
 pub(crate) fn assemble(
     ring: &PolynomialRing,
     input: &[Polynomial],
@@ -165,17 +171,48 @@ pub(crate) fn assemble(
 ) -> Result<Vec<u8>, CertifyError> {
     let modulus = ring.modulus();
     let nvars = ring.nvars();
+    validate_parts(input, &basis, &origins, nvars)?;
+    hold_parts(input, &basis, &origins, budget)?;
+    let (basis, origins) = sort_basis(basis, origins);
+    let membership = membership_representations(input, &basis, modulus, budget)?;
+    let spairs = spair_representations(&basis, modulus, budget)?;
+    write_certificate(
+        modulus,
+        nvars,
+        input,
+        &basis,
+        &origins,
+        &membership,
+        &spairs,
+        budget,
+    )
+}
 
+fn validate_parts(
+    input: &[Polynomial],
+    basis: &[Polynomial],
+    origins: &[Origin],
+    nvars: usize,
+) -> Result<(), CertifyError> {
     if origins.len() != basis.len() {
         return Err(CertifyError::Emitter(EmitterFault::OriginCount {
             found: origins.len(),
             expected: basis.len(),
         }));
     }
+    validate_input(input, nvars)?;
+    validate_basis(basis, nvars)?;
+    validate_origins(origins, input.len(), nvars)
+}
 
+fn validate_input(input: &[Polynomial], nvars: usize) -> Result<(), CertifyError> {
     for (index, poly) in input.iter().enumerate() {
         check_width(poly, Place::Input(index), nvars)?;
     }
+    Ok(())
+}
+
+fn validate_basis(basis: &[Polynomial], nvars: usize) -> Result<(), CertifyError> {
     for (index, poly) in basis.iter().enumerate() {
         if poly.is_zero() {
             return Err(CertifyError::Emitter(EmitterFault::BasisElementZero {
@@ -184,12 +221,20 @@ pub(crate) fn assemble(
         }
         check_width(poly, Place::Basis(index), nvars)?;
     }
+    Ok(())
+}
+
+fn validate_origins(
+    origins: &[Origin],
+    input_len: usize,
+    nvars: usize,
+) -> Result<(), CertifyError> {
     for (basis_index, entry) in origins.iter().enumerate() {
-        if entry.len() != input.len() {
+        if entry.len() != input_len {
             return Err(CertifyError::Emitter(EmitterFault::OriginEntryCount {
                 basis: basis_index,
                 found: entry.len(),
-                expected: input.len(),
+                expected: input_len,
             }));
         }
         for (input_index, poly) in entry.iter().enumerate() {
@@ -200,42 +245,54 @@ pub(crate) fn assemble(
             check_width(poly, at, nvars)?;
         }
     }
+    Ok(())
+}
 
+fn hold_parts(
+    input: &[Polynomial],
+    basis: &[Polynomial],
+    origins: &[Origin],
+    budget: &mut Budget,
+) -> Result<(), CertifyError> {
     budget.check_deadline()?;
     budget.hold_polys(input)?;
-    budget.hold_polys(&basis)?;
-    for entry in &origins {
+    budget.hold_polys(basis)?;
+    for entry in origins {
         budget.hold_polys(entry)?;
     }
+    Ok(())
+}
 
-    // The basis and the origins move into the sort together, so the sort
-    // copies no cofactor list.
+fn sort_basis(basis: Vec<Polynomial>, origins: Vec<Origin>) -> (Vec<Polynomial>, Vec<Origin>) {
     let mut sorted: Vec<(Polynomial, Origin)> = basis.into_iter().zip(origins).collect();
     sorted.sort_by(|a, b| b.0.lm().cmp(&a.0.lm()));
-    let (sorted_basis, sorted_origins): (Vec<Polynomial>, Vec<Origin>) = sorted.into_iter().unzip();
+    sorted.into_iter().unzip()
+}
 
-    let membership = membership_representations(input, &sorted_basis, modulus, budget)?;
-    let spairs = spair_representations(&sorted_basis, modulus, budget)?;
-
+#[allow(clippy::too_many_arguments)]
+fn write_certificate(
+    modulus: u64,
+    nvars: usize,
+    input: &[Polynomial],
+    basis: &[Polynomial],
+    origins: &[Origin],
+    membership: &[Vec<Polynomial>],
+    spairs: &[represent::SpairEntry],
+    budget: &mut Budget,
+) -> Result<Vec<u8>, CertifyError> {
     budget.check_deadline()?;
-    // The writer charges the growing buffer per polynomial, so a
-    // certificate the limit forbids stops the writer instead of being
-    // built in full and rejected after the fact.
     let certificate = json::write(
         &json::Parts {
             modulus,
             nvars,
             input,
-            basis: &sorted_basis,
-            origin: &sorted_origins,
-            membership: &membership,
-            spairs: &spairs,
+            basis,
+            origin: origins,
+            membership,
+            spairs,
         },
         budget,
     )?;
-    // Charge the certificate its own byte length, not the estimate already
-    // held for the same data: that would double count. Charging nothing
-    // would let a limit too small for even an empty certificate pass.
     budget.hold_bytes(certificate.len())?;
     Ok(certificate)
 }

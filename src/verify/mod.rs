@@ -1,8 +1,9 @@
-//! Independent verifier for the `sylv-gb-cert-v1` certificate contract.
+//! Independent verifiers for the v1 JSON and v2 binary certificate
+//! contracts.
 //!
 //! The engines are untrusted candidate generators. This module is the trust
 //! boundary. It reads certificate bytes and returns a [`VerifiedGb`] only
-//! after every obligation of the `sylv-gb-cert-v1` contract holds.
+//! after every obligation of the selected contract holds.
 //!
 //! The module shares no code with the engines. It carries its own field
 //! arithmetic, its own monomial and polynomial types, its own grevlex
@@ -32,10 +33,16 @@ mod checks;
 mod error;
 mod json;
 mod limits;
+pub mod v2;
 
 pub use algebra::{Exp, Mono, Poly, Term};
-pub use error::{BasisFault, Cap, Location, PolyFault, Syntax, VerifyError};
+pub use error::{
+    BasisFault, BinaryFault, Cap, DivisionFault, DivisionSite, Location, NodeFault, PolyFault,
+    PoolFault, Syntax, VerifyError, WitnessFault,
+};
 pub use limits::Limits;
+
+const V1_FIRST: u8 = b'{';
 
 /// A basis that passed every obligation, with the data it was checked
 /// against.
@@ -88,11 +95,17 @@ pub fn verify(bytes: &[u8]) -> Result<VerifiedGb, VerifyError> {
 /// [`VerifyError::DeadlineExceeded`]. Neither value says the certificate is
 /// invalid.
 pub fn verify_with_limits(bytes: &[u8], limits: &Limits) -> Result<VerifiedGb, VerifyError> {
+    match bytes.first().copied() {
+        Some(V1_FIRST) => verify_v1(bytes, limits),
+        Some(v2::MAGIC_FIRST) => v2::verify_with_limits(bytes, limits),
+        first => Err(VerifyError::Format { first }),
+    }
+}
+
+fn verify_v1(bytes: &[u8], limits: &Limits) -> Result<VerifiedGb, VerifyError> {
     let outcome = json::decode(bytes, limits).and_then(|raw| checks::check(raw, limits));
-    // A deadline outranks acceptance and outranks every invalidity: work
-    // that ran past the deadline is work the caller did not buy, and the
-    // finding it produced does not stand. Exhaustion the verifier observed
-    // itself stands as it reported it, so a cap stays a cap.
+    // A passed deadline outranks acceptance and invalidity. A cap already
+    // reported remains a cap because the verifier stopped at that boundary.
     if !matches!(&outcome, Err(error) if error.is_exhaustion()) {
         limits.check_deadline()?;
     }
@@ -103,6 +116,28 @@ pub fn verify_with_limits(bytes: &[u8], limits: &Limits) -> Result<VerifiedGb, V
         input: accepted.input,
         basis: accepted.basis,
     })
+}
+
+/// Convert an accepted v2 value without sharing any verifier arithmetic.
+fn from_v2(accepted: v2::Accepted) -> VerifiedGb {
+    fn polys(raw: Vec<v2::DensePoly>) -> Vec<Poly> {
+        raw.into_iter()
+            .map(|terms| {
+                Poly::new(
+                    terms
+                        .into_iter()
+                        .map(|(coeff, exps)| Term::new(coeff, Mono::new(exps)))
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+    VerifiedGb {
+        modulus: accepted.modulus,
+        nvars: accepted.nvars,
+        input: polys(accepted.input),
+        basis: polys(accepted.basis),
+    }
 }
 
 #[cfg(test)]

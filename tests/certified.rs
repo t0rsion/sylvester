@@ -28,7 +28,7 @@ fn ring(modulus: u64, nvars: usize) -> PolynomialRing {
     PolynomialRing::prime_field(modulus, names).expect("the modulus is prime")
 }
 
-/// Build an ideal from terms given as (coefficient, exponents).
+/// An ideal from terms given as (coefficient, exponents).
 fn ideal_of(ring: &PolynomialRing, system: &[Vec<(i64, Vec<u16>)>]) -> Ideal {
     let generators: Vec<Polynomial> = system
         .iter()
@@ -75,7 +75,8 @@ fn certificate_basis(ring: &PolynomialRing, verified: &[Poly]) -> Vec<Polynomial
         .collect()
 }
 
-/// Certify one system and check every claim the API makes about it.
+/// Certifies one system: the verifier accepts the bytes, and the basis
+/// matches the raw classic output.
 fn round_trip(label: &str, ideal: &Ideal) -> Vec<u8> {
     let ring = ideal.ring();
     let certified = ideal
@@ -247,7 +248,6 @@ fn the_zero_ideal_passes_certification() {
     assert!(verified.basis().is_empty());
     assert_eq!(verified.nvars(), 2);
 
-    // A ring with no variables names none in the certificate either.
     let field = PolynomialRing::prime_field(7, Vec::<String>::new()).expect("7 is prime");
     let bytes = round_trip("no variables", &ideal_of(&field, &[Vec::new()]));
     let verified = verify(&bytes).expect("the certificate holds");
@@ -398,7 +398,7 @@ fn a_pair_past_the_degree_limit_stops_certification() {
 
 #[test]
 fn an_exhausted_timeout_stops_a_run_with_no_pairs() {
-    // A single generator makes no critical pair, and no generator makes no
+    // A single generator makes no critical pair. An empty list makes no
     // basis. Neither run may report success past an exhausted budget.
     let ring = ring(32003, 2);
     let single = vec![vec![(1i64, vec![2u16, 0]), (3, vec![0, 1])]];
@@ -413,17 +413,20 @@ fn an_exhausted_timeout_stops_a_run_with_no_pairs() {
 }
 
 #[test]
-fn certification_ignores_the_backend_option() {
-    // This release certifies the classic backend alone, so the matrix
-    // option changes nothing about the value.
+fn the_certificate_format_follows_the_backend() {
     let ideal = ideal_of(&ring(3, 3), &f3_system());
     let classic_run = ideal
         .groebner_basis_certified(classic())
         .expect("the certificate holds");
-    let matrix_run = ideal
-        .groebner_basis_certified(ComputeOptions::new().backend(Backend::Matrix))
+    assert_eq!(classic_run.certificate()[0], b'{');
+    let f4_run = ideal
+        .groebner_basis_certified(ComputeOptions::new().backend(Backend::F4))
         .expect("the certificate holds");
-    assert_eq!(classic_run.certificate(), matrix_run.certificate());
+    assert_eq!(&f4_run.certificate()[..8], b"SYLVGB\x02\x00");
+    assert_eq!(
+        canonical_set(classic_run.basis(), 3),
+        canonical_set(f4_run.basis(), 3)
+    );
 }
 
 #[test]
@@ -459,9 +462,8 @@ fn the_uncertified_path_still_solves_the_counterexample_systems() {
 
 #[test]
 fn the_certified_basis_is_the_basis_the_certificate_carries() {
-    // The value the caller reads comes from the accepted bytes. Decoding
-    // the certificate with the verifier must give back the same basis, in
-    // the same order.
+    // The value the caller reads is decoded from the accepted bytes, in the
+    // same order.
     let ring = ring(32003, 4);
     let certified = ideal_of(&ring, &cyclic_4())
         .groebner_basis_certified(classic())
@@ -632,18 +634,25 @@ fn the_emitter_shares_no_code_with_the_verifier() {
     // verifier as their oracle.
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cert");
     let mut checked = 0;
-    for entry in std::fs::read_dir(&root).expect("the emitter directory is readable") {
-        let entry = entry.expect("the directory entry is readable").path();
-        let text = std::fs::read_to_string(&entry).expect("the file is readable");
-        assert!(
-            !text.contains("use crate::verify") && !text.contains("use super::verify"),
-            "{} imports the verifier",
-            entry.display()
-        );
-        checked += 1;
+    let mut pending = vec![root];
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(&directory).expect("the emitter directory is readable") {
+            let entry = entry.expect("the directory entry is readable").path();
+            if entry.is_dir() {
+                pending.push(entry);
+                continue;
+            }
+            let text = std::fs::read_to_string(&entry).expect("the file is readable");
+            assert!(
+                !text.contains("use crate::verify") && !text.contains("use super::verify"),
+                "{} imports the verifier",
+                entry.display()
+            );
+            checked += 1;
+        }
     }
     assert!(
-        checked >= 5,
+        checked >= 10,
         "expected the emitter module tree, found {checked} files"
     );
 }

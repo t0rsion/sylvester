@@ -6,11 +6,8 @@
 
 use sylvester::{Backend, ComputeError, ComputeOptions, PolynomialRing};
 
-const LIMIT: ComputeError = ComputeError::DegreeLimit { limit: 65535 };
-
-fn backends() -> [Backend; 2] {
-    [Backend::Classic, Backend::Matrix]
-}
+const DEGREE_LIMIT: ComputeError = ComputeError::DegreeLimit { limit: 65535 };
+const EXPONENT_LIMIT: ComputeError = ComputeError::ExponentLimit { limit: 65535 };
 
 /// A generator of total degree 131070, which no product of the engines
 /// could hold. The ring accepts it because each exponent fits a `u16` on
@@ -27,16 +24,17 @@ fn an_input_generator_past_the_limit_is_a_typed_error() {
     assert_eq!(g.degree(), Some(131070));
 
     let ideal = ring.ideal([f, g]).expect("one ring");
-    for backend in backends() {
-        assert_eq!(
-            ideal.groebner_basis(ComputeOptions::new().backend(backend)),
-            Err(LIMIT),
-            "backend {backend:?}"
-        );
-    }
+    assert_eq!(
+        ideal.groebner_basis(ComputeOptions::new().backend(Backend::Classic)),
+        Err(DEGREE_LIMIT)
+    );
+    assert_eq!(
+        ideal.groebner_basis(ComputeOptions::new().backend(Backend::F4)),
+        Err(EXPONENT_LIMIT)
+    );
     assert_eq!(
         ideal.groebner_basis_certified(ComputeOptions::new()),
-        Err(sylvester::CertifyError::Engine(LIMIT))
+        Err(sylvester::CertifyError::Engine(EXPONENT_LIMIT))
     );
 }
 
@@ -58,15 +56,19 @@ fn a_signature_product_past_the_limit_is_a_typed_error() {
     }
 
     let ideal = ring.ideal([f0, f1, f2]).expect("one ring");
-    for backend in backends() {
-        assert_eq!(
-            ideal.groebner_basis(ComputeOptions::new().backend(backend)),
-            Err(LIMIT),
-            "backend {backend:?}"
-        );
-    }
     assert_eq!(
-        ideal.groebner_basis_certified(ComputeOptions::new()),
-        Err(sylvester::CertifyError::Engine(LIMIT))
+        ideal.groebner_basis(ComputeOptions::new().backend(Backend::Classic)),
+        Err(DEGREE_LIMIT)
     );
+    let f4 = ideal
+        .groebner_basis(ComputeOptions::new().backend(Backend::F4))
+        .expect("F4 has no signature product and the exponent path fits");
+    assert_eq!(f4.len(), 1);
+    assert_eq!(f4[0].degree(), Some(0));
+
+    let certified = ideal
+        .groebner_basis_certified(ComputeOptions::new())
+        .expect("the default F4 path certifies the unit basis");
+    assert_eq!(certified.basis().len(), 1);
+    assert_eq!(certified.basis()[0].degree(), Some(0));
 }

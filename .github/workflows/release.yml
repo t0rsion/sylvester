@@ -49,7 +49,7 @@ jobs:
           mkdir -p "$PKG_DIR"
           tar xzf target/package/sylvester-*.crate -C "$PKG_DIR"
           cd "$PKG_DIR"/sylvester-*
-          cargo +1.92.0 test
+          cargo +1.92.0 test --locked
 
   crates-io:
     # Publication is irreversible, so every fallible build and test job runs

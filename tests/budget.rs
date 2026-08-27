@@ -1,4 +1,4 @@
-//! What the memory limit and the deadline actually stop.
+//! What the memory limit and the deadline stop.
 
 use sylvester::{Backend, ComputeError, ComputeOptions, Ideal, PolynomialRing};
 
@@ -52,7 +52,7 @@ fn smallest_limit_that_finishes(ideal: &Ideal, backend: Backend) -> usize {
 /// there.
 #[test]
 fn a_wide_ring_charges_the_heap_exponents() {
-    for backend in [Backend::Classic, Backend::Matrix] {
+    for backend in [Backend::Classic, Backend::F4] {
         let inline = smallest_limit_that_finishes(&padded_ideal(11), backend);
         let spilled = smallest_limit_that_finishes(&padded_ideal(12), backend);
         assert!(
@@ -64,7 +64,7 @@ fn a_wide_ring_charges_the_heap_exponents() {
 
 /// A limit of zero bytes stops every run over a generator, on either
 /// backend. An empty generator list holds nothing, so it finishes under
-/// any limit; that case is checked separately below.
+/// any limit.
 #[test]
 fn a_zero_memory_limit_stops_every_run() {
     let ring = PolynomialRing::prime_field(7, ["x", "y"]).expect("7 is prime");
@@ -78,7 +78,7 @@ fn a_zero_memory_limit_stops_every_run() {
     ];
     for generators in inputs {
         let ideal = ring.ideal(generators.clone()).expect("one ring");
-        for backend in [Backend::Classic, Backend::Matrix] {
+        for backend in [Backend::Classic, Backend::F4] {
             assert_eq!(
                 ideal.groebner_basis(ComputeOptions::new().backend(backend).memory_limit(0)),
                 Err(ComputeError::MemoryLimitExceeded),
@@ -89,7 +89,7 @@ fn a_zero_memory_limit_stops_every_run() {
     }
 
     let empty = ring.ideal(Vec::new()).expect("one ring");
-    for backend in [Backend::Classic, Backend::Matrix] {
+    for backend in [Backend::Classic, Backend::F4] {
         assert!(
             empty
                 .groebner_basis(ComputeOptions::new().backend(backend).memory_limit(0))

@@ -1,17 +1,17 @@
 //! Cofactor vectors over the canonical input.
 //!
-//! An origin holds one cofactor per input polynomial. For a value `g` the
-//! engines carry, the origin `c` states the identity
+//! An origin holds one cofactor per input polynomial. For a value `g` that
+//! the engines carry, the origin `c` states the identity
 //!
 //! ```text
 //! g = sum_i c_i * f_i
 //! ```
 //!
-//! over the canonicalized input F. The engines keep the identity through
-//! every step they take, so [`super::assemble`] writes origins that the
-//! engine derived, never origins recomputed after the fact. Every function
-//! here updates an origin by the same scalar and monomial the polynomial
-//! step uses.
+//! over the canonical input F. The engines keep the identity through every
+//! step they take, so [`super::assemble`] writes origins that the engine
+//! derived, never origins recomputed after the fact. Every function here
+//! updates an origin by the same scalar and monomial the polynomial step
+//! uses.
 
 use crate::poly::{ExponentOverflow, Monomial, Polynomial};
 use crate::ring::PolynomialRing;

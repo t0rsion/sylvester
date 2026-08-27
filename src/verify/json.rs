@@ -1,11 +1,11 @@
 //! Strict decoder for the canonical certificate encoding.
 //!
 //! The decoder accepts one shape only: the object the contract lists, with
-//! its keys in the contract order and no insignificant whitespace. It reads
-//! bytes and returns typed values. It checks the resource caps while it
-//! reads, so a rejected certificate never allocates past a cap. Every loop
-//! that runs over the bytes polls the deadline every `WORK_STRIDE` steps,
-//! so no single field can be read past it.
+//! its keys in the contract order and no insignificant whitespace. It checks
+//! the resource caps while it reads, so a rejected certificate never
+//! allocates past a cap. Every loop that runs over the bytes polls the
+//! deadline every `WORK_STRIDE` steps, so no single field can be read past
+//! it.
 
 use super::algebra::{Mono, Poly, Term};
 use super::error::{Cap, Syntax, VerifyError};
@@ -86,6 +86,24 @@ struct Decoder<'a> {
     polys: usize,
     terms: usize,
     entries: usize,
+}
+
+struct Header {
+    schema: String,
+    order: String,
+    modulus: u64,
+    nvars: u64,
+}
+
+struct Polynomials {
+    input: Vec<Poly>,
+    basis: Vec<Poly>,
+}
+
+struct Witnesses {
+    origin: Vec<Vec<Poly>>,
+    membership: Vec<Vec<Poly>>,
+    spairs: Vec<RawSpair>,
 }
 
 fn is_whitespace(byte: u8) -> bool {
@@ -343,65 +361,104 @@ impl Decoder<'_> {
 
     fn certificate(&mut self) -> Decoded<RawCert> {
         self.expect(b'{', "an object")?;
+        let header = self.certificate_header()?;
+        let polys = self.certificate_polynomials()?;
+        let witnesses = self.certificate_witnesses()?;
+        self.finish_certificate()?;
+        Ok(RawCert {
+            schema: header.schema,
+            order: header.order,
+            modulus: header.modulus,
+            nvars: header.nvars,
+            input: polys.input,
+            basis: polys.basis,
+            origin: witnesses.origin,
+            membership: witnesses.membership,
+            spairs: witnesses.spairs,
+        })
+    }
+
+    fn certificate_header(&mut self) -> Decoded<Header> {
+        let (schema, order) = self.certificate_names()?;
+        let (modulus, nvars) = self.certificate_ring()?;
+        Ok(Header {
+            schema,
+            order,
+            modulus,
+            nvars,
+        })
+    }
+
+    fn certificate_names(&mut self) -> Decoded<(String, String)> {
         self.key(0)?;
         let schema = self.string()?;
         self.separator(1)?;
         self.key(1)?;
         let order = self.string()?;
+        Ok((schema, order))
+    }
+
+    fn certificate_ring(&mut self) -> Decoded<(u64, u64)> {
         self.separator(2)?;
         self.key(2)?;
         let modulus = self.uint("the modulus", u64::MAX)?;
         self.separator(3)?;
         self.key(3)?;
         let nvars = self.uint("nvars", u64::MAX)?;
-        // The width check runs here, before any polynomial is decoded,
-        // rather than waiting for `checks::check` to run it once the whole
-        // certificate, however large, is already in memory.
         if nvars > MAX_NVARS {
             return Err(VerifyError::Nvars {
                 found: nvars,
                 max: MAX_NVARS,
             });
         }
+        Ok((modulus, nvars))
+    }
+
+    fn certificate_polynomials(&mut self) -> Decoded<Polynomials> {
         self.separator(4)?;
         self.key(4)?;
         let input = self.poly_array()?;
         self.separator(5)?;
         self.key(5)?;
         let basis = self.poly_array()?;
-        self.separator(6)?;
-        self.key(6)?;
-        let origin = self.array(|d| {
-            d.entry()?;
-            d.poly_array()
-        })?;
-        self.separator(7)?;
-        self.key(7)?;
-        let membership = self.array(|d| {
-            d.entry()?;
-            d.poly_array()
-        })?;
-        self.separator(8)?;
-        self.key(8)?;
-        let spairs = self.array(|d| {
-            d.entry()?;
-            d.spair()
-        })?;
-        self.expect(b'}', "the end of the object")?;
-        if self.pos != self.bytes.len() {
-            return self.fail(Syntax::TrailingBytes);
-        }
-        Ok(RawCert {
-            schema,
-            order,
-            modulus,
-            nvars,
-            input,
-            basis,
+        Ok(Polynomials { input, basis })
+    }
+
+    fn certificate_witnesses(&mut self) -> Decoded<Witnesses> {
+        let origin = self.cofactor_matrix(6)?;
+        let membership = self.cofactor_matrix(7)?;
+        let spairs = self.spair_array()?;
+        Ok(Witnesses {
             origin,
             membership,
             spairs,
         })
+    }
+
+    fn cofactor_matrix(&mut self, slot: usize) -> Decoded<Vec<Vec<Poly>>> {
+        self.separator(slot)?;
+        self.key(slot)?;
+        self.array(|decoder| {
+            decoder.entry()?;
+            decoder.poly_array()
+        })
+    }
+
+    fn spair_array(&mut self) -> Decoded<Vec<RawSpair>> {
+        self.separator(8)?;
+        self.key(8)?;
+        self.array(|decoder| {
+            decoder.entry()?;
+            decoder.spair()
+        })
+    }
+
+    fn finish_certificate(&mut self) -> Decoded<()> {
+        self.expect(b'}', "the end of the object")?;
+        if self.pos != self.bytes.len() {
+            return self.fail(Syntax::TrailingBytes);
+        }
+        Ok(())
     }
 }
 

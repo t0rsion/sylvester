@@ -4,14 +4,13 @@ use std::cmp::Ordering;
 
 use crate::poly::Monomial;
 
-/// The module monomial that labels one polynomial.
+/// The module monomial that labels one polynomial, ordered position over term.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Signature {
     pub(crate) index: usize,
     pub(crate) term: Monomial,
 }
 
-// Order: POT (Position Over Term). Compare the index first, then the term.
 impl Ord for Signature {
     fn cmp(&self, other: &Self) -> Ordering {
         match self.index.cmp(&other.index) {
@@ -68,7 +67,7 @@ pub(super) fn add_syzygy_rule(rules: &mut Vec<Signature>, sig: Signature) {
 
 /// Report whether some basis element `g` makes `p` sig-redundant.
 ///
-/// True when `sig(g) | sig(p)` and `lm(g) | lm(p)`, the two quotients
+/// True when `sig(g) | sig(p)` and `lm(g) | lm(p)`, with the two quotients
 /// independent (Arri-Perry; Eder-Faugère survey). Call this only on a
 /// regular normal form: the completeness of the drop rests on `p` having
 /// finished `f5_reduce`. With a = sig(p)/sig(g) and b = lm(p)/lm(g), a > b
@@ -84,7 +83,7 @@ pub(super) fn add_syzygy_rule(rules: &mut Vec<Signature>, sig: Signature) {
 /// indices keep the basis and the pair queues finite. Accepting the
 /// equal-quotient (singular) case would instead create equal-lead,
 /// equal-signature duplicates that multiply without bound. Every untouched
-/// reducer row m*g of the matrix backend falls in that singular class.
+/// reducer multiple m*g falls in that singular class.
 pub(super) fn is_sig_redundant(p: &LabeledPoly, basis: &[LabeledPoly]) -> bool {
     let Some(lm_p) = p.poly.lm() else {
         return false;

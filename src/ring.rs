@@ -12,15 +12,14 @@ use field::{Felt, is_prime};
 /// The largest number of variables a ring accepts.
 ///
 /// The certificate contract caps `nvars` at 256, so a ring past that bound
-/// could never certify. `PolynomialRing::prime_field` shares the cap.
+/// could never certify.
 const MAX_VARIABLES: usize = 256;
 
 /// The largest modulus a ring accepts.
 ///
 /// The certificate contract caps `p` at 2^31 - 1, so a ring past that bound
-/// could never certify. `PolynomialRing::prime_field` shares the cap. Below
-/// this bound the product of two representatives fits a `u64`, so field
-/// multiplication needs no wider integer.
+/// could never certify. Below this bound the product of two representatives
+/// fits a `u64`, so field multiplication needs no wider integer.
 const MAX_MODULUS: u64 = (1 << 31) - 1;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -32,17 +31,14 @@ struct RingInner {
 /// A polynomial ring over a prime field, under the grevlex order.
 ///
 /// The ring owns the modulus, the variable names, and the variable order.
-/// Every polynomial is built through the ring, so every polynomial stores
-/// its ring, holds reduced coefficients, and holds one exponent per
-/// variable. Cloning a ring shares one allocation.
+/// The first variable is the largest. Every polynomial is built through
+/// the ring. Each polynomial stores its ring, holds reduced coefficients,
+/// and holds one exponent per variable. Cloning a ring shares one
+/// allocation.
 ///
 /// Two rings are equal when they name the same prime and the same
-/// variables in the same order. Two separate constructions of one ring are
-/// therefore equal, and polynomials of either belong to both.
-///
-/// The monomial order is grevlex over the variable order given at
-/// construction, with the first variable the largest. Certificates name it
-/// `grevlex-v1`. There is no other order in this release.
+/// variables in the same order. Polynomials of either construction
+/// belong to both.
 ///
 /// ```
 /// use sylvester::PolynomialRing;
@@ -68,12 +64,10 @@ impl Eq for PolynomialRing {}
 impl PolynomialRing {
     /// Build the ring `F_p[variables]`.
     ///
-    /// `modulus` must be a prime of at most 2^31 - 1, and the ring accepts
-    /// at most 256 variables. Both bounds match the `sylv-gb-cert-v1`
-    /// certificate contract, so every ring this constructor builds can
-    /// certify. Variable names must be distinct. Each name starts with an
-    /// ASCII letter or an underscore and holds only ASCII letters, digits,
-    /// and underscores. The order of the names is the variable order.
+    /// `modulus` must be a prime of at most 2^31 - 1. The ring accepts at
+    /// most 256 variables. Variable names must be distinct. Each name starts
+    /// with an ASCII letter or an underscore and holds only ASCII letters,
+    /// digits, and underscores. The order of the names is the variable order.
     ///
     /// ```
     /// use sylvester::PolynomialRing;
