@@ -14,9 +14,8 @@ pub(crate) const WORK_STRIDE: usize = 1024;
 
 /// Caps the verifier enforces while it reads and while it checks.
 ///
-/// The verifier applies a cap before it allocates the item the cap covers,
-/// so a certificate that breaches a cap never allocates past it. Lower the
-/// caps for bytes from an untrusted peer.
+/// The verifier applies a cap before it allocates the item the cap covers.
+/// A caller lowers the caps for bytes from an untrusted peer.
 ///
 /// The caps bound memory. A deadline bounds time, and every loop over the
 /// certificate polls it on a fixed stride of work, so a run can overrun its
@@ -49,6 +48,30 @@ pub struct Limits {
     /// counts term and exponent payloads, not allocator metadata, so it is
     /// not a cap on resident memory.
     pub max_intermediate_bytes: usize,
+    /// The largest number of monomials in a v2 pool.
+    pub max_pool_monomials: usize,
+    /// The largest number of variable/exponent entries in a v2 pool.
+    pub max_pool_entries: usize,
+    /// The largest number of polynomials in a v2 input section.
+    pub max_input_polys: usize,
+    /// The largest number of nodes in a v2 trace.
+    pub max_nodes: usize,
+    /// The largest number of steps in one v2 combination node.
+    pub max_comb_steps: usize,
+    /// The largest number of combination steps in a v2 trace.
+    pub max_trace_steps: usize,
+    /// The largest number of elements in a v2 basis.
+    pub max_basis: usize,
+    /// The largest number of pairs in a v2 basis.
+    pub max_pairs: usize,
+    /// The largest number of steps in one v2 division trace.
+    pub max_division_steps: usize,
+    /// The largest number of division steps in a v2 certificate.
+    pub max_total_division_steps: usize,
+    /// The largest byte estimate for live v2 trace and basis values.
+    pub max_live_bytes: usize,
+    /// The largest number of work units a v2 verification may charge.
+    pub max_work_units: u64,
     /// The instant the work must stop at.
     pub deadline: Option<Instant>,
 }
@@ -62,8 +85,124 @@ impl Default for Limits {
             max_total_terms: 8_000_000,
             max_entries: 4_000_000,
             max_intermediate_bytes: 512 << 20,
+            max_pool_monomials: 4_000_000,
+            max_pool_entries: 16_000_000,
+            max_input_polys: 1_000_000,
+            max_nodes: 8_000_000,
+            max_comb_steps: 1 << 20,
+            max_trace_steps: 64_000_000,
+            max_basis: 1_000_000,
+            max_pairs: 4_000_000,
+            max_division_steps: 1 << 20,
+            max_total_division_steps: 64_000_000,
+            max_live_bytes: 512 << 20,
+            max_work_units: 4_000_000_000,
             deadline: None,
         }
+    }
+}
+
+/// The work, deadline, and byte-denominated arithmetic budget of one v2
+/// verification.
+#[derive(Clone, Debug)]
+pub(crate) struct Meter {
+    work: u64,
+    next_poll: u64,
+    live_bytes: usize,
+    max_work_units: u64,
+    max_live_bytes: usize,
+    max_intermediate_bytes: usize,
+    term_bytes: usize,
+    deadline: Option<Instant>,
+}
+
+impl Meter {
+    /// Start under the caller's caps. Until the header supplies `nvars`,
+    /// one term is priced at the contract's maximum width.
+    pub(crate) fn new(limits: &Limits) -> Self {
+        Meter {
+            work: 0,
+            next_poll: WORK_STRIDE as u64,
+            live_bytes: 0,
+            max_work_units: limits.max_work_units,
+            max_live_bytes: limits.max_live_bytes,
+            max_intermediate_bytes: limits.max_intermediate_bytes,
+            term_bytes: term_bytes(256),
+            deadline: limits.deadline,
+        }
+    }
+
+    /// Price subsequent polynomial buffers for the decoded variable count.
+    pub(crate) fn set_nvars(&mut self, nvars: usize) {
+        self.term_bytes = term_bytes(nvars);
+    }
+
+    /// Charge work before running it and poll the deadline on a fixed
+    /// stride, including inside arithmetic and decoding loops.
+    pub(crate) fn charge(&mut self, units: u64) -> Result<(), VerifyError> {
+        let total = self.work.saturating_add(units);
+        if total > self.max_work_units {
+            return Err(VerifyError::CapExceeded {
+                cap: Cap::WorkUnits,
+                limit: usize::try_from(self.max_work_units).unwrap_or(usize::MAX),
+            });
+        }
+        self.work = total;
+        if total >= self.next_poll {
+            self.next_poll = total
+                .saturating_sub(total % WORK_STRIDE as u64)
+                .saturating_add(WORK_STRIDE as u64);
+            self.poll()?;
+        }
+        Ok(())
+    }
+
+    /// Poll the deadline immediately.
+    pub(crate) fn poll(&self) -> Result<(), VerifyError> {
+        match self.deadline {
+            Some(deadline) if Instant::now() >= deadline => Err(VerifyError::DeadlineExceeded),
+            _ => Ok(()),
+        }
+    }
+
+    fn bytes(&self, terms: usize) -> Option<usize> {
+        terms.checked_mul(self.term_bytes)
+    }
+
+    /// Check one prospective v2 arithmetic result before allocation.
+    pub(crate) fn check_intermediate(&self, terms: usize) -> Result<(), VerifyError> {
+        match self.bytes(terms) {
+            Some(bytes) if bytes <= self.max_intermediate_bytes => Ok(()),
+            _ => Err(VerifyError::CapExceeded {
+                cap: Cap::IntermediateBytes,
+                limit: self.max_intermediate_bytes,
+            }),
+        }
+    }
+
+    /// Charge a live v2 value after values it replaces have been released.
+    pub(crate) fn hold(&mut self, terms: usize) -> Result<(), VerifyError> {
+        let Some(bytes) = self.bytes(terms) else {
+            return Err(VerifyError::CapExceeded {
+                cap: Cap::IntermediateBytes,
+                limit: self.max_live_bytes,
+            });
+        };
+        let total = self.live_bytes.saturating_add(bytes);
+        if total > self.max_live_bytes {
+            return Err(VerifyError::CapExceeded {
+                cap: Cap::IntermediateBytes,
+                limit: self.max_live_bytes,
+            });
+        }
+        self.live_bytes = total;
+        Ok(())
+    }
+
+    /// Release a v2 value's byte estimate.
+    pub(crate) fn release(&mut self, terms: usize) {
+        let bytes = self.bytes(terms).unwrap_or(usize::MAX);
+        self.live_bytes = self.live_bytes.saturating_sub(bytes);
     }
 }
 
@@ -135,8 +274,7 @@ impl Ticker {
 /// The budget covers every buffer the arithmetic reserves and every buffer
 /// the caller holds live beside it, charged for its capacity until it is
 /// dropped. It excludes the decoded certificate, which the term caps cover.
-/// The verifier charges before it reserves, so a check that needs more than
-/// the cap fails before it allocates.
+/// The verifier charges before it reserves.
 #[derive(Clone, Debug)]
 pub(crate) struct Budget {
     max_bytes: usize,

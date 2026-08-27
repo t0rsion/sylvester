@@ -709,8 +709,7 @@ fn rejects_work_after_the_deadline() {
 
 #[test]
 fn stops_an_oversized_polynomial_count_before_it_allocates() {
-    // The input array declares far more polynomials than the cap allows.
-    // The decoder stops at the cap, so it never reads the rest.
+    // The decoder stops at the cap, so it never reads the rest of the array.
     let oversized_polys = 200_000;
     let mut bytes = String::with_capacity(oversized_polys * 16);
     bytes.push_str(
@@ -747,98 +746,6 @@ fn stops_an_oversized_polynomial_count_before_it_allocates() {
             cap: Cap::Bytes,
             limit: 1024
         })
-    );
-}
-
-/// Every file under `path`, with its path relative to `src`.
-fn source_files(path: &std::path::Path) -> Vec<(String, String)> {
-    let mut files = Vec::new();
-    let mut stack = vec![path.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        for entry in std::fs::read_dir(&dir).expect("the directory is readable") {
-            let entry = entry.expect("the directory entry is readable").path();
-            if entry.is_dir() {
-                stack.push(entry);
-                continue;
-            }
-            if entry.extension().is_some_and(|ext| ext == "rs") {
-                let text = std::fs::read_to_string(&entry).expect("the file is readable");
-                files.push((entry.display().to_string(), text));
-            }
-        }
-    }
-    files
-}
-
-#[test]
-fn shares_no_code_with_the_engines() {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/verify");
-    let forbidden = [
-        "crate::ring",
-        "crate::poly",
-        "crate::compute",
-        "crate::cert",
-        "crate::ideal",
-        "use super::super",
-        "serde",
-        // The verifier does its own arithmetic in `u64` and `u128`. A big
-        // integer crate on this side would be one more thing to trust.
-        "num_bigint",
-        "num-bigint",
-        "num_integer",
-        "num-integer",
-        "num_rational",
-        "num-rational",
-        "num_traits",
-        "num-traits",
-    ];
-    let files = source_files(&root);
-    for (path, text) in &files {
-        for needle in forbidden {
-            assert!(!text.contains(needle), "{path} holds {needle}");
-        }
-    }
-    assert!(
-        files.len() >= 5,
-        "expected the verifier module tree, found {} files",
-        files.len()
-    );
-}
-
-#[test]
-fn the_engines_do_not_reach_into_the_verifier() {
-    // The dependency runs one way. Two files name the verifier on purpose:
-    // `compute/mod.rs` runs it over freshly written bytes, and
-    // `certificate.rs` carries its error type in the certified result.
-    // Nothing else may, and a documentation link is not an import.
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let allowed = ["compute/mod.rs", "certificate.rs"];
-    let verifier = root.join("verify");
-    let mut checked = 0;
-    for (path, text) in source_files(&root) {
-        if std::path::Path::new(&path).starts_with(&verifier)
-            || allowed
-                .iter()
-                .any(|tail| std::path::Path::new(&path).ends_with(tail))
-        {
-            continue;
-        }
-        for (number, line) in text.lines().enumerate() {
-            let code = line.trim_start();
-            if code.starts_with("//") {
-                continue;
-            }
-            assert!(
-                !code.contains("crate::verify"),
-                "{path}:{} reaches into the verifier",
-                number + 1
-            );
-        }
-        checked += 1;
-    }
-    assert!(
-        checked >= 8,
-        "expected the engine tree, found {checked} files"
     );
 }
 

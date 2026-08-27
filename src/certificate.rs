@@ -1,11 +1,10 @@
 //! Certificates for a computed basis.
 //!
-//! A certificate holds the input, the basis, and the cofactors of both
-//! ideal inclusions. The contract is `sylv-gb-cert-v1`. The emitter that
-//! writes a certificate is untrusted. The verifier in [`crate::verify`] is
-//! the trust boundary. Acceptance establishes two facts: the input and the
-//! basis generate the same ideal, and the basis is the reduced Gröbner
-//! basis of that ideal under grevlex.
+//! A certificate carries the input, the basis, and the evidence needed to
+//! check both ideal inclusions. Classic writes the JSON
+//! `sylv-gb-cert-v1` cofactor contract; F4 writes the binary
+//! `sylv-gb-cert-v2` trace contract. The writers are untrusted. The
+//! independent verifier in [`crate::verify`] is the trust boundary.
 
 use std::fmt;
 
@@ -16,8 +15,7 @@ use crate::verify::VerifyError;
 /// A basis with the certificate the verifier accepted for it.
 ///
 /// [`crate::Ideal::groebner_basis_certified`] returns one. The basis is
-/// decoded from the accepted bytes, so the value the caller reads is the
-/// value the verifier checked.
+/// decoded from the accepted bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CertifiedGroebnerBasis {
     basis: GroebnerBasis,
@@ -34,17 +32,15 @@ impl CertifiedGroebnerBasis {
         &self.basis
     }
 
-    /// The certificate bytes, in the `sylv-gb-cert-v1` contract.
+    /// The certificate bytes, in the selected backend's contract.
     ///
-    /// The bytes are a function of the input alone. Two runs over one input
-    /// write the same bytes. The options change none of them: the backend
-    /// is not read, and the deadline and the memory limit only stop the
-    /// run.
+    /// A certified F4 run records on one thread, so its thread count
+    /// changes no byte.
     pub fn certificate(&self) -> &[u8] {
         &self.certificate
     }
 
-    /// Take the owned basis and bytes.
+    /// The basis and certificate bytes, consuming the value.
     pub fn into_parts(self) -> (GroebnerBasis, Vec<u8>) {
         (self.basis, self.certificate)
     }
@@ -82,11 +78,10 @@ impl fmt::Display for Place {
 ///
 /// [`CertifyError::Engine`] and [`CertifyError::VerifierExhausted`] report
 /// an exhausted budget. Neither says anything about the basis.
-/// [`CertifyError::Emitter`] reports a defect in the candidate the emitter
-/// read or in the certificate it wrote. [`CertifyError::InputMismatch`]
-/// reports an accepted certificate that does not describe the ideal the
-/// caller asked about. [`CertifyError::Rejected`] reports a certificate the
-/// verifier read and refused.
+/// [`CertifyError::Emitter`] reports a defect in the candidate or the
+/// written certificate. [`CertifyError::InputMismatch`] reports an
+/// accepted certificate that does not describe the caller's ideal.
+/// [`CertifyError::Rejected`] reports a certificate the verifier refused.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CertifyError {
     /// The emitter could not write a certificate for the candidate it read.
@@ -101,6 +96,94 @@ pub enum CertifyError {
     VerifierExhausted(VerifyError),
     /// The verifier rejected the certificate the emitter wrote.
     Rejected(VerifyError),
+    /// The certificate would exceed a format cap, so the writer stopped.
+    CapExceeded {
+        /// The cap the certificate would exceed.
+        cap: CertificateCap,
+        /// The value the cap holds.
+        limit: usize,
+    },
+}
+
+/// The part of an F4 trace the v2 writer could not read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TraceFault {
+    /// A pivot row carries no summand.
+    EmptyRow,
+    /// A named row or pivot has no value.
+    UnboundRow,
+    /// A returned basis element has no value.
+    UnboundBasis,
+    /// The trace and returned basis have different lengths.
+    BasisCount {
+        /// The number of elements named by the trace.
+        found: usize,
+        /// The number of elements returned by the engine.
+        expected: usize,
+    },
+}
+
+/// A hard count cap in the v2 certificate contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CertificateCap {
+    /// Monomials in the pool.
+    PoolMonomials,
+    /// Variable/exponent entries in the pool.
+    PoolEntries,
+    /// Input polynomials.
+    InputPolys,
+    /// Terms in one polynomial.
+    TermsPerPoly,
+    /// Terms in the certificate.
+    TotalTerms,
+    /// Trace nodes.
+    Nodes,
+    /// Steps in one combination node.
+    CombSteps,
+    /// Combination steps in the trace.
+    TraceSteps,
+    /// Basis elements.
+    Basis,
+    /// Basis pairs.
+    Pairs,
+    /// Steps in one division trace.
+    DivisionSteps,
+    /// Division steps in the certificate.
+    TotalDivisionSteps,
+}
+
+impl fmt::Display for CertificateCap {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            CertificateCap::PoolMonomials => "pool monomials",
+            CertificateCap::PoolEntries => "pool entries",
+            CertificateCap::InputPolys => "input polynomials",
+            CertificateCap::TermsPerPoly => "terms in one polynomial",
+            CertificateCap::TotalTerms => "terms in the certificate",
+            CertificateCap::Nodes => "trace nodes",
+            CertificateCap::CombSteps => "steps in one combination",
+            CertificateCap::TraceSteps => "combination steps in the trace",
+            CertificateCap::Basis => "basis elements",
+            CertificateCap::Pairs => "basis pairs",
+            CertificateCap::DivisionSteps => "steps in one division trace",
+            CertificateCap::TotalDivisionSteps => "division steps in the certificate",
+        };
+        f.write_str(name)
+    }
+}
+
+impl fmt::Display for TraceFault {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TraceFault::EmptyRow => f.write_str("a pivot row carries no summand"),
+            TraceFault::UnboundRow => f.write_str("a named row carries no value"),
+            TraceFault::UnboundBasis => f.write_str("a basis element carries no value"),
+            TraceFault::BasisCount { found, expected } => write!(
+                f,
+                "the trace names {found} basis elements, the run returned {expected}"
+            ),
+        }
+    }
 }
 
 /// Why the emitter could not write a certificate for a candidate.
@@ -154,6 +237,13 @@ pub enum EmitterFault {
         /// The index of the input polynomial.
         input: usize,
     },
+    /// A basis element is not monic, so no v2 division trace holds.
+    BasisElementNotMonic {
+        /// The index of the element.
+        index: usize,
+    },
+    /// The F4 trace does not describe the returned basis.
+    Trace(TraceFault),
 }
 
 impl fmt::Display for CertifyError {
@@ -169,6 +259,9 @@ impl fmt::Display for CertifyError {
             }
             CertifyError::Rejected(error) => {
                 write!(f, "the verifier rejected the certificate: {error}")
+            }
+            CertifyError::CapExceeded { cap, limit } => {
+                write!(f, "the certificate would hold more than {limit} {cap}")
             }
         }
     }
@@ -208,6 +301,10 @@ impl fmt::Display for EmitterFault {
                 f,
                 "input polynomial {input} has a nonzero remainder on division by the basis"
             ),
+            EmitterFault::BasisElementNotMonic { index } => {
+                write!(f, "basis element {index} is not monic")
+            }
+            EmitterFault::Trace(fault) => write!(f, "{fault}"),
         }
     }
 }
@@ -217,7 +314,9 @@ impl std::error::Error for CertifyError {
         match self {
             CertifyError::Engine(error) => Some(error),
             CertifyError::VerifierExhausted(error) | CertifyError::Rejected(error) => Some(error),
-            CertifyError::Emitter(_) | CertifyError::InputMismatch => None,
+            CertifyError::Emitter(_)
+            | CertifyError::InputMismatch
+            | CertifyError::CapExceeded { .. } => None,
         }
     }
 }
@@ -225,6 +324,12 @@ impl std::error::Error for CertifyError {
 impl From<EmitterFault> for CertifyError {
     fn from(fault: EmitterFault) -> Self {
         CertifyError::Emitter(fault)
+    }
+}
+
+impl From<TraceFault> for CertifyError {
+    fn from(fault: TraceFault) -> Self {
+        CertifyError::Emitter(EmitterFault::Trace(fault))
     }
 }
 

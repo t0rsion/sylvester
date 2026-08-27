@@ -1,6 +1,5 @@
 //! Wall-time benchmarks for both backends on three small systems at
-//! p = 32003, to catch regressions between runs. No cell here is certified
-//! or parallel.
+//! p = 32003. No cell is certified or parallel.
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use sylvester::{Backend, ComputeOptions, Ideal, PolynomialRing};
@@ -60,7 +59,7 @@ fn bench_backends(c: &mut Criterion) {
     ];
 
     for (name, ideal) in &systems {
-        for backend in [Backend::Matrix, Backend::Classic] {
+        for backend in [Backend::F4, Backend::Classic] {
             let label = format!("{name}/{}", backend_name(backend));
             c.bench_function(&label, |b| {
                 b.iter(|| {
@@ -76,7 +75,7 @@ fn bench_backends(c: &mut Criterion) {
 
 fn backend_name(backend: Backend) -> &'static str {
     match backend {
-        Backend::Matrix => "matrix",
+        Backend::F4 => "f4",
         Backend::Classic => "classic",
     }
 }

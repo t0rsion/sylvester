@@ -1,4 +1,5 @@
-//! Signature-based Gröbner bases over finite prime fields.
+//! Gröbner bases over finite prime fields, with a default F4 engine, a
+//! classic F5 oracle, and independent certificate verifiers.
 //!
 //! Every value is built through a [`PolynomialRing`], which fixes the prime,
 //! the variable names, and the variable order. The monomial order is
@@ -26,42 +27,37 @@
 //!
 //! # Correctness status: repaired, checked against oracles, not proven
 //!
-//! Two counterexamples proved both backends incorrect as originally
-//! extracted, and this crate carries the repair. The counterexample tests
-//! in `tests/known_defects.rs` assert correct behavior through an
-//! independent checker, and a randomized differential suite checks both
-//! backends against a self-contained Buchberger oracle in
-//! `tests/differential.rs`. Termination has a pen-and-paper proof by
-//! Dickson's lemma. No proof here is machine-checked, and the verifier
-//! itself is a trusted, unproven base.
+//! Counterexamples proved the originally extracted engines incorrect.
+//! This crate carries the repair. The tests in `tests/known_defects.rs`
+//! assert the hand-verified correct bases through an independent checker.
+//! A randomized differential suite checks F4 and classic against a
+//! self-contained Buchberger oracle in `tests/differential.rs`.
+//! Termination has a pen-and-paper proof by Dickson's lemma. No proof
+//! here is machine-checked. The verifier is trusted, unproven code.
 //!
 //! [`Ideal::groebner_basis`] is the unproven path. It reports an exhausted
-//! budget, or a monomial past the degree an exponent's width supports (an
+//! budget, or a monomial past the degree an exponent's width supports: an
 //! input generator, a critical pair's least common multiple, or a signature
-//! or cofactor product), and nothing else about the basis it returns.
-//! [`Ideal::groebner_basis_certified`] runs the classic backend with
-//! cofactor tracking and writes a certificate. It returns a value only
-//! after the independent verifier in [`verify`] accepts the bytes, and the
-//! basis it returns is decoded from those bytes. Certification is
-//! classic-only in this release.
+//! or cofactor product. It says nothing else about the basis it returns.
+//! [`Ideal::groebner_basis_certified`] runs the selected backend and writes
+//! its certificate. It returns a value only after the independent verifier
+//! in [`verify`] accepts the bytes, and the basis it returns is decoded
+//! from those bytes. Classic writes `sylv-gb-cert-v1`; F4 writes
+//! `sylv-gb-cert-v2`.
 //!
 //! # Backends
 //!
-//! [`Backend::Classic`] processes critical pairs one at a time in signature
-//! order. [`Backend::Matrix`] batches pairs by degree and reduces them in
-//! sparse Macaulay matrices with F4-style elimination. It applies the F5
-//! syzygy criterion to skip rows, and it replaces a rewritable
-//! S-polynomial row with the multiple its canonical rewriter names.
+//! [`Backend::F4`] is the default. It batches critical pairs by degree,
+//! builds sparse matrices over interned monomials, and uses Gebauer-Moller
+//! pair management. [`Backend::Classic`] processes pairs one at a time in
+//! signature order. It is the differential oracle and the v1 path.
 //!
-//! # Feature flags
-//!
-//! `parallel` adds rayon row reduction to the matrix backend. Rows that
-//! share one signature reduce against the same pivots, so such a group
-//! runs in parallel once it reaches an internal threshold. There is no
-//! option for it.
+//! [`ComputeOptions::threads`] controls F4's rayon parallelism. Classic and
+//! certified runs stay on one thread. The crate has no feature flags.
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
+#![warn(unreachable_pub)]
 
 mod cert;
 mod certificate;
@@ -71,8 +67,10 @@ mod poly;
 mod ring;
 pub mod verify;
 
-pub use certificate::{CertifiedGroebnerBasis, CertifyError, EmitterFault, Place};
-pub use compute::{Backend, ComputeError, ComputeOptions};
+pub use certificate::{
+    CertificateCap, CertifiedGroebnerBasis, CertifyError, EmitterFault, Place, TraceFault,
+};
+pub use compute::{Backend, ComputeError, ComputeOptions, ComputeReport, F4Counters};
 pub use ideal::{GroebnerBasis, Ideal};
 pub use poly::Polynomial;
 pub use ring::{ParseError, PolynomialRing, RingError};

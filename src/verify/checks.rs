@@ -81,35 +81,60 @@ fn check_encodings(
     modulus: u64,
     budget: &mut Budget,
 ) -> Result<(), VerifyError> {
-    for (index, poly) in raw.input.iter().enumerate() {
-        check_poly(poly, Location::Input(index), nvars, modulus, budget)?;
+    check_poly_list(&raw.input, Location::Input, nvars, modulus, budget)?;
+    check_poly_list(&raw.basis, Location::Basis, nvars, modulus, budget)?;
+    check_poly_matrix(
+        &raw.origin,
+        |basis, input| Location::Origin { basis, input },
+        nvars,
+        modulus,
+        budget,
+    )?;
+    check_poly_matrix(
+        &raw.membership,
+        |input, basis| Location::Membership { input, basis },
+        nvars,
+        modulus,
+        budget,
+    )?;
+    check_spair_encodings(&raw.spairs, nvars, modulus, budget)
+}
+
+fn check_poly_list(
+    polys: &[Poly],
+    location: impl Fn(usize) -> Location,
+    nvars: usize,
+    modulus: u64,
+    budget: &mut Budget,
+) -> Result<(), VerifyError> {
+    for (index, poly) in polys.iter().enumerate() {
+        check_poly(poly, location(index), nvars, modulus, budget)?;
     }
-    for (index, poly) in raw.basis.iter().enumerate() {
-        check_poly(poly, Location::Basis(index), nvars, modulus, budget)?;
-    }
-    for (basis, entry) in raw.origin.iter().enumerate() {
-        for (input, poly) in entry.iter().enumerate() {
-            check_poly(
-                poly,
-                Location::Origin { basis, input },
-                nvars,
-                modulus,
-                budget,
-            )?;
+    Ok(())
+}
+
+fn check_poly_matrix(
+    entries: &[Vec<Poly>],
+    location: impl Fn(usize, usize) -> Location,
+    nvars: usize,
+    modulus: u64,
+    budget: &mut Budget,
+) -> Result<(), VerifyError> {
+    for (outer, entry) in entries.iter().enumerate() {
+        for (inner, poly) in entry.iter().enumerate() {
+            check_poly(poly, location(outer, inner), nvars, modulus, budget)?;
         }
     }
-    for (input, entry) in raw.membership.iter().enumerate() {
-        for (basis, poly) in entry.iter().enumerate() {
-            check_poly(
-                poly,
-                Location::Membership { input, basis },
-                nvars,
-                modulus,
-                budget,
-            )?;
-        }
-    }
-    for entry in &raw.spairs {
+    Ok(())
+}
+
+fn check_spair_encodings(
+    spairs: &[super::json::RawSpair],
+    nvars: usize,
+    modulus: u64,
+    budget: &mut Budget,
+) -> Result<(), VerifyError> {
+    for entry in spairs {
         let i = usize::try_from(entry.i).unwrap_or(usize::MAX);
         let j = usize::try_from(entry.j).unwrap_or(usize::MAX);
         for (basis, poly) in entry.cofactors.iter().enumerate() {
@@ -165,7 +190,6 @@ fn check_poly(
     Ok(())
 }
 
-/// Collect the leading monomial of every basis element.
 fn leading_monomials<'a>(
     basis: &'a [Poly],
     budget: &mut Budget,
@@ -192,7 +216,14 @@ fn leading_monomials<'a>(
 /// leading monomial, which the sort check rejects.
 fn check_basis(basis: &[Poly], budget: &mut Budget) -> Result<(), VerifyError> {
     let lms = leading_monomials(basis, budget)?;
-    for index in 1..basis.len() {
+    check_basis_order(&lms, budget)?;
+    check_basis_monic(basis, budget)?;
+    check_basis_tails(basis, &lms, budget)?;
+    check_basis_minimal(&lms, budget)
+}
+
+fn check_basis_order(lms: &[&Mono], budget: &mut Budget) -> Result<(), VerifyError> {
+    for index in 1..lms.len() {
         budget.step()?;
         if algebra::cmp_grevlex(lms[index - 1], lms[index]) != Ordering::Greater {
             return Err(VerifyError::Basis {
@@ -201,6 +232,10 @@ fn check_basis(basis: &[Poly], budget: &mut Budget) -> Result<(), VerifyError> {
             });
         }
     }
+    Ok(())
+}
+
+fn check_basis_monic(basis: &[Poly], budget: &mut Budget) -> Result<(), VerifyError> {
     for (index, element) in basis.iter().enumerate() {
         budget.step()?;
         match element.lc() {
@@ -219,6 +254,14 @@ fn check_basis(basis: &[Poly], budget: &mut Budget) -> Result<(), VerifyError> {
             }
         }
     }
+    Ok(())
+}
+
+fn check_basis_tails(
+    basis: &[Poly],
+    lms: &[&Mono],
+    budget: &mut Budget,
+) -> Result<(), VerifyError> {
     for (index, element) in basis.iter().enumerate() {
         for (term, tail) in element.terms().iter().enumerate().skip(1) {
             for (by, lm) in lms.iter().enumerate() {
@@ -232,6 +275,10 @@ fn check_basis(basis: &[Poly], budget: &mut Budget) -> Result<(), VerifyError> {
             }
         }
     }
+    Ok(())
+}
+
+fn check_basis_minimal(lms: &[&Mono], budget: &mut Budget) -> Result<(), VerifyError> {
     for (index, lm) in lms.iter().enumerate() {
         for (by, other) in lms.iter().enumerate() {
             budget.step()?;
@@ -336,50 +383,94 @@ fn check_membership(raw: &RawCert, modulus: u64, budget: &mut Budget) -> Result<
 }
 
 /// Obligation 6: every pair is covered, and every entry holds.
+///
+/// The certificate may omit a coprime pair. The verifier enumerates every
+/// pair of the claimed basis itself. A missing non-coprime pair is
+/// [`VerifyError::SpairMissing`].
 fn check_spairs(raw: &RawCert, modulus: u64, budget: &mut Budget) -> Result<(), VerifyError> {
     let basis = &raw.basis;
     let lms = leading_monomials(basis, budget)?;
     let count = basis.len();
-    let mut pairs: Vec<(usize, usize)> = Vec::with_capacity(raw.spairs.len());
-    for (entry_index, entry) in raw.spairs.iter().enumerate() {
-        budget.step()?;
-        if entry.i >= count as u64 {
-            return Err(VerifyError::IndexOutOfRange {
-                what: "the first S-pair index",
-                index: entry.i,
-                bound: count,
-            });
-        }
-        if entry.j >= count as u64 {
-            return Err(VerifyError::IndexOutOfRange {
-                what: "the second S-pair index",
-                index: entry.j,
-                bound: count,
-            });
-        }
-        let (i, j) = (entry.i as usize, entry.j as usize);
-        if i >= j {
-            return Err(VerifyError::SpairIndexOrder { i, j });
-        }
-        if entry.cofactors.len() != count {
-            return Err(VerifyError::CountMismatch {
-                what: "S-pair entry",
-                index: Some(entry_index),
-                found: entry.cofactors.len(),
-                expected: count,
-            });
-        }
-        if let Some(&previous) = pairs.last() {
-            if previous == (i, j) {
-                return Err(VerifyError::SpairDuplicate { i, j });
-            }
-            if (i, j) < previous {
-                return Err(VerifyError::SpairUnsorted { i, j });
-            }
-        }
-        pairs.push((i, j));
-    }
+    let pairs = check_spair_entries(&raw.spairs, count, budget)?;
+    check_spair_coverage(raw, &lms, &pairs, modulus, budget)
+}
 
+fn check_spair_entries(
+    entries: &[super::json::RawSpair],
+    count: usize,
+    budget: &mut Budget,
+) -> Result<Vec<(usize, usize)>, VerifyError> {
+    let mut pairs: Vec<(usize, usize)> = Vec::with_capacity(entries.len());
+    for (entry_index, entry) in entries.iter().enumerate() {
+        budget.step()?;
+        pairs.push(check_spair_entry(
+            entry_index,
+            entry,
+            count,
+            pairs.last().copied(),
+        )?);
+    }
+    Ok(pairs)
+}
+
+fn check_spair_entry(
+    entry_index: usize,
+    entry: &super::json::RawSpair,
+    count: usize,
+    previous: Option<(usize, usize)>,
+) -> Result<(usize, usize), VerifyError> {
+    if entry.i >= count as u64 {
+        return Err(VerifyError::IndexOutOfRange {
+            what: "the first S-pair index",
+            index: entry.i,
+            bound: count,
+        });
+    }
+    if entry.j >= count as u64 {
+        return Err(VerifyError::IndexOutOfRange {
+            what: "the second S-pair index",
+            index: entry.j,
+            bound: count,
+        });
+    }
+    let pair = (entry.i as usize, entry.j as usize);
+    if pair.0 >= pair.1 {
+        return Err(VerifyError::SpairIndexOrder {
+            i: pair.0,
+            j: pair.1,
+        });
+    }
+    if entry.cofactors.len() != count {
+        return Err(VerifyError::CountMismatch {
+            what: "S-pair entry",
+            index: Some(entry_index),
+            found: entry.cofactors.len(),
+            expected: count,
+        });
+    }
+    if previous == Some(pair) {
+        return Err(VerifyError::SpairDuplicate {
+            i: pair.0,
+            j: pair.1,
+        });
+    }
+    if previous.is_some_and(|previous| pair < previous) {
+        return Err(VerifyError::SpairUnsorted {
+            i: pair.0,
+            j: pair.1,
+        });
+    }
+    Ok(pair)
+}
+
+fn check_spair_coverage(
+    raw: &RawCert,
+    lms: &[&Mono],
+    pairs: &[(usize, usize)],
+    modulus: u64,
+    budget: &mut Budget,
+) -> Result<(), VerifyError> {
+    let basis = &raw.basis;
     let mut next = 0usize;
     for (i, left) in basis.iter().enumerate() {
         for (j, right) in basis.iter().enumerate().skip(i + 1) {
@@ -405,8 +496,7 @@ fn check_spairs(raw: &RawCert, modulus: u64, budget: &mut Budget) -> Result<(), 
 
 /// Check one S-pair identity and its leading-monomial bounds.
 ///
-/// The check holds one product at a time. It checks the bound on a product,
-/// then adds the product to the running sum.
+/// The check holds one product at a time.
 ///
 /// The zero S-polynomial has no leading monomial. It bounds no nonzero
 /// summand, so every cofactor must be zero.
@@ -423,27 +513,57 @@ fn check_spair(
     let target = algebra::spoly(left, right, modulus, budget, 0)?;
     let mut sum = Poly::zero();
     for (summand, (cofactor, element)) in cofactors.iter().zip(basis).enumerate() {
-        budget.step()?;
-        if cofactor.is_zero() || element.is_zero() {
-            continue;
+        if let Some(product) = checked_spair_product(
+            (i, j),
+            summand,
+            cofactor,
+            element,
+            &target,
+            &sum,
+            modulus,
+            budget,
+        )? {
+            sum = algebra::add(sum, product, modulus, budget, target.terms().len())?;
         }
-        let live = target.terms().len() + sum.terms().len();
-        let product = algebra::mul(cofactor, element, modulus, budget, live)?;
-        if let Some(lm) = product.lm() {
-            let above = match target.lm() {
-                Some(bound) => algebra::cmp_grevlex(lm, bound) == Ordering::Greater,
-                None => true,
-            };
-            if above {
-                return Err(VerifyError::SpairBound { i, j, summand });
-            }
-        }
-        sum = algebra::add(sum, product, modulus, budget, target.terms().len())?;
     }
     if sum != target {
         return Err(VerifyError::SpairIdentity { i, j });
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn checked_spair_product(
+    pair: (usize, usize),
+    summand: usize,
+    cofactor: &Poly,
+    element: &Poly,
+    target: &Poly,
+    sum: &Poly,
+    modulus: u64,
+    budget: &mut Budget,
+) -> Result<Option<Poly>, VerifyError> {
+    budget.step()?;
+    if cofactor.is_zero() || element.is_zero() {
+        return Ok(None);
+    }
+    let live = target.terms().len() + sum.terms().len();
+    let product = algebra::mul(cofactor, element, modulus, budget, live)?;
+    if product.lm().is_some_and(|lm| above_bound(lm, target.lm())) {
+        return Err(VerifyError::SpairBound {
+            i: pair.0,
+            j: pair.1,
+            summand,
+        });
+    }
+    Ok(Some(product))
+}
+
+fn above_bound(lm: &Mono, bound: Option<&Mono>) -> bool {
+    match bound {
+        Some(bound) => algebra::cmp_grevlex(lm, bound) == Ordering::Greater,
+        None => true,
+    }
 }
 
 #[cfg(test)]

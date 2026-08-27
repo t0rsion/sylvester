@@ -4,54 +4,6 @@
 //! travels as an argument, so one type serves every prime the crate
 //! supports.
 
-/// A modulus with the reciprocal that reduces a product without dividing.
-///
-/// A 64-bit division costs about twenty cycles and the elimination inner
-/// loop runs one per entry. Barrett reduction replaces it with two
-/// multiplications and a conditional subtraction, at the price of one
-/// division to build the reciprocal. Build one per loop, not per entry.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct Modulus {
-    p: u64,
-    /// `floor(2^64 / p)`.
-    reciprocal: u64,
-}
-
-impl Modulus {
-    /// The reciprocal costs one 128-bit division, so hold the result.
-    pub(crate) fn new(p: u64) -> Self {
-        debug_assert!(p > 1, "the modulus must be above 1");
-        debug_assert!(p < 1 << 31, "a ring modulus is below 2^31");
-        Modulus {
-            p,
-            reciprocal: ((1u128 << 64) / p as u128) as u64,
-        }
-    }
-
-    #[inline]
-    pub(crate) fn value(self) -> u64 {
-        self.p
-    }
-
-    /// Multiply two values below the modulus.
-    ///
-    /// Both factors are below 2^31, so the product is below 2^62 and the
-    /// quotient estimate is short by at most one: with
-    /// `s = 2^64 - reciprocal * p` in `[0, p)`, the estimate loses
-    /// `x * s / (p * 2^64) < x / 2^64 < 1/4`. One subtraction covers that.
-    /// Which side of `p` the estimate lands on is unpredictable, so the
-    /// subtraction is written as a `min` over the wrapped difference,
-    /// which compiles to a conditional move rather than a branch.
-    #[inline]
-    pub(crate) fn mul(self, a: u64, b: u64) -> u64 {
-        debug_assert!(a < self.p && b < self.p, "both factors are below p");
-        let x = a * b;
-        let quotient = ((x as u128 * self.reciprocal as u128) >> 64) as u64;
-        let residue = x - quotient * self.p;
-        residue.min(residue.wrapping_sub(self.p))
-    }
-}
-
 /// One element of the prime field.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub(crate) struct Felt(u64);
@@ -77,11 +29,6 @@ impl Felt {
     }
 
     #[inline]
-    pub(crate) fn zero() -> Self {
-        Felt(0)
-    }
-
-    #[inline]
     pub(crate) fn one() -> Self {
         Felt(1)
     }
@@ -103,8 +50,8 @@ impl Felt {
 
     /// Subtract in the field.
     ///
-    /// A ring holds a modulus of at most 2^31 - 1, so the borrow fits a
-    /// `u64`.
+    /// A ring holds a modulus of at most 2^31 - 1, so the difference fits
+    /// a `u64`.
     #[inline]
     pub(crate) fn sub(self, other: Self, p: u64) -> Self {
         debug_assert!(p < 1 << 32, "a ring modulus is below 2^31");
@@ -126,10 +73,8 @@ impl Felt {
 
     /// Multiply in the field.
     ///
-    /// A ring holds a modulus of at most 2^31 - 1, so both factors are
-    /// below 2^31 and the product fits a `u64` without widening. This
-    /// divides once per call. A loop over one fixed modulus takes
-    /// [`Modulus`] instead and pays no division.
+    /// A ring holds a modulus of at most 2^31 - 1, so the product fits a
+    /// `u64`.
     #[inline]
     pub(crate) fn mul(self, other: Self, p: u64) -> Self {
         debug_assert!(self.0 < p && other.0 < p, "both factors must be below p");
@@ -139,8 +84,8 @@ impl Felt {
 
     /// The multiplicative inverse, by the extended Euclidean algorithm.
     ///
-    /// Zero has no inverse. The caller must not pass it. One is its own
-    /// inverse, which every monic polynomial hits.
+    /// Zero has no inverse. One is its own inverse, which every monic
+    /// polynomial hits.
     pub(crate) fn inv(self, p: u64) -> Self {
         assert!(!self.is_zero(), "zero has no inverse in a field");
         if self.0 == 1 {
@@ -168,48 +113,12 @@ impl Felt {
     /// Divide in the field.
     ///
     /// A divisor of one is common, because every basis element is monic.
-    /// It needs no inversion.
     #[inline]
     pub(crate) fn div(self, other: Self, p: u64) -> Self {
         if other.0 == 1 {
             return self;
         }
         self.mul(other.inv(p), p)
-    }
-
-    /// Invert a list with one inversion, by Montgomery's trick.
-    ///
-    /// A zero input stays zero in the result.
-    pub(crate) fn batch_inv(values: &[Felt], p: u64) -> Vec<Felt> {
-        if values.is_empty() {
-            return Vec::new();
-        }
-
-        let mut prefix = Vec::with_capacity(values.len());
-        let mut acc = Felt::one();
-        for &value in values {
-            if !value.is_zero() {
-                acc = acc.mul(value, p);
-            }
-            prefix.push(acc);
-        }
-
-        let mut inv_acc = acc.inv(p);
-        let mut result = vec![Felt::zero(); values.len()];
-        for index in (0..values.len()).rev() {
-            if values[index].is_zero() {
-                continue;
-            }
-            let before = if index == 0 {
-                Felt::one()
-            } else {
-                prefix[index - 1]
-            };
-            result[index] = inv_acc.mul(before, p);
-            inv_acc = inv_acc.mul(values[index], p);
-        }
-
-        result
     }
 }
 
@@ -235,42 +144,53 @@ fn wide_mul_residue(a: u64, b: u64, n: u64) -> u64 {
 /// The test is a deterministic Miller-Rabin over the bases that decide
 /// every 64-bit integer.
 pub(crate) fn is_prime(n: u64) -> bool {
-    const BASES: [u64; 12] = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37];
+    let Some(screened) = screen_small_primes(n) else {
+        let (d, r) = factor_twos(n - 1);
+        return PRIMALITY_BASES
+            .into_iter()
+            .all(|base| passes_miller_rabin(base, d, r, n));
+    };
+    screened
+}
 
+const PRIMALITY_BASES: [u64; 12] = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37];
+
+fn screen_small_primes(n: u64) -> Option<bool> {
     if n < 2 {
-        return false;
+        return Some(false);
     }
-    for base in BASES {
+    for base in PRIMALITY_BASES {
         if n == base {
-            return true;
+            return Some(true);
         }
-        if n % base == 0 {
-            return false;
+        if n.is_multiple_of(base) {
+            return Some(false);
         }
     }
+    None
+}
 
-    let mut d = n - 1;
+fn factor_twos(mut d: u64) -> (u64, u32) {
     let mut r = 0u32;
-    while d % 2 == 0 {
+    while d.is_multiple_of(2) {
         d /= 2;
         r += 1;
     }
+    (d, r)
+}
 
-    'base: for base in BASES {
-        let mut x = pow_mod(base, d, n);
-        if x == 1 || x == n - 1 {
-            continue;
-        }
-        for _ in 1..r {
-            x = wide_mul_residue(x, x, n);
-            if x == n - 1 {
-                continue 'base;
-            }
-        }
-        return false;
+fn passes_miller_rabin(base: u64, d: u64, r: u32, n: u64) -> bool {
+    let mut x = pow_mod(base, d, n);
+    if x == 1 || x == n - 1 {
+        return true;
     }
-
-    true
+    for _ in 1..r {
+        x = wide_mul_residue(x, x, n);
+        if x == n - 1 {
+            return true;
+        }
+    }
+    false
 }
 
 fn pow_mod(base: u64, mut exponent: u64, n: u64) -> u64 {
@@ -288,7 +208,7 @@ fn pow_mod(base: u64, mut exponent: u64, n: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Felt, Modulus, is_prime};
+    use super::{Felt, is_prime};
 
     #[test]
     fn new_reduces_into_the_field() {
@@ -309,38 +229,9 @@ mod tests {
         assert_eq!(b.sub(a, p).value(), 3);
         assert_eq!(a.mul(b, p).value(), 4);
         assert_eq!(a.neg(p).value(), 4);
-        assert_eq!(Felt::zero().neg(p).value(), 0);
+        assert_eq!(Felt::new(0, p).neg(p).value(), 0);
         assert_eq!(a.mul(a.inv(p), p).value(), 1);
         assert_eq!(Felt::new(2, p).div(Felt::new(4, p), p).value(), 4);
-    }
-
-    #[test]
-    fn batch_inversion_keeps_zeros() {
-        let p = 7;
-        let values = [Felt::new(3, p), Felt::zero(), Felt::new(5, p)];
-        let inverses = Felt::batch_inv(&values, p);
-        assert_eq!(inverses[0].mul(values[0], p).value(), 1);
-        assert_eq!(inverses[1].value(), 0);
-        assert_eq!(inverses[2].mul(values[2], p).value(), 1);
-    }
-
-    #[test]
-    fn barrett_multiplication_agrees_with_division() {
-        for p in [2u64, 3, 7, 32003, 65537, 1_073_741_827, (1 << 31) - 1] {
-            let modulus = Modulus::new(p);
-            let mut state = 0x2545_f491_4f6c_dd1du64;
-            for _ in 0..20_000 {
-                state ^= state << 13;
-                state ^= state >> 7;
-                state ^= state << 17;
-                let a = state % p;
-                let b = state.rotate_left(32) % p;
-                assert_eq!(modulus.mul(a, b), a * b % p, "at {a} * {b} mod {p}");
-            }
-            assert_eq!(modulus.mul(0, p - 1), 0);
-            assert_eq!(modulus.mul(p - 1, p - 1), (p - 1) * (p - 1) % p);
-            assert_eq!(modulus.value(), p);
-        }
     }
 
     #[test]

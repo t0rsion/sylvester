@@ -1,15 +1,11 @@
 //! Known-defect tests: verified counterexamples against both Gröbner backends.
 //!
-//! The checker below is independent of the engine code: it has
-//! its own polynomial representation, its own mod-p arithmetic, a grevlex
-//! comparison written from the definition, its own multivariate division,
-//! and its own S-polynomials. It shares nothing with `src/**`, so it cannot
-//! inherit an engine bug.
-//!
-//! Some tests validate the checker itself against hand-verified data. The
-//! backend tests assert the correct behavior: they fail on the archived
-//! snapshot, where they are `#[ignore]`d, and pass on the repaired backends
-//! in this tree.
+//! The checker is independent of the engine: its own polynomials, mod-p
+//! arithmetic, grevlex from the definition, multivariate division, and
+//! S-polynomials. It shares nothing with `src/**`. Some tests check the
+//! checker against hand-verified data. The backend tests assert the correct
+//! reduced bases. An output-only check accepts `{1}`, which these tests
+//! block.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -29,7 +25,7 @@ fn mul_mod(a: u64, b: u64, p: u64) -> u64 {
 
 /// Modular inverse via Fermat's little theorem; `a` must be nonzero mod prime `p`.
 fn inv_mod(a: u64, p: u64) -> u64 {
-    assert!(a % p != 0, "attempted to invert zero mod {p}");
+    assert!(!a.is_multiple_of(p), "attempted to invert zero mod {p}");
     let mut base = a % p;
     let mut exp = p - 2;
     let mut acc = 1u64;
@@ -128,7 +124,7 @@ impl Poly {
         self.terms.retain(|_, c| *c != 0);
     }
 
-    /// Render for diagnostics, e.g. "x^2 + 2*y*z".
+    /// A diagnostic rendering, e.g. `"x^2 + 2*y*z"`.
     fn render(&self, p: u64) -> String {
         if self.is_zero() {
             return "0".to_string();
@@ -299,7 +295,7 @@ fn f3_system_ideal() -> Ideal {
     engine_ideal(3, &["x^2 + y^2", "x*z + x*y", "y + x*y"])
 }
 
-/// The matrix backend's actual (wrong) 4-element output on the F_3 system.
+/// The legacy batch engine's actual (wrong) 4-element output on the F_3 system.
 fn f3_wrong_engine_output() -> Vec<Poly> {
     vec![
         Poly::from_terms(&[(1, &[2, 0, 0]), (2, &[0, 1, 1])], 3), // x^2 + 2yz
@@ -315,7 +311,7 @@ fn f3_true_basis() -> Vec<Poly> {
     basis
 }
 
-/// Build the ideal of a system over `F_p`, from the engine's own syntax.
+/// The ideal of a system over `F_p`, from the engine's own syntax.
 fn engine_ideal(p: u64, generators: &[&str]) -> Ideal {
     let names = ["x", "y", "z"];
     let nvars = if p == 2 { 2 } else { 3 };
@@ -407,9 +403,8 @@ fn assert_engine_output_is_basis(
             render_witness(&witness, p)
         );
     }
-    // The containment checker alone cannot reject a proper superset ideal such
-    // as {1}; for these fixed systems the reduced basis is known, so demand it
-    // exactly (as a set of monic polynomials).
+    // The containment checker cannot reject a proper superset such as {1}.
+    // For these systems the reduced basis is known, so demand it exactly.
     assert_eq!(
         normalized_basis_set(&candidate, p),
         normalized_basis_set(true_basis, p),
@@ -452,8 +447,8 @@ fn checker_rejects_classic_f2_output_with_f2_generator_witness() {
 }
 
 #[test]
-fn checker_rejects_matrix_f3_output_with_s_pair_witness() {
-    // The 4-element matrix output is not a Gröbner basis at all:
+fn checker_rejects_legacy_f3_output_with_s_pair_witness() {
+    // The legacy 4-element output is not a Gröbner basis at all:
     // S(x^2 + 2yz, xy + y) has nonzero normal form y + yz^2.
     let expected_normal_form = Poly::from_terms(&[(1, &[0, 1, 0]), (1, &[0, 1, 2])], 3); // y + yz^2
     let result = is_groebner_basis_of(&f3_system(), &f3_wrong_engine_output(), 3);
@@ -483,12 +478,12 @@ fn classic_backend_solves_the_f2_system() {
 }
 
 #[test]
-fn matrix_backend_solves_the_f3_system() {
+fn f4_backend_solves_the_f3_system() {
     let output = f3_system_ideal()
-        .groebner_basis(ComputeOptions::new().backend(Backend::Matrix))
-        .expect("matrix backend returned an error");
+        .groebner_basis(ComputeOptions::new().backend(Backend::F4))
+        .expect("F4 backend returned an error");
     assert_engine_output_is_basis(
-        "matrix backend, F_3 system",
+        "F4 backend, F_3 system",
         &f3_system(),
         &f3_true_basis(),
         &output,

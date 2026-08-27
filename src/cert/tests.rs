@@ -1,8 +1,7 @@
 //! Emission tests: every certificate is checked byte for byte.
 //!
 //! The expected strings are the ones `tests/verifier.rs` accepts by hand, so
-//! the writer and the hand-written corpus stay one format. The verifier runs
-//! over them there, not here: this module never imports `crate::verify`, and
+//! the writer and the hand-written corpus stay one format.
 //! `tests/certified.rs` covers the emitter and the verifier end to end.
 
 use std::time::{Duration, Instant};
@@ -234,8 +233,8 @@ fn two_assemblies_of_one_system_give_the_same_bytes() {
 fn a_wrong_origin_cofactor_goes_into_the_bytes_unrepaired() {
     let (input, basis, mut origins) = pair_system();
     // The cofactor of x - y over xy - 1 is -x. The sign flip keeps the
-    // shape and breaks the identity. The writer must copy it out as it
-    // stands; `tests/certified.rs` checks that such bytes are rejected.
+    // shape and breaks the identity. The writer copies it as given;
+    // `tests/certified.rs` checks that such bytes are rejected.
     origins[1] = list(&["y", "x"]);
 
     let bytes = emit(&input, &basis, &origins).expect("the emitter writes what it gets");

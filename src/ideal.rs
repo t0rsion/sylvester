@@ -3,7 +3,7 @@
 use std::ops::Deref;
 
 use crate::certificate::{CertifiedGroebnerBasis, CertifyError};
-use crate::compute::{self, ComputeError, ComputeOptions};
+use crate::compute::{self, ComputeError, ComputeOptions, ComputeReport};
 use crate::poly::Polynomial;
 use crate::ring::PolynomialRing;
 
@@ -44,12 +44,13 @@ impl Ideal {
         &self.generators
     }
 
-    /// Compute the reduced Gröbner basis under grevlex.
+    /// Compute the reduced Gröbner basis.
     ///
-    /// The options pick the backend and the resource budget. Nothing else
-    /// is checked. The result carries no proof: it is the value the engine
-    /// returned, unchecked. Use [`Ideal::groebner_basis_certified`] for a
-    /// basis an independent verifier has accepted.
+    /// The options pick the backend and the resource budget. The result is
+    /// the value the engine returned, unchecked.
+    ///
+    /// [`Ideal::groebner_basis_certified`] returns a basis an independent
+    /// verifier has accepted.
     pub fn groebner_basis(&self, options: ComputeOptions) -> Result<GroebnerBasis, ComputeError> {
         let polynomials = compute::groebner_basis(&self.ring, &self.generators, &options)?;
         Ok(GroebnerBasis {
@@ -58,23 +59,47 @@ impl Ideal {
         })
     }
 
-    /// Compute the reduced Gröbner basis and the certificate that proves
-    /// it.
+    /// Compute the reduced Gröbner basis and report what the run did.
+    ///
+    /// The basis is the one [`Ideal::groebner_basis`] returns for the same
+    /// options. The report adds the backend, the counters of the run, and
+    /// the wall time of the engine call.
+    pub fn groebner_basis_with_report(
+        &self,
+        options: ComputeOptions,
+    ) -> Result<(GroebnerBasis, ComputeReport), ComputeError> {
+        let (polynomials, report) =
+            compute::groebner_basis_with_report(&self.ring, &self.generators, &options)?;
+        let basis = GroebnerBasis {
+            ring: self.ring.clone(),
+            polynomials,
+        };
+        Ok((basis, report))
+    }
+
+    /// Compute the reduced Gröbner basis and the certificate the verifier
+    /// accepted for it.
     ///
     /// The value exists only after the independent verifier in
     /// [`crate::verify`] accepts the certificate bytes. The basis it
-    /// carries is decoded from those bytes, not taken from the engine.
+    /// carries is decoded from those bytes.
     ///
-    /// This release certifies the classic backend alone. The backend in
-    /// `options` is not read. The deadline and the memory limit are, and
-    /// they cover the whole run: the engine, the certificate, and the
-    /// verifier. An exhausted budget is [`CertifyError::Engine`] up to the
-    /// verifier and [`CertifyError::VerifierExhausted`] inside it. Neither
-    /// says anything about the basis.
+    /// The certificate format follows the backend. Classic writes
+    /// `sylv-gb-cert-v1` from the cofactors it tracks. F4 writes
+    /// `sylv-gb-cert-v2` from the trace it records. There is no format
+    /// option.
+    ///
+    /// The deadline and the memory limit cover the whole run: the engine,
+    /// the certificate, and the verifier. An exhausted budget is
+    /// [`CertifyError::Engine`] up to the verifier and
+    /// [`CertifyError::VerifierExhausted`] inside it. Neither says
+    /// anything about the basis.
+    ///
+    /// A run that records its trace stays on one thread, so the thread
+    /// count changes no byte of a `sylv-gb-cert-v2` certificate.
     ///
     /// [`CertifyError::Rejected`] means the engine wrote a certificate that
-    /// does not hold. That is an engine defect, reported rather than
-    /// panicked.
+    /// does not hold. That is an engine defect.
     pub fn groebner_basis_certified(
         &self,
         options: ComputeOptions,
@@ -86,8 +111,7 @@ impl Ideal {
 /// The basis a computation returned.
 ///
 /// The elements are monic and run strictly descending by leading monomial.
-/// The value derefs to `&[Polynomial]`, so slice methods and iteration work
-/// on it directly.
+/// The value derefs to `&[Polynomial]`.
 ///
 /// A basis from [`Ideal::groebner_basis`] is the engine's claim. A basis
 /// from [`Ideal::groebner_basis_certified`] passed the verifier.
@@ -107,7 +131,7 @@ impl GroebnerBasis {
         &self.ring
     }
 
-    /// Take the owned polynomials.
+    /// The polynomials, consuming the basis.
     pub fn into_polynomials(self) -> Vec<Polynomial> {
         self.polynomials
     }

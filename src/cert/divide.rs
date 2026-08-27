@@ -36,7 +36,7 @@ const DEADLINE_STRIDE: usize = 64;
 /// memory limit is passed.
 ///
 /// A divisor whose exponent vectors do not match the width of `f` reduces
-/// nothing. The function never panics.
+/// nothing.
 pub(crate) fn divide(
     f: &Polynomial,
     divisors: &[Polynomial],
@@ -53,7 +53,7 @@ pub(crate) fn divide(
     let mut steps = 0usize;
 
     while let Some(lead) = work.last().cloned() {
-        if steps % DEADLINE_STRIDE == 0 {
+        if steps.is_multiple_of(DEADLINE_STRIDE) {
             budget.check_deadline()?;
         }
         steps += 1;

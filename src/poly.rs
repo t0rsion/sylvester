@@ -10,15 +10,15 @@ use crate::ring::field::Felt;
 
 /// The exponent vector of a monomial.
 ///
-/// A ring with more than [`INLINE_VARIABLES`] variables still works: the
-/// vector spills to the heap.
+/// Past [`INLINE_VARIABLES`] variables, the vector spills to the heap.
 pub(crate) type Exps = SmallVec<[u16; INLINE_VARIABLES]>;
 
 /// The number of exponents a monomial holds inline.
 ///
 /// Eleven exponents are the most that fit the space `SmallVec` reserves
-/// anyway, so `Monomial` stays 40 bytes and `Term` 48. A wider inline
-/// array grows both and measures slower on every benchmark input.
+/// for the inline array, so `Monomial` stays 40 bytes and `Term` 48. A
+/// wider inline array grows both and measures slower on every benchmark
+/// input.
 const INLINE_VARIABLES: usize = 11;
 
 /// The heap bytes one monomial's exponent vector costs beyond what
@@ -39,8 +39,8 @@ pub(crate) fn heap_exps_bytes(nvars: usize) -> usize {
 
 /// A monomial product past the width one exponent holds.
 ///
-/// [`Monomial::checked_mul`] reports this instead of panicking. The
-/// engines turn it into [`crate::compute::ComputeError::DegreeLimit`].
+/// [`Monomial::checked_mul`] reports this. The engines turn it into
+/// [`crate::compute::ComputeError::DegreeLimit`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ExponentOverflow;
 
@@ -48,7 +48,7 @@ pub(crate) struct ExponentOverflow;
 ///
 /// Every monomial of one ring holds one exponent per variable. The
 /// arithmetic checks that width in debug builds, because a mismatch is a
-/// defect and not a value.
+/// defect.
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub(crate) struct Monomial {
     pub(crate) exps: Exps,
@@ -58,11 +58,10 @@ pub(crate) struct Monomial {
 /// Copy an exponent vector.
 ///
 /// Every monomial the engines build starts from a copy of one they hold,
-/// so this is the innermost step of both backends, and both ways
-/// `SmallVec` would do it cost more than the copy itself: its `Clone`
-/// runs a capacity check per element, and `from_slice` calls `memcpy` for
-/// twenty bytes. A ring inside the inline width copies a fixed-width
-/// buffer instead, which the compiler unrolls.
+/// so this is the innermost step of both backends. `SmallVec`'s `Clone`
+/// runs a capacity check per element, and `from_slice` calls `memcpy`.
+/// A ring inside the inline width copies a fixed-width buffer instead,
+/// which the compiler unrolls.
 #[inline]
 fn copy_exps(exps: &[u16]) -> Exps {
     if exps.len() > INLINE_VARIABLES {
@@ -114,8 +113,7 @@ impl Monomial {
         let deg = exps
             .iter()
             .try_fold(0u32, |acc, &e| acc.checked_add(e as u32))
-            // a ring holds at most 65535 variables and every
-            // exponent fits a u16, so the sum fits a u32.
+            // A ring holds at most 256 variables, each below 2^16.
             .expect("monomial degree overflow");
         Monomial { exps, deg }
     }
@@ -292,9 +290,8 @@ pub(crate) struct Term {
 ///
 /// Build one with [`PolynomialRing::polynomial`] or
 /// [`PolynomialRing::parse_polynomial`]. A polynomial carries its ring, so
-/// even the zero polynomial names its variables and its prime. The
-/// coefficients are reduced, the monomials are distinct, and no coefficient
-/// is zero.
+/// the zero polynomial names its variables and its prime. The coefficients
+/// are reduced, the monomials are distinct, and no coefficient is zero.
 ///
 /// `Display` writes the syntax [`PolynomialRing::parse_polynomial`] reads,
 /// with the terms in descending grevlex order.
@@ -357,7 +354,9 @@ impl Polynomial {
         Polynomial { ring, terms }
     }
 
-    /// Sort, merge, and drop the zero terms.
+    /// Build a polynomial from unsorted terms, merging like monomials.
+    ///
+    /// A term that reduces to zero drops out.
     pub(crate) fn from_terms(ring: PolynomialRing, mut terms: Vec<Term>) -> Self {
         let p = ring.modulus();
         terms.retain(|t| !t.coeff.is_zero());
@@ -365,16 +364,16 @@ impl Polynomial {
 
         let mut out: Vec<Term> = Vec::with_capacity(terms.len());
         for term in terms {
-            if let Some(last) = out.last_mut() {
-                if last.mono == term.mono {
-                    let c = last.coeff.add(term.coeff, p);
-                    if c.is_zero() {
-                        out.pop();
-                    } else {
-                        last.coeff = c;
-                    }
-                    continue;
+            if let Some(last) = out.last_mut()
+                && last.mono == term.mono
+            {
+                let c = last.coeff.add(term.coeff, p);
+                if c.is_zero() {
+                    out.pop();
+                } else {
+                    last.coeff = c;
                 }
+                continue;
             }
             out.push(term);
         }
@@ -528,8 +527,7 @@ impl Polynomial {
     /// Return `m * self`, or [`ExponentOverflow`] when a product leaves the
     /// width one exponent holds.
     ///
-    /// The coefficients are copied. Grevlex is a monomial order, so the
-    /// terms stay in ascending order.
+    /// Grevlex is a monomial order, so the terms stay in ascending order.
     pub(crate) fn shift_monomial(&self, m: &Monomial) -> Result<Self, ExponentOverflow> {
         let mut terms: Vec<Term> = Vec::with_capacity(self.terms.len());
         for t in &self.terms {
@@ -578,18 +576,15 @@ impl Polynomial {
                 Ordering::Greater => {
                     let b_coeff = b0.coeff.mul(c, p).neg(p);
                     let mono = b_mono.take().expect("the multiple is held");
-                    if !b_coeff.is_zero() {
-                        out.push(Term {
-                            coeff: b_coeff,
-                            mono,
-                        });
-                    }
+                    out.push(Term {
+                        coeff: b_coeff,
+                        mono,
+                    });
                     j += 1;
                 }
                 Ordering::Equal => {
                     let b_coeff = b0.coeff.mul(c, p);
                     let new_coeff = a.coeff.sub(b_coeff, p);
-                    // The monomials are equal, so the held multiple equals a.mono.
                     let mono = b_mono.take().expect("the multiple is held");
                     if !new_coeff.is_zero() {
                         out.push(Term {
@@ -604,22 +599,7 @@ impl Polynomial {
         }
 
         out.extend(self.terms[i..].iter().cloned());
-        while j < other.terms.len() {
-            let b0 = &other.terms[j];
-            let b_coeff = b0.coeff.mul(c, p).neg(p);
-            let held = b_mono.take();
-            if !b_coeff.is_zero() {
-                let mono = match held {
-                    Some(mono) => mono,
-                    None => b0.mono.checked_mul(m)?,
-                };
-                out.push(Term {
-                    coeff: b_coeff,
-                    mono,
-                });
-            }
-            j += 1;
-        }
+        append_scaled_tail(&mut out, &other.terms, j, b_mono, c, m, p)?;
 
         Ok(self.with_terms(out))
     }
@@ -714,6 +694,69 @@ impl Polynomial {
     }
 }
 
+fn append_scaled_tail(
+    out: &mut Vec<Term>,
+    terms: &[Term],
+    mut start: usize,
+    held: Option<Monomial>,
+    c: Felt,
+    m: &Monomial,
+    p: u64,
+) -> Result<(), ExponentOverflow> {
+    if let Some(mono) = held {
+        push_negated_scaled(out, &terms[start], c, mono, p);
+        start += 1;
+    }
+    for term in &terms[start..] {
+        push_negated_scaled(out, term, c, term.mono.checked_mul(m)?, p);
+    }
+    Ok(())
+}
+
+fn push_negated_scaled(out: &mut Vec<Term>, term: &Term, c: Felt, mono: Monomial, p: u64) {
+    out.push(Term {
+        coeff: term.coeff.mul(c, p).neg(p),
+        mono,
+    });
+}
+
+fn write_term(
+    f: &mut fmt::Formatter<'_>,
+    variables: &[String],
+    coeff: u64,
+    exps: &[u16],
+) -> fmt::Result {
+    let mut written = false;
+    if coeff != 1 || exps.iter().all(|&exp| exp == 0) {
+        write!(f, "{coeff}")?;
+        written = true;
+    }
+    for (name, &exp) in variables.iter().zip(exps) {
+        written = write_variable(f, name, exp, written)?;
+    }
+    Ok(())
+}
+
+fn write_variable(
+    f: &mut fmt::Formatter<'_>,
+    name: &str,
+    exp: u16,
+    mut written: bool,
+) -> Result<bool, fmt::Error> {
+    if exp == 0 {
+        return Ok(written);
+    }
+    if written {
+        f.write_str("*")?;
+    }
+    written = true;
+    match exp {
+        1 => f.write_str(name)?,
+        _ => write!(f, "{name}^{exp}")?,
+    }
+    Ok(written)
+}
+
 impl fmt::Display for Polynomial {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.is_zero() {
@@ -724,25 +767,7 @@ impl fmt::Display for Polynomial {
             if index > 0 {
                 f.write_str(" + ")?;
             }
-            let mut written = false;
-            if coeff != 1 || exps.iter().all(|&e| e == 0) {
-                write!(f, "{coeff}")?;
-                written = true;
-            }
-            for (name, &exp) in variables.iter().zip(exps) {
-                if exp == 0 {
-                    continue;
-                }
-                if written {
-                    f.write_str("*")?;
-                }
-                written = true;
-                if exp == 1 {
-                    f.write_str(name)?;
-                } else {
-                    write!(f, "{name}^{exp}")?;
-                }
-            }
+            write_term(f, variables, coeff, exps)?;
         }
         Ok(())
     }

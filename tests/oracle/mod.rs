@@ -2,9 +2,9 @@
 //!
 //! The oracle has its own polynomial arithmetic, grevlex from the
 //! definition, textbook Buchberger completion, and interreduction. It shares
-//! no code with `src/**`, so it cannot inherit an engine bug. The reduced
-//! Gröbner basis of an ideal is unique, so each backend's output must equal
-//! the oracle's reduced basis as a set of monic polynomials.
+//! no code with `src/**`. The reduced Gröbner basis of an ideal is unique, so
+//! each backend's output must equal the oracle's reduced basis as a set of
+//! monic polynomials.
 //!
 //! Each test crate that includes this module uses a different subset, so the
 //! whole module is exempt from `dead_code`.
@@ -14,16 +14,16 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use sylvester::{Backend, ComputeError, ComputeOptions, GroebnerBasis, Ideal, PolynomialRing};
 
-pub fn sub_mod(a: u64, b: u64, p: u64) -> u64 {
+pub(crate) fn sub_mod(a: u64, b: u64, p: u64) -> u64 {
     (a + p - b % p) % p
 }
 
-pub fn mul_mod(a: u64, b: u64, p: u64) -> u64 {
+pub(crate) fn mul_mod(a: u64, b: u64, p: u64) -> u64 {
     ((a as u128 * b as u128) % p as u128) as u64
 }
 
-pub fn inv_mod(a: u64, p: u64) -> u64 {
-    assert!(a % p != 0, "attempted to invert zero mod {p}");
+pub(crate) fn inv_mod(a: u64, p: u64) -> u64 {
+    assert!(!a.is_multiple_of(p), "attempted to invert zero mod {p}");
     let mut base = a % p;
     let mut exp = p - 2;
     let mut acc = 1u64;
@@ -37,9 +37,9 @@ pub fn inv_mod(a: u64, p: u64) -> u64 {
     acc
 }
 
-pub type Exps = Vec<u16>;
+pub(crate) type Exps = Vec<u16>;
 
-pub fn grevlex_cmp(a: &[u16], b: &[u16]) -> Ordering {
+pub(crate) fn grevlex_cmp(a: &[u16], b: &[u16]) -> Ordering {
     assert_eq!(a.len(), b.len(), "monomials from different rings");
     let da: u64 = a.iter().map(|&e| e as u64).sum();
     let db: u64 = b.iter().map(|&e| e as u64).sum();
@@ -57,39 +57,39 @@ pub fn grevlex_cmp(a: &[u16], b: &[u16]) -> Ordering {
     Ordering::Equal
 }
 
-pub fn divides(divisor: &[u16], multiple: &[u16]) -> bool {
+pub(crate) fn divides(divisor: &[u16], multiple: &[u16]) -> bool {
     divisor.iter().zip(multiple.iter()).all(|(d, m)| d <= m)
 }
 
-pub fn exps_sub(a: &[u16], b: &[u16]) -> Exps {
+pub(crate) fn exps_sub(a: &[u16], b: &[u16]) -> Exps {
     a.iter().zip(b.iter()).map(|(x, y)| x - y).collect()
 }
 
-pub fn exps_add(a: &[u16], b: &[u16]) -> Exps {
+pub(crate) fn exps_add(a: &[u16], b: &[u16]) -> Exps {
     a.iter().zip(b.iter()).map(|(x, y)| x + y).collect()
 }
 
-pub fn exps_lcm(a: &[u16], b: &[u16]) -> Exps {
+pub(crate) fn exps_lcm(a: &[u16], b: &[u16]) -> Exps {
     a.iter().zip(b.iter()).map(|(x, y)| *x.max(y)).collect()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Poly {
-    pub terms: BTreeMap<Exps, u64>,
+pub(crate) struct Poly {
+    pub(crate) terms: BTreeMap<Exps, u64>,
 }
 
 impl Poly {
-    pub fn zero() -> Self {
+    pub(crate) fn zero() -> Self {
         Poly {
             terms: BTreeMap::new(),
         }
     }
 
-    pub fn is_zero(&self) -> bool {
+    pub(crate) fn is_zero(&self) -> bool {
         self.terms.is_empty()
     }
 
-    pub fn leading_term(&self) -> Option<(&Exps, u64)> {
+    pub(crate) fn leading_term(&self) -> Option<(&Exps, u64)> {
         self.terms
             .iter()
             .max_by(|(a, _), (b, _)| grevlex_cmp(a, b))
@@ -97,7 +97,7 @@ impl Poly {
     }
 
     /// Subtract `factor * x^shift * g` from `self`, modulo `p`.
-    pub fn sub_scaled(&mut self, factor: u64, shift: &[u16], g: &Poly, p: u64) {
+    pub(crate) fn sub_scaled(&mut self, factor: u64, shift: &[u16], g: &Poly, p: u64) {
         for (mono, &coeff) in &g.terms {
             let target = exps_add(mono, shift);
             let delta = mul_mod(factor, coeff, p);
@@ -107,7 +107,7 @@ impl Poly {
         self.terms.retain(|_, c| *c != 0);
     }
 
-    pub fn make_monic(&self, p: u64) -> Poly {
+    pub(crate) fn make_monic(&self, p: u64) -> Poly {
         let Some((_, lead)) = self.leading_term() else {
             return Poly::zero();
         };
@@ -120,7 +120,7 @@ impl Poly {
     }
 }
 
-pub fn poly_from_terms(terms: &[(u64, &[u16])], p: u64) -> Poly {
+pub(crate) fn poly_from_terms(terms: &[(u64, &[u16])], p: u64) -> Poly {
     let mut poly = Poly::zero();
     for &(coeff, exps) in terms {
         let entry = poly.terms.entry(exps.to_vec()).or_insert(0);
@@ -130,7 +130,7 @@ pub fn poly_from_terms(terms: &[(u64, &[u16])], p: u64) -> Poly {
     poly
 }
 
-pub fn normal_form(f: &Poly, basis: &[Poly], p: u64) -> Poly {
+pub(crate) fn normal_form(f: &Poly, basis: &[Poly], p: u64) -> Poly {
     let mut work = f.clone();
     let mut remainder = Poly::zero();
     while let Some((lead_mono, lead_coeff)) = work.leading_term() {
@@ -154,7 +154,7 @@ pub fn normal_form(f: &Poly, basis: &[Poly], p: u64) -> Poly {
     remainder
 }
 
-pub fn s_polynomial(f: &Poly, g: &Poly, p: u64) -> Poly {
+pub(crate) fn s_polynomial(f: &Poly, g: &Poly, p: u64) -> Poly {
     let (f_mono, f_coeff) = f.leading_term().expect("s_polynomial: f is zero");
     let (g_mono, g_coeff) = g.leading_term().expect("s_polynomial: g is zero");
     let lcm = exps_lcm(f_mono, g_mono);
@@ -170,7 +170,7 @@ pub fn s_polynomial(f: &Poly, g: &Poly, p: u64) -> Poly {
 /// each processed exactly once, new pairs enqueued on every insertion.
 /// Pairs are processed lowest lcm degree first (the normal selection
 /// strategy); selection order does not affect correctness, only size.
-pub fn buchberger(generators: &[Poly], p: u64) -> Vec<Poly> {
+pub(crate) fn buchberger(generators: &[Poly], p: u64) -> Vec<Poly> {
     fn lcm_degree(basis: &[Poly], i: usize, j: usize) -> u64 {
         let (mi, _) = basis[i].leading_term().expect("nonzero");
         let (mj, _) = basis[j].leading_term().expect("nonzero");
@@ -217,7 +217,7 @@ pub fn buchberger(generators: &[Poly], p: u64) -> Vec<Poly> {
 
 /// Reduced Gröbner basis from a Gröbner basis: minimalize leading terms,
 /// then interreduce until stable.
-pub fn reduce_basis(basis: &[Poly], p: u64) -> Vec<Poly> {
+pub(crate) fn reduce_basis(basis: &[Poly], p: u64) -> Vec<Poly> {
     let mut current: Vec<Poly> = basis
         .iter()
         .filter(|f| !f.is_zero())
@@ -260,10 +260,10 @@ pub fn reduce_basis(basis: &[Poly], p: u64) -> Vec<Poly> {
 }
 
 /// Deterministic splitmix64.
-pub struct Rng(pub u64);
+pub(crate) struct Rng(pub u64);
 
 impl Rng {
-    pub fn next_u64(&mut self) -> u64 {
+    pub(crate) fn next_u64(&mut self) -> u64 {
         self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
         let mut z = self.0;
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
@@ -271,21 +271,21 @@ impl Rng {
         z ^ (z >> 31)
     }
 
-    pub fn below(&mut self, n: u64) -> u64 {
+    pub(crate) fn below(&mut self, n: u64) -> u64 {
         self.next_u64() % n
     }
 }
 
 #[derive(Clone, Copy)]
-pub struct Shape {
-    pub nvars: usize,
-    pub max_deg: u64,
-    pub ngens: usize,
-    pub min_terms: u64,
-    pub term_spread: u64,
+pub(crate) struct Shape {
+    pub(crate) nvars: usize,
+    pub(crate) max_deg: u64,
+    pub(crate) ngens: usize,
+    pub(crate) min_terms: u64,
+    pub(crate) term_spread: u64,
 }
 
-pub const fn shape(
+pub(crate) const fn shape(
     nvars: usize,
     max_deg: u64,
     ngens: usize,
@@ -302,13 +302,13 @@ pub const fn shape(
 }
 
 /// 3 variables, 4 generators, degree <= 3, 1..=4 term-insertion attempts.
-pub const SMALL: Shape = shape(3, 3, 4, 1, 4);
+pub(crate) const SMALL: Shape = shape(3, 3, 4, 1, 4);
 
 /// 4 variables, 5 generators, degree <= 3, 2..=5 term-insertion attempts.
-pub const HARDER: Shape = shape(4, 3, 5, 2, 4);
+pub(crate) const HARDER: Shape = shape(4, 3, 5, 2, 4);
 
 /// A random monomial in `shape.nvars` variables of total degree <= max_deg.
-pub fn random_mono(rng: &mut Rng, shape: Shape) -> Exps {
+pub(crate) fn random_mono(rng: &mut Rng, shape: Shape) -> Exps {
     loop {
         let exps: Exps = (0..shape.nvars)
             .map(|_| rng.below(shape.max_deg + 1) as u16)
@@ -322,7 +322,7 @@ pub fn random_mono(rng: &mut Rng, shape: Shape) -> Exps {
 
 /// A random system of `shape.ngens` polynomials; term counts are insertion
 /// attempts, so colliding monomials can leave fewer (or zero) terms.
-pub fn random_system(rng: &mut Rng, p: u64, shape: Shape) -> Vec<Poly> {
+pub(crate) fn random_system(rng: &mut Rng, p: u64, shape: Shape) -> Vec<Poly> {
     (0..shape.ngens)
         .map(|_| {
             let nterms = shape.min_terms + rng.below(shape.term_spread);
@@ -340,11 +340,11 @@ pub fn random_system(rng: &mut Rng, p: u64, shape: Shape) -> Vec<Poly> {
 }
 
 /// The variable names the engine ring uses, one per oracle variable.
-pub fn variable_names(nvars: usize) -> Vec<String> {
+pub(crate) fn variable_names(nvars: usize) -> Vec<String> {
     (0..nvars).map(|index| format!("x{index}")).collect()
 }
 
-pub fn to_engine_ideal(system: &[Poly], p: u64, nvars: usize) -> Ideal {
+pub(crate) fn to_engine_ideal(system: &[Poly], p: u64, nvars: usize) -> Ideal {
     let ring = PolynomialRing::prime_field(p, variable_names(nvars)).expect("the modulus is prime");
     let generators: Vec<_> = system
         .iter()
@@ -365,7 +365,7 @@ pub fn to_engine_ideal(system: &[Poly], p: u64, nvars: usize) -> Ideal {
         .expect("the polynomials share a ring")
 }
 
-pub fn engine_output_to_polys(output: &GroebnerBasis, p: u64, nvars: usize) -> Vec<Poly> {
+pub(crate) fn engine_output_to_polys(output: &GroebnerBasis, p: u64, nvars: usize) -> Vec<Poly> {
     output
         .iter()
         .map(|poly| {
@@ -383,7 +383,7 @@ pub fn engine_output_to_polys(output: &GroebnerBasis, p: u64, nvars: usize) -> V
         .collect()
 }
 
-pub fn canonical_set(basis: &[Poly], p: u64) -> BTreeSet<Vec<(Exps, u64)>> {
+pub(crate) fn canonical_set(basis: &[Poly], p: u64) -> BTreeSet<Vec<(Exps, u64)>> {
     basis
         .iter()
         .filter(|f| !f.is_zero())
@@ -391,11 +391,11 @@ pub fn canonical_set(basis: &[Poly], p: u64) -> BTreeSet<Vec<(Exps, u64)>> {
         .collect()
 }
 
-pub fn make_canonical(f: &Poly) -> Vec<(Exps, u64)> {
+pub(crate) fn make_canonical(f: &Poly) -> Vec<(Exps, u64)> {
     f.terms.iter().map(|(e, &c)| (e.clone(), c)).collect()
 }
 
-pub fn render_system(system: &[Poly]) -> String {
+pub(crate) fn render_system(system: &[Poly]) -> String {
     let rendered: Vec<String> = system.iter().map(|f| format!("{:?}", f.terms)).collect();
     format!("[{}]", rendered.join(", "))
 }
@@ -440,9 +440,9 @@ fn check_backend(
     );
 }
 
-/// Run both backends on one system and compare each against the oracle's
+/// Runs both backends on one system and compares each against the oracle's
 /// reduced basis.
-pub fn check_system(system: &[Poly], p: u64, nvars: usize, seed: u64) {
+pub(crate) fn check_system(system: &[Poly], p: u64, nvars: usize, seed: u64) {
     if system.iter().all(Poly::is_zero) {
         return;
     }
@@ -450,7 +450,7 @@ pub fn check_system(system: &[Poly], p: u64, nvars: usize, seed: u64) {
     let oracle_reduced = canonical_set(&reduce_basis(&oracle, p), p);
     let ideal = to_engine_ideal(system, p, nvars);
 
-    for (label, backend) in [("classic", Backend::Classic), ("matrix", Backend::Matrix)] {
+    for (label, backend) in [("classic", Backend::Classic), ("f4", Backend::F4)] {
         check_backend(
             label,
             system,

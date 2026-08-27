@@ -2,8 +2,8 @@
 //! oracle in `tests/oracle`.
 //!
 //! Five tests run in the default suite. Two sweeps, `adversarial_largest_modulus`
-//! and `adversarial_huge_exponents`, are `#[ignore]`d for their runtime; run
-//! them with `cargo +1.92 test --release --test adversarial -- --ignored`.
+//! and `adversarial_huge_exponents`, are `#[ignore]`d for their runtime.
+//! `cargo +1.92 test --release --test adversarial -- --ignored` runs them.
 
 mod oracle;
 
@@ -120,7 +120,7 @@ fn adversarial_tiny_inputs() {
             vec![zero, one],
         ] {
             let ideal = ring.ideal(gens.clone()).expect("same ring");
-            for backend in [Backend::Classic, Backend::Matrix] {
+            for backend in [Backend::Classic, Backend::F4] {
                 let out = ideal
                     .groebner_basis(ComputeOptions::new().backend(backend))
                     .expect("no budget");
@@ -157,11 +157,11 @@ fn adversarial_backend_agreement_on_larger_shapes() {
                 let classic = ideal
                     .groebner_basis(ComputeOptions::new().backend(Backend::Classic))
                     .expect("no budget");
-                let matrix = ideal
-                    .groebner_basis(ComputeOptions::new().backend(Backend::Matrix))
+                let f4 = ideal
+                    .groebner_basis(ComputeOptions::new().backend(Backend::F4))
                     .expect("no budget");
                 let a = canonical_set(&engine_output_to_polys(&classic, p, s.nvars), p);
-                let b = canonical_set(&engine_output_to_polys(&matrix, p, s.nvars), p);
+                let b = canonical_set(&engine_output_to_polys(&f4, p, s.nvars), p);
                 assert_eq!(
                     a,
                     b,
@@ -213,14 +213,15 @@ fn adversarial_huge_exponents() {
                 }
                 let ideal = ring.ideal(generators).expect("one ring");
                 // A few near-limit configurations run a genuinely large
-                // computation, so each carries a timeout. The claim under
-                // test is that every run ends in a value or a typed error,
-                // never a panic; a stopped run reports the typed error.
+                // computation, so each carries a timeout. A stopped run
+                // reports the typed error.
                 let options = ComputeOptions::new().timeout(std::time::Duration::from_millis(750));
-                for backend in [Backend::Classic, Backend::Matrix] {
+                for backend in [Backend::Classic, Backend::F4] {
                     match ideal.groebner_basis(options.clone().backend(backend)) {
                         Ok(_)
                         | Err(sylvester::ComputeError::DegreeLimit { .. })
+                        | Err(sylvester::ComputeError::ExponentLimit { .. })
+                        | Err(sylvester::ComputeError::TableFull)
                         | Err(sylvester::ComputeError::Timeout) => {}
                         Err(other) => panic!(
                             "unexpected error {other} for nvars={nvars} p={p} seed={seed} backend={backend:?}"

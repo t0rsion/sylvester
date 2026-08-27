@@ -1,27 +1,39 @@
 # sylvester
 
-A signature-based Gröbner basis library over finite prime fields. Every
-value comes from a `PolynomialRing`, which fixes the prime (`2 <= p <= 2^31
-- 1`), the variable names (at most 256), and the variable order. The
-monomial order is grevlex, and there is no other. Two backends compute the
-reduced basis: classic F5, one critical pair at a time in signature order,
-and a Macaulay-matrix backend that batches pairs by degree. The certified
-path returns a basis only after an independent verifier accepts a
-certificate for it, and that verifier shares no code with the engines.
+Gröbner bases over finite prime fields in Rust.
 
-This is a first alpha. The API will change.
+Version 0.2.0 contains:
+
+- a default F4 engine with sparse matrix reduction;
+- a repaired classic F5 engine used as an independent oracle;
+- independent verifiers for classic and F4 certificates;
+- typed time, memory, exponent, and table limits;
+- deterministic differential tests on complete bases.
+
+This is an alpha. The API may change before 1.0.
 
 ## Status
 
-Repaired, checked against oracles, not proven. Two counterexamples proved
-both backends wrong as first extracted; this tree carries the repair,
-checked by the independent checker in `tests/known_defects.rs` and a
-randomized differential suite against a self-contained Buchberger oracle.
-Termination has a pen-and-paper proof by Dickson's lemma. No proof here is
-machine-checked, and the verifier itself is a trusted, unproven base.
+Both engines are empirically checked, not proven. The default suite compares
+complete reduced bases with an independent Buchberger oracle. Fixed
+counterexamples block failures that output-only checks miss.
 
-Certification is classic-only: the matrix backend emits no certificate, so
-a basis from it is unchecked. This is a `0.1` alpha; treat it as such.
+An accepted certificate establishes the result. The verifier is trusted,
+unproven code. No proof in this repository is machine-checked.
+
+See [KNOWN_ISSUES.md][known-issues] for the counterexamples, repairs,
+termination arguments, and evidence limits.
+
+## Domain
+
+`PolynomialRing` fixes:
+
+- a prime \(p\), where \(2\le p\le2^{31}-1\);
+- at most 256 variable names;
+- the variable order;
+- grevlex, named `grevlex-v1` in certificates.
+
+There is no runtime monomial order. One exponent is at most 65,535.
 
 ## Example
 
@@ -42,55 +54,105 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let certified = ideal.groebner_basis_certified(ComputeOptions::new())?;
-    println!("verifier accepted {} bytes", certified.certificate().len());
+    println!("{} certificate bytes", certified.certificate().len());
     Ok(())
 }
 ```
 
-`ComputeOptions` picks the `backend`, `timeout`, and `memory_limit`. An
-exhausted budget is a typed `ComputeError::Timeout` or
-`MemoryLimitExceeded`; a monomial past total degree 65,535 is
-`ComputeError::DegreeLimit`. Nothing truncates silently.
+F4 is the default. Select classic explicitly when needed:
+
+```rust
+use sylvester::{Backend, ComputeOptions};
+
+let options = ComputeOptions::new()
+    .backend(Backend::Classic)
+    .memory_limit(512 << 20)
+    .threads(1);
+# let _ = options;
+```
+
+`ComputeOptions` sets the backend, timeout, memory limit, and F4 thread count.
+Zero threads use Rayon's global pool. One thread uses the calling thread.
+Classic and certified calls remain serial.
+
+`Ideal::groebner_basis_with_report` also returns elapsed time and F4 counters.
+
+## Partiality
+
+The computation returns typed errors. It never truncates silently.
+
+| Error | Meaning |
+| --- | --- |
+| `Timeout` | The deadline passed. |
+| `MemoryLimitExceeded` | The tracked live data passed the byte budget. |
+| `DegreeLimit` | Classic needed a monomial past the supported total degree. |
+| `ExponentLimit` | F4 needed one exponent above 65,535. |
+| `TableFull` | An F4 monomial table exhausted its identifier space. |
+
+The memory budget charges owned engine and certificate data. It does not cap
+process RSS.
 
 ## Certificates
 
-`groebner_basis_certified` returns the basis together with the bytes the
-verifier accepted, decoded from those bytes rather than taken from the
-engine. Acceptance establishes that the input and the returned basis
-generate the same ideal and that the basis is the reduced Gröbner basis of
-that ideal, over F_p under grevlex. It does not make an engine correct: an
-engine can still hang, exhaust its budget, or write a certificate the
-verifier rejects.
+`Ideal::groebner_basis_certified` follows the selected backend:
 
-The bytes are canonical JSON under the `sylv-gb-cert-v1` contract, so
-`verify::verify` can check a stored certificate later, applying every
-resource cap before it allocates. A certified run costs several times an
-uncertified one.
+| Backend | Contract | Encoding |
+| --- | --- | --- |
+| Classic | `sylv-gb-cert-v1` | Canonical JSON with explicit cofactors |
+| F4 | `sylv-gb-cert-v2` | Canonical binary operation trace |
 
-## Performance
+The method verifies its bytes before returning. The returned basis is decoded
+from those accepted bytes.
 
-sylvester is slower than msolve and Groebner.jl and does not finish every
-instance they do. Measured comparisons come with v0.2.
+Acceptance establishes:
 
-## Roadmap
+\[
+\langle F\rangle=\langle G\rangle,
+\qquad
+G=\operatorname{rGB}_{\mathrm{grevlex}}(\langle F\rangle).
+\]
 
-- v0.2: speed. An F4 engine, with certificates built from an execution trace.
-- v0.3: Python bindings, rational coefficients, and more ideal operations.
+`verify::verify` checks stored v1 or v2 bytes. `verify::verify_with_limits`
+adds caller-supplied caps and a deadline. The verifier code is isolated from
+both engines.
 
-## Building and testing
+The frozen contracts are [certificate-v1.md][certificate-v1] and
+[certificate-v2.md][certificate-v2].
 
-Rust 1.85 or later; `rust-toolchain.toml` pins 1.92 for development.
+## Evidence
 
+The default suite checks both engines against a criterion-free Buchberger
+oracle over five prime fields. The release suite adds 166,375 exhaustive
+systems over \(\mathbb F_2\), 1,000 degree-reversal systems over
+\(\mathbb F_3\), and an `eco-8` F4-to-classic comparison.
+
+The external harness compares complete bases with Singular, msolve,
+Macaulay2, and Groebner.jl. Timings apply only to the recorded machine,
+versions, inputs, and limits. The v0.2 one-thread F4 gate passes at a
+1.13x geometric mean and a 1.48x worst cell against msolve. See
+[the comparison record][comparison-record].
+
+## Build
+
+The minimum supported Rust version is 1.88. Development pins Rust 1.92.
+
+```text
+cargo +1.92 test --workspace
+cargo +1.92 test --release --test differential -- --ignored
+cargo +1.92 test --release --test f4_engine -- --ignored
+cargo +1.92 clippy --workspace --all-targets --all-features -- -D warnings
+cargo +1.92 fmt --all --check
+RUSTDOCFLAGS="-D warnings" cargo +1.92 doc --workspace --no-deps
 ```
-cargo +1.92 test
-cargo +1.92 test --features parallel
-cargo +1.92 test --release --test differential -- --ignored    # slow sweeps
-```
 
-`parallel` is the only feature: it adds rayon row elimination to the matrix
-backend.
+The crate has no feature flags.
 
 ## License
 
 MIT OR Apache-2.0, at your option. See [LICENSE-MIT](LICENSE-MIT) and
 [LICENSE-APACHE](LICENSE-APACHE).
+
+[certificate-v1]: https://github.com/t0rsion/sylvester/blob/v0.2.0/docs/certificate-v1.md
+[certificate-v2]: https://github.com/t0rsion/sylvester/blob/v0.2.0/docs/certificate-v2.md
+[comparison-record]: https://github.com/t0rsion/sylvester/blob/v0.2.0/benchmarks/gb-comparison/REPORT.md
+[known-issues]: https://github.com/t0rsion/sylvester/blob/v0.2.0/KNOWN_ISSUES.md

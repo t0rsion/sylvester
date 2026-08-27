@@ -2,9 +2,9 @@
 //!
 //! The writer emits the `sylv-gb-cert-v1` object: the nine keys in the
 //! contract order, no insignificant whitespace, and decimal integers.
-//! Engine terms run ascending under the order and
-//! certificate terms run descending, so the writer reverses every term
-//! list. The same values always give the same bytes.
+//! Engine terms run ascending under the order and certificate terms run
+//! descending, so the writer reverses every term list. The same values
+//! always give the same bytes.
 
 use crate::compute::ComputeError;
 use crate::poly::Polynomial;
@@ -29,10 +29,9 @@ pub(crate) struct Parts<'a> {
 /// Write the canonical bytes, or stop when the buffer would pass the limit.
 ///
 /// The writer charges the growing buffer against `budget` once per
-/// polynomial, the granularity the arrays already iterate. So a certificate
-/// too large for the memory limit stops within one polynomial of the limit
-/// instead of after the whole buffer is built. When the budget passes, the
-/// bytes are exactly what the same `parts` always produce.
+/// polynomial. A certificate too large for the memory limit stops within
+/// one polynomial of the limit instead of after the whole buffer is built.
+/// The budget stops a write; it never changes the bytes.
 pub(crate) fn write(parts: &Parts<'_>, budget: &Budget) -> Result<Vec<u8>, ComputeError> {
     let mut out = Vec::new();
     out.extend_from_slice(br#"{"schema":""#);
