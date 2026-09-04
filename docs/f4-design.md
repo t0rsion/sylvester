@@ -1,13 +1,13 @@
-# F4 design for v0.2
+# F4 engine design
 
-Status: implemented in 0.2.0.
+Status: implemented.
 
 This document records the F4 engine in `src/compute/f4`. It is not a proof of
 correctness. `KNOWN_ISSUES.md` states the evidence and its limits.
 
 ## 1. Scope
 
-Version 0.2 adds one prime-field backend:
+The design adds one prime-field backend:
 
 \[
 \text{critical pairs}
@@ -21,8 +21,8 @@ The engine computes over \(\mathbb F_p\), where
 \(2\le p\le 2^{31}-1\). It uses the sealed `grevlex-v1` order. It accepts at
 most 256 variables. One exponent is at most 65,535.
 
-The release also retains classic F5. F4 is the default. Classic remains the
-independent engine oracle and the v1 certificate producer.
+F4 is the default. Classic F5 remains the independent engine oracle and
+the v1 certificate producer.
 
 This release does not add rational arithmetic, runtime monomial orders,
 user-defined pair criteria, or new coefficient domains.
@@ -294,12 +294,12 @@ record is `benchmarks/gb-comparison/REPORT.md`.
 
 ## 15. Non-goals
 
-Version 0.2 does not claim:
+The design does not claim:
 
 - a proof of engine or verifier correctness;
 - equality between the memory estimate and process RSS;
 - performance outside the recorded benchmark;
-- stable pre-1.0 API compatibility;
+- stable API compatibility;
 - rational coefficients or rational certificates;
 - configurable monomial orders;
 - GPU or distributed execution.

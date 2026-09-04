@@ -1,41 +1,34 @@
-//! Emission tests: every certificate is checked byte for byte.
+//! Emission tests: every certificate goes to the independent verifier.
 //!
-//! The expected strings are the ones `tests/verifier.rs` accepts by hand, so
+//! The verifier is the oracle. A certificate is right when it accepts. The
+//! expected byte strings are the ones `tests/verifier.rs` checks by hand, so
 //! the writer and the hand-written corpus stay one format.
-//! `tests/certified.rs` covers the emitter and the verifier end to end.
 
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
-use super::{Budget, assemble, divide::divide, origin::Origin, represent};
+use super::{WriterBudget, assemble, divide::divide, origin::Origin, represent};
 use crate::certificate::{CertifyError, EmitterFault, Place};
-use crate::compute::ComputeError;
+use crate::compute::{ComputeError, ComputeLimits};
 use crate::poly::Polynomial;
-use crate::ring::PolynomialRing;
+use crate::ring::{PolynomialRing, PrimeOps};
+use crate::verify::{VerifyError, verify};
 
 const P: u64 = 7;
 
+/// The field arithmetic of the test ring.
+fn ops() -> PrimeOps {
+    PrimeOps::new(P)
+}
+
 /// A budget that stops nothing, for the two-variable ring.
-fn budget() -> Budget {
-    Budget::unlimited(2)
+fn budget() -> WriterBudget {
+    WriterBudget::unlimited(2)
 }
 
 fn ring() -> PolynomialRing {
     PolynomialRing::prime_field(P, ["x", "y"]).expect("7 is prime")
-}
-
-/// Assemble over the two-variable ring with an unlimited budget.
-fn emit(
-    input: &[Polynomial],
-    basis: &[Polynomial],
-    origins: &[Origin],
-) -> Result<Vec<u8>, CertifyError> {
-    assemble(
-        &ring(),
-        input,
-        basis.to_vec(),
-        origins.to_vec(),
-        &mut budget(),
-    )
 }
 
 /// Build polynomials of the two-variable ring from text.
@@ -55,11 +48,7 @@ fn one(text: &str) -> Polynomial {
 fn product(a: &Polynomial, b: &Polynomial) -> Polynomial {
     let mut out = a.zero_like();
     for term in &a.terms {
-        out = out.add(
-            &b.scale_monomial(term.coeff, &term.mono, P)
-                .expect("the product fits"),
-            P,
-        );
+        out = out.add(&b.scale_monomial(&term.coeff, &term.mono, &ops()), &ops());
     }
     out
 }
@@ -75,7 +64,14 @@ fn emits_the_single_generator_certificate() {
     let basis = input.clone();
     let origins = vec![list(&["1"])];
 
-    let bytes = emit(&input, &basis, &origins).expect("the basis holds");
+    let bytes = assemble(
+        &ring(),
+        &input,
+        basis.clone(),
+        origins.clone(),
+        &mut budget(),
+    )
+    .expect("the basis holds");
     assert_eq!(
         text(&bytes),
         concat!(
@@ -84,6 +80,7 @@ fn emits_the_single_generator_certificate() {
             r#""origin":[[[[1,[0,0]]]]],"membership":[[[[1,[0,0]]]]],"spairs":[]}"#
         )
     );
+    verify(&bytes).expect("the certificate holds");
 }
 
 /// F = {x, x + 1}, G = {1}, with 1 = -x + (x + 1).
@@ -93,7 +90,14 @@ fn emits_the_unit_ideal_certificate() {
     let basis = list(&["1"]);
     let origins = vec![list(&["-1", "1"])];
 
-    let bytes = emit(&input, &basis, &origins).expect("the basis holds");
+    let bytes = assemble(
+        &ring(),
+        &input,
+        basis.clone(),
+        origins.clone(),
+        &mut budget(),
+    )
+    .expect("the basis holds");
     assert_eq!(
         text(&bytes),
         concat!(
@@ -103,6 +107,7 @@ fn emits_the_unit_ideal_certificate() {
             r#""membership":[[[[1,[1,0]]]],[[[1,[1,0]],[1,[0,0]]]]],"spairs":[]}"#
         )
     );
+    verify(&bytes).expect("the certificate holds");
 }
 
 /// F = {x^2 - 1, xy - 1}, G = [y^2 - 1, x - y]. The only pair is coprime,
@@ -126,8 +131,16 @@ const PAIR: &str = concat!(
 #[test]
 fn emits_a_two_element_basis_with_hand_derived_origins() {
     let (input, basis, origins) = pair_system();
-    let bytes = emit(&input, &basis, &origins).expect("the basis holds");
+    let bytes = assemble(
+        &ring(),
+        &input,
+        basis.clone(),
+        origins.clone(),
+        &mut budget(),
+    )
+    .expect("the basis holds");
     assert_eq!(text(&bytes), PAIR);
+    verify(&bytes).expect("the certificate holds");
 }
 
 #[test]
@@ -136,8 +149,10 @@ fn sorts_the_basis_and_carries_the_origins_with_it() {
     let swapped: Vec<Polynomial> = basis.iter().rev().cloned().collect();
     let swapped_origins: Vec<Origin> = origins.iter().rev().cloned().collect();
 
-    let bytes = emit(&input, &swapped, &swapped_origins).expect("the basis holds");
+    let bytes = assemble(&ring(), &input, swapped, swapped_origins, &mut budget())
+        .expect("the basis holds");
     assert_eq!(text(&bytes), PAIR);
+    verify(&bytes).expect("the certificate holds");
 }
 
 /// F = {x^2 - y, xy - 1}, G = [x^2 - y, xy - 1, y^2 - x]. The pairs (0,1)
@@ -161,14 +176,22 @@ const BASE: &str = concat!(
 #[test]
 fn emits_the_spair_entries_of_a_three_element_basis() {
     let (input, basis, origins) = base_system();
-    let bytes = emit(&input, &basis, &origins).expect("the basis holds");
+    let bytes = assemble(
+        &ring(),
+        &input,
+        basis.clone(),
+        origins.clone(),
+        &mut budget(),
+    )
+    .expect("the basis holds");
     assert_eq!(text(&bytes), BASE);
+    verify(&bytes).expect("the certificate holds");
 }
 
 #[test]
 fn leaves_out_the_pair_with_coprime_leading_monomials() {
     let (_, basis, _) = base_system();
-    let entries = represent::spair_representations(&basis, P, &mut budget())
+    let entries = represent::spair_representations(&basis, &ops(), &mut budget())
         .expect("the basis is a Gröbner basis");
     let pairs: Vec<(usize, usize)> = entries.iter().map(|entry| (entry.i, entry.j)).collect();
     assert_eq!(pairs, vec![(0, 1), (1, 2)]);
@@ -193,6 +216,7 @@ fn emits_the_zero_ideal_certificate() {
             r#""input":[[]],"basis":[],"origin":[],"membership":[[]],"spairs":[]}"#
         )
     );
+    verify(&bytes).expect("the certificate holds");
 }
 
 /// F = {1}, G = {1} with no variables.
@@ -213,37 +237,70 @@ fn emits_a_certificate_without_variables() {
             r#""origin":[[[[1,[]]]]],"membership":[[[[1,[]]]]],"spairs":[]}"#
         )
     );
+    verify(&bytes).expect("the certificate holds");
 }
 
 #[test]
 fn two_assemblies_of_one_system_give_the_same_bytes() {
     let (input, basis, origins) = base_system();
-    let first = emit(&input, &basis, &origins).expect("the basis holds");
-    let second = emit(&input, &basis, &origins).expect("the basis holds");
+    let first = assemble(
+        &ring(),
+        &input,
+        basis.clone(),
+        origins.clone(),
+        &mut budget(),
+    )
+    .expect("the basis holds");
+    let second = assemble(
+        &ring(),
+        &input,
+        basis.clone(),
+        origins.clone(),
+        &mut budget(),
+    )
+    .expect("the basis holds");
     assert_eq!(first, second);
 
     let (pair_input, pair_basis, pair_origins) = pair_system();
-    let third = emit(&pair_input, &pair_basis, &pair_origins).expect("the basis holds");
-    let fourth = emit(&pair_input, &pair_basis, &pair_origins).expect("the basis holds");
+    let third = assemble(
+        &ring(),
+        &pair_input,
+        pair_basis.clone(),
+        pair_origins.clone(),
+        &mut budget(),
+    )
+    .expect("the basis holds");
+    let fourth = assemble(
+        &ring(),
+        &pair_input,
+        pair_basis.clone(),
+        pair_origins.clone(),
+        &mut budget(),
+    )
+    .expect("the basis holds");
     assert_eq!(third, fourth);
     assert_ne!(first, third);
 }
 
 #[test]
-fn a_wrong_origin_cofactor_goes_into_the_bytes_unrepaired() {
+fn a_wrong_origin_cofactor_reaches_the_verifier() {
     let (input, basis, mut origins) = pair_system();
     // The cofactor of x - y over xy - 1 is -x. The sign flip keeps the
-    // shape and breaks the identity. The writer copies it as given;
-    // `tests/certified.rs` checks that such bytes are rejected.
+    // shape and breaks the identity.
     origins[1] = list(&["y", "x"]);
 
-    let bytes = emit(&input, &basis, &origins).expect("the emitter writes what it gets");
+    let bytes = assemble(
+        &ring(),
+        &input,
+        basis.clone(),
+        origins.clone(),
+        &mut budget(),
+    )
+    .expect("the emitter writes what it gets");
     assert_eq!(
-        text(&bytes),
-        PAIR.replace(
-            r#"[[[1,[0,1]]],[[6,[1,0]]]]"#,
-            r#"[[[1,[0,1]]],[[1,[1,0]]]]"#
-        )
+        verify(&bytes),
+        Err(VerifyError::OriginIdentity { basis: 1 }),
+        "the writer must not repair a wrong cofactor"
     );
 }
 
@@ -257,14 +314,20 @@ fn a_basis_that_is_not_groebner_is_a_typed_defect() {
     let origins = vec![list(&["1", "0"]), list(&["0", "1"])];
 
     assert_eq!(
-        emit(&input, &basis, &origins),
+        assemble(
+            &ring(),
+            &input,
+            basis.clone(),
+            origins.clone(),
+            &mut budget()
+        ),
         Err(CertifyError::Emitter(EmitterFault::NotAGroebnerBasis {
             i: 0,
             j: 1
         }))
     );
     assert_eq!(
-        represent::spair_representations(&basis, P, &mut budget()),
+        represent::spair_representations(&basis, &ops(), &mut budget()),
         Err(CertifyError::Emitter(EmitterFault::NotAGroebnerBasis {
             i: 0,
             j: 1
@@ -279,13 +342,19 @@ fn an_input_that_does_not_reduce_is_a_typed_defect() {
     let origins = vec![list(&["0"])];
 
     assert_eq!(
-        emit(&input, &basis, &origins),
+        assemble(
+            &ring(),
+            &input,
+            basis.clone(),
+            origins.clone(),
+            &mut budget()
+        ),
         Err(CertifyError::Emitter(EmitterFault::InputHasRemainder {
             input: 0
         }))
     );
     assert_eq!(
-        represent::membership_representations(&input, &basis, P, &mut budget()),
+        represent::membership_representations(&input, &basis, &ops(), &mut budget()),
         Err(CertifyError::Emitter(EmitterFault::InputHasRemainder {
             input: 0
         }))
@@ -294,9 +363,16 @@ fn an_input_that_does_not_reduce_is_a_typed_defect() {
 
 #[test]
 fn a_count_that_does_not_match_is_a_typed_defect() {
+    let ring = ring();
     let (input, basis, origins) = pair_system();
     assert_eq!(
-        emit(&input, &basis, &origins[..1]),
+        assemble(
+            &ring,
+            &input,
+            basis.clone(),
+            origins[..1].to_vec(),
+            &mut budget()
+        ),
         Err(CertifyError::Emitter(EmitterFault::OriginCount {
             found: 1,
             expected: 2
@@ -305,7 +381,7 @@ fn a_count_that_does_not_match_is_a_typed_defect() {
 
     let short = vec![origins[0][..1].to_vec(), origins[1].clone()];
     assert_eq!(
-        emit(&input, &basis, &short),
+        assemble(&ring, &input, basis.clone(), short, &mut budget()),
         Err(CertifyError::Emitter(EmitterFault::OriginEntryCount {
             basis: 0,
             found: 1,
@@ -313,9 +389,9 @@ fn a_count_that_does_not_match_is_a_typed_defect() {
         }))
     );
 
-    let zero_basis = vec![ring().zero()];
+    let zero_basis = vec![ring.zero()];
     assert_eq!(
-        emit(&input, &zero_basis, &[Vec::new()]),
+        assemble(&ring, &input, zero_basis, vec![Vec::new()], &mut budget()),
         Err(CertifyError::Emitter(EmitterFault::BasisElementZero {
             index: 0
         }))
@@ -326,7 +402,7 @@ fn a_count_that_does_not_match_is_a_typed_defect() {
     let wide_ring = PolynomialRing::prime_field(P, ["x", "y", "z"]).expect("7 is prime");
     let wide = vec![wide_ring.polynomial([(1, [1, 0, 0])]).expect("fits")];
     assert_eq!(
-        emit(&wide, &basis, &origins),
+        assemble(&ring, &wide, basis, origins, &mut budget()),
         Err(CertifyError::Emitter(EmitterFault::ExponentCount {
             at: Place::Input(0),
             found: 3,
@@ -341,12 +417,12 @@ fn division_records_quotients_that_rebuild_the_dividend() {
     for text in ["x^3 + 2*y", "3*x*y^2 + x*y + 5", "x^2*y^2", "0"] {
         let f = one(text);
         let (quotients, remainder) =
-            divide(&f, &divisors, P, &budget()).expect("the budget stops nothing");
+            divide(&f, &divisors, &ops(), &budget()).expect("the budget stops nothing");
         assert_eq!(quotients.len(), divisors.len());
 
         let mut sum = remainder.clone();
         for (quotient, divisor) in quotients.iter().zip(&divisors) {
-            sum = sum.add(&product(quotient, divisor), P);
+            sum = sum.add(&product(quotient, divisor), &ops());
         }
         assert_eq!(sum, f, "f = sum q_j g_j + r");
 
@@ -357,8 +433,7 @@ fn division_records_quotients_that_rebuild_the_dividend() {
             let lead = quotient
                 .lm()
                 .expect("a nonzero quotient has a leading monomial")
-                .checked_mul(divisor.lm().expect("a divisor is nonzero"))
-                .expect("the product fits");
+                .mul(divisor.lm().expect("a divisor is nonzero"));
             assert!(
                 Some(&lead) <= f.lm(),
                 "lm(q_j g_j) must stay at or below lm(f)"
@@ -367,9 +442,31 @@ fn division_records_quotients_that_rebuild_the_dividend() {
     }
 }
 
-/// An instant in the past, so every deadline check stops the work.
-fn passed() -> Option<Instant> {
-    Some(Instant::now() - Duration::from_secs(1))
+/// A budget whose deadline has passed, so every check stops the work.
+fn passed() -> WriterBudget {
+    let limits = ComputeLimits {
+        deadline: Some(Instant::now() - Duration::from_secs(1)),
+        ..ComputeLimits::default()
+    };
+    WriterBudget::new(&limits, 2)
+}
+
+/// A budget whose run is cancelled, so every check stops the work.
+fn cancelled() -> WriterBudget {
+    let limits = ComputeLimits {
+        cancel: Some(Arc::new(AtomicBool::new(true))),
+        ..ComputeLimits::default()
+    };
+    WriterBudget::new(&limits, 2)
+}
+
+/// A budget of `bytes` and no deadline.
+fn bounded(bytes: usize) -> WriterBudget {
+    let limits = ComputeLimits {
+        memory: Some(bytes),
+        ..ComputeLimits::default()
+    };
+    WriterBudget::new(&limits, 2)
 }
 
 #[test]
@@ -381,24 +478,47 @@ fn a_passed_deadline_stops_the_emitter() {
             &input,
             basis.clone(),
             origins.clone(),
-            &mut Budget::new(passed(), None, 2),
+            &mut passed(),
         ),
-        Err(CertifyError::Engine(ComputeError::Timeout))
+        Err(CertifyError::WriterExhausted(ComputeError::Timeout))
     );
 
     let divisors = list(&["x^2 - y", "x*y - 1"]);
     assert_eq!(
-        divide(
-            &one("x^3 + 2*y"),
-            &divisors,
-            P,
-            &Budget::new(passed(), None, 2)
-        ),
-        Err(ComputeError::Timeout)
+        divide(&one("x^3 + 2*y"), &divisors, &ops(), &passed()),
+        Err(CertifyError::WriterExhausted(ComputeError::Timeout))
     );
     assert_eq!(
-        represent::spair_representations(&basis, P, &mut Budget::new(passed(), None, 2)),
-        Err(CertifyError::Engine(ComputeError::Timeout))
+        represent::spair_representations(&basis, &ops(), &mut passed()),
+        Err(CertifyError::WriterExhausted(ComputeError::Timeout))
+    );
+}
+
+/// The writer reads the cancellation flag where it reads the deadline.
+/// `ComputeError` names no cancellation, so a cancelled writer reports the
+/// exhaustion it shares with a passed deadline.
+#[test]
+fn a_cancelled_run_stops_the_emitter() {
+    let (input, basis, origins) = base_system();
+    assert_eq!(
+        assemble(
+            &ring(),
+            &input,
+            basis.clone(),
+            origins.clone(),
+            &mut cancelled(),
+        ),
+        Err(CertifyError::WriterExhausted(ComputeError::Timeout))
+    );
+
+    let divisors = list(&["x^2 - y", "x*y - 1"]);
+    assert_eq!(
+        divide(&one("x^3 + 2*y"), &divisors, &ops(), &cancelled()),
+        Err(CertifyError::WriterExhausted(ComputeError::Timeout))
+    );
+    assert_eq!(
+        represent::spair_representations(&basis, &ops(), &mut cancelled()),
+        Err(CertifyError::WriterExhausted(ComputeError::Timeout))
     );
 }
 
@@ -412,37 +532,46 @@ fn a_tight_memory_limit_stops_the_emitter() {
                 &input,
                 basis.clone(),
                 origins.clone(),
-                &mut Budget::new(None, Some(limit), 2),
+                &mut bounded(limit),
             ),
-            Err(CertifyError::Engine(ComputeError::MemoryLimitExceeded)),
+            Err(CertifyError::WriterExhausted(
+                ComputeError::MemoryLimitExceeded
+            )),
             "a limit of {limit} bytes cannot hold the emission"
         );
     }
 
     let divisors = list(&["x^2 - y", "x*y - 1"]);
     assert_eq!(
-        divide(
-            &one("x^3 + 2*y"),
-            &divisors,
-            P,
-            &Budget::new(None, Some(1), 2)
-        ),
-        Err(ComputeError::MemoryLimitExceeded)
+        divide(&one("x^3 + 2*y"), &divisors, &ops(), &bounded(1)),
+        Err(CertifyError::WriterExhausted(
+            ComputeError::MemoryLimitExceeded
+        ))
     );
 }
 
 #[test]
 fn a_limit_that_holds_the_emission_changes_no_byte() {
     let (input, basis, origins) = base_system();
-    let free = emit(&input, &basis, &origins).expect("the basis holds");
+    let free = assemble(
+        &ring(),
+        &input,
+        basis.clone(),
+        origins.clone(),
+        &mut budget(),
+    )
+    .expect("the basis holds");
     let bounded = assemble(
         &ring(),
         &input,
         basis,
         origins,
-        &mut Budget::new(
-            Some(Instant::now() + Duration::from_secs(60)),
-            Some(1 << 20),
+        &mut WriterBudget::new(
+            &ComputeLimits {
+                deadline: Some(Instant::now() + Duration::from_secs(60)),
+                memory: Some(1 << 20),
+                ..ComputeLimits::default()
+            },
             2,
         ),
     )

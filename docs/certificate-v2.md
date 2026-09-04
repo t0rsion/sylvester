@@ -1132,5 +1132,5 @@ covers at least these cases:
 - The two verifiers share the trust model, the four facts of section 2,
   the sealed order `grevlex-v1`, and the `VerifiedGb` type. They share no
   decoder and no arithmetic.
-- Backward compatibility is not a goal before 1.0. A future schema
+- Backward compatibility is not a goal before API stability. A future schema
   replaces this one. It does not extend it.

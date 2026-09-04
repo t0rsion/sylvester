@@ -1,9 +1,9 @@
-//! Symbolic preprocessing for one F4 batch (design section 6).
+//! Symbolic preprocessing for one F4 batch (design section 3.5).
 //!
 //! Preprocessing turns the selected pairs into the rows and the columns of
 //! one matrix. A row is a basis element and a multiplier, never a copy of
 //! the element's coefficients: multiplying by a monomial permutes the
-//! support and leaves the coefficients alone (design section 7).
+//! support and leaves the coefficients alone (design section 3.6).
 //!
 //! Every monomial here lives in the batch-local table, which the caller
 //! clears once the batch's new basis elements are converted.
@@ -35,7 +35,8 @@ pub(crate) struct RawRow {
     pub(crate) source: u32,
     /// The multiplier, in the batch-local table.
     pub(crate) mult: MonomialId,
-    /// The column of `mult * lm(source)`. It is always a pivot column.
+    /// The column of `mult * lm(source)`, which is the row's leading
+    /// column. It is always a pivot column.
     pub(crate) lead_col: u32,
 }
 
@@ -49,7 +50,8 @@ pub(crate) struct RawRow {
 /// ```
 ///
 /// with `npiv` the boundary. Each block descends under the table order.
-/// The whole vector does not.
+/// The whole vector does not. `columns[c]` is the monomial of column `c`,
+/// and `col_of[m.index()]` is the column of monomial `m`, or [`NO_COLUMN`].
 ///
 /// Every row's `lead_col` is a pivot column, and every pivot column has
 /// exactly one reducer row, named by `pivot_row_of`. Rows that are not
@@ -58,14 +60,13 @@ pub(crate) struct Symbolic<'t, L: Lanes> {
     /// The batch-local monomial table, holding every column and every
     /// multiplier.
     pub(crate) table: &'t mut MonomialTable<L>,
-    /// Reducer rows and rows to reduce, in one vector.
+    /// The rows, reducer rows and rows to reduce in one vector.
     pub(crate) rows: Vec<RawRow>,
     /// The column monomials, pivot block then non-pivot block.
     pub(crate) columns: Vec<MonomialId>,
     /// The number of pivot columns, which is the block boundary.
     pub(crate) npiv: u32,
     /// The column of each monomial of the table, or [`NO_COLUMN`].
-    #[cfg(test)]
     pub(crate) col_of: Vec<u32>,
     /// The reducer row of each pivot column, one entry per pivot column.
     pub(crate) pivot_row_of: Vec<u32>,
@@ -89,7 +90,6 @@ impl<L: Lanes> Symbolic<'_, L> {
     }
 
     /// The column of `m`, or `None` when `m` is not a column.
-    #[cfg(test)]
     pub(crate) fn column_of(&self, m: MonomialId) -> Option<u32> {
         match self.col_of.get(m.index()) {
             Some(&NO_COLUMN) | None => None,
@@ -110,26 +110,50 @@ impl<L: Lanes> Symbolic<'_, L> {
         let col = self.rows[row as usize].lead_col;
         self.is_pivot_column(col) && self.pivot_row_of[col as usize] == row
     }
+
+    /// The bytes the result holds, counting capacities and the table.
+    pub(crate) fn memory_bytes(&self) -> usize {
+        self.table
+            .memory_bytes()
+            .saturating_add(self.rows.capacity().saturating_mul(size_of::<RawRow>()))
+            .saturating_add(
+                self.columns
+                    .capacity()
+                    .saturating_mul(size_of::<MonomialId>()),
+            )
+            .saturating_add(self.col_of.capacity().saturating_mul(size_of::<u32>()))
+            .saturating_add(
+                self.pivot_row_of
+                    .capacity()
+                    .saturating_mul(size_of::<u32>()),
+            )
+            .saturating_add(self.row_monos.capacity().saturating_mul(size_of::<u32>()))
+            .saturating_add(self.row_start.capacity().saturating_mul(size_of::<u32>()))
+    }
 }
 
 /// Which divisor becomes the reducer of a column.
 ///
-/// Production uses [`Reducer::First`]. Tests also exercise the alternative
-/// rule that informed this choice.
+/// The default is [`Reducer::First`]. [`Reducer::Shortest`] takes a
+/// reducer of higher degree more often, and its multiple pulls more
+/// monomials into the symbolic closure, so the batch carries more rows and
+/// more nonzeros. It was slower on every cell M2 chunk F2 measured, whose
+/// counts are in that record.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum Reducer {
     /// The first divisor in scan order.
     #[default]
     First,
     /// The divisor with the fewest terms, smallest basis index first.
-    #[cfg(test)]
     Shortest,
 }
 
 /// Which row of an lcm group becomes the reducer row of that column.
 ///
-/// Production uses [`UpperRow::SmallestSource`]. Tests also exercise the
-/// alternative rule that informed this choice.
+/// The default is [`UpperRow::SmallestSource`]. The rule changes no
+/// counter, only which row of an lcm group reduces its column, so it acts
+/// through fill alone. Neither rule won the cells M2 chunk F2 measured, so
+/// the default stays where M1 put it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum UpperRow {
     /// The row whose source has the smallest basis index.
@@ -137,7 +161,6 @@ pub(crate) enum UpperRow {
     SmallestSource,
     /// The row whose source has the fewest terms, smallest basis index
     /// first.
-    #[cfg(test)]
     ShortestSource,
 }
 
@@ -163,7 +186,7 @@ const PIVOT: u8 = 1;
 /// The mark of a monomial that has no reducer.
 const FREE: u8 = 2;
 
-/// Build the rows and the columns of one batch (design section 6).
+/// Build the rows and the columns of one batch (design section 3.5).
 ///
 /// `selected` is one batch of pairs, and `table` is the batch-local table,
 /// which must be empty. Every row is a live or retired basis element and a
@@ -211,20 +234,19 @@ fn add_pair_rows<L: Lanes>(
     walk: &mut Walk,
 ) -> Result<(), F4Error> {
     let mut sources: Vec<u32> = Vec::new();
+    let mut group = PairGroup {
+        basis,
+        table,
+        strategy,
+        walk,
+        sources: &mut sources,
+    };
     let mut start = 0;
     while start < pairs.len() {
         clock.tick()?;
         let lcm = pairs[start].lcm;
         let end = pair_group_end(pairs, start, lcm);
-        add_pair_group(
-            &pairs[start..end],
-            lcm,
-            basis,
-            table,
-            strategy,
-            walk,
-            &mut sources,
-        )?;
+        add_pair_group(&pairs[start..end], lcm, &mut group)?;
         start = end;
     }
     Ok(())
@@ -238,29 +260,43 @@ fn pair_group_end(pairs: &[Pair], start: usize, lcm: MonomialId) -> usize {
     end
 }
 
-#[allow(clippy::too_many_arguments)]
+struct PairGroup<'a, L: Lanes> {
+    basis: &'a Basis<L>,
+    table: &'a mut MonomialTable<L>,
+    strategy: &'a Strategy,
+    walk: &'a mut Walk,
+    sources: &'a mut Vec<u32>,
+}
+
 fn add_pair_group<L: Lanes>(
     pairs: &[Pair],
     lcm: MonomialId,
-    basis: &Basis<L>,
-    table: &mut MonomialTable<L>,
-    strategy: &Strategy,
-    walk: &mut Walk,
-    sources: &mut Vec<u32>,
+    group: &mut PairGroup<'_, L>,
 ) -> Result<(), F4Error> {
-    pair_sources(pairs, sources)?;
-    let column = intern_from(table, basis.table(), lcm)?;
-    walk.mark(column, PIVOT);
-    let first = walk.rows.len() as u32;
-    for &source in sources.iter() {
-        let mult = quotient_into(table, basis.table(), lcm, basis.table(), basis.lead(source))?
-            .expect("the lead of an endpoint divides the pair's lcm");
-        walk.push_row(source, mult, column)?;
+    pair_sources(pairs, group.sources)?;
+    let column = intern_from(group.table, group.basis.table(), lcm)?;
+    group.walk.mark(column, PIVOT);
+    let first = group.walk.rows.len() as u32;
+    for &source in group.sources.iter() {
+        let mult = quotient_into(
+            group.table,
+            group.basis.table(),
+            lcm,
+            group.basis.table(),
+            group.basis.lead(source),
+        )?
+        .expect("the lead of an endpoint divides the pair's lcm");
+        group.walk.push_row(source, mult, column)?;
     }
-    let pivot = first + upper_row(basis, &walk.rows[first as usize..], strategy.upper_row);
-    walk.set_pivot_row(column, pivot);
-    reserve(&mut walk.pivot_cols, 1)?;
-    walk.pivot_cols.push(column);
+    let pivot = first
+        + upper_row(
+            group.basis,
+            &group.walk.rows[first as usize..],
+            group.strategy.upper_row,
+        );
+    group.walk.set_pivot_row(column, pivot);
+    reserve(&mut group.walk.pivot_cols, 1)?;
+    group.walk.pivot_cols.push(column);
     Ok(())
 }
 
@@ -282,7 +318,7 @@ fn pair_sources(pairs: &[Pair], sources: &mut Vec<u32>) -> Result<(), F4Error> {
 /// element is the reducer row of its own leading column. Symbolic closure
 /// then adds one row per reducer multiple, exactly as it does for a pair
 /// batch. The caller passes the result to [`super::matrix::build`] and
-/// then to [`super::kernel::interreduce`] (design section 9).
+/// then to [`super::kernel::interreduce`] (design section 3.8).
 pub(crate) fn preprocess_basis<'t, L: Lanes>(
     basis: &Basis<L>,
     table: &'t mut MonomialTable<L>,
@@ -295,7 +331,6 @@ pub(crate) fn preprocess_basis<'t, L: Lanes>(
     let view = basis.lead_index().project(basis.table(), table)?;
     let mut walk = Walk::default();
     for &element in basis.live() {
-        clock.tick()?;
         let column = intern_from(table, basis.table(), basis.lead(element))?;
         // Two live elements never share a leading monomial, so each
         // element is the only reducer row of its own column.
@@ -312,16 +347,15 @@ pub(crate) fn preprocess_basis<'t, L: Lanes>(
 }
 
 /// Which row of an lcm group reduces that column.
-fn upper_row<L: Lanes>(_basis: &Basis<L>, _group: &[RawRow], rule: UpperRow) -> u32 {
+fn upper_row<L: Lanes>(basis: &Basis<L>, group: &[RawRow], rule: UpperRow) -> u32 {
     match rule {
         // The group's sources are sorted, so the first row has the
         // smallest source index.
         UpperRow::SmallestSource => 0,
-        #[cfg(test)]
-        UpperRow::ShortestSource => _group
+        UpperRow::ShortestSource => group
             .iter()
             .enumerate()
-            .min_by_key(|(index, row)| (_basis.poly(row.source).len(), *index))
+            .min_by_key(|(index, row)| (basis.poly(row.source).len(), *index))
             .map(|(index, _)| index as u32)
             .unwrap_or(0),
     }
@@ -338,6 +372,7 @@ struct Walk {
     /// The leading monomial of each row, parallel to `rows`. It becomes
     /// the row's `lead_col` once the columns are numbered.
     row_lead: Vec<MonomialId>,
+    /// The mark of each monomial of the table.
     marks: Vec<u8>,
     /// The reducer row of each monomial that is a pivot column.
     pivot_row: Vec<u32>,
@@ -377,7 +412,13 @@ impl Walk {
         Ok(())
     }
 
-    /// Close the row set under reduction (design section 6).
+    /// Close the row set under reduction (design section 3.5, steps 3 to
+    /// 5).
+    ///
+    /// Every monomial of every row already in the walk goes on the stack.
+    /// A monomial with a live divisor becomes a pivot column and adds the
+    /// reducer's row, whose monomials go on the stack in turn. A monomial
+    /// with no divisor becomes a non-pivot column.
     fn close<L: Lanes>(
         &mut self,
         table: &mut MonomialTable<L>,
@@ -510,7 +551,6 @@ impl Walk {
             rows: self.rows,
             columns,
             npiv,
-            #[cfg(test)]
             col_of,
             pivot_row_of,
             row_monos: self.row_monos,

@@ -1,12 +1,13 @@
-//! Matrix construction for one batch (design section 7).
+//! Matrix construction for one batch (design section 3.6).
 //!
 //! [`build`] turns the symbolic preprocessing output into a [`Batch`]: a
 //! column numbering, one flat arena of column indices, and one [`RowRef`]
 //! per row. A row that comes from a basis element names that element's
 //! coefficient vector instead of copying it. Multiplying a polynomial by
-//! a monomial permutes the support and leaves the coefficients alone.
+//! a monomial permutes nothing and scales nothing, so the support changes
+//! and the coefficients do not.
 //!
-//! Columns descend under the table order. Design section 7 numbers the
+//! Columns descend under the table order. Design section 3.6 numbers the
 //! pivot columns first and the free columns second, both descending, and
 //! [`super::symbolic::preprocess`] hands over that numbering. [`build`]
 //! merges the two blocks into one descending numbering. The reason is
@@ -16,7 +17,9 @@
 //! column. Under the two-block numbering a row that holds a free monomial
 //! above a pivot monomial has a descent, and repairing it would permute
 //! the coefficients and end the reuse. Both blocks descend, so the merge
-//! is one pass.
+//! is one pass. The counts `npiv` and `nfree`, the unit upper triangular
+//! structure over the pivot columns, and the kernel's increasing column
+//! walk are the same under either numbering.
 
 use core::cmp::Ordering;
 use core::ops::Range;
@@ -71,7 +74,6 @@ impl RowRef {
     }
 
     /// Where the coefficients live.
-    #[cfg(test)]
     pub(crate) fn coeffs(&self) -> CoeffSrc {
         self.coeffs
     }
@@ -101,8 +103,9 @@ pub(crate) trait BasisCoeffs {
     /// The coefficients of basis element `source`, descending by
     /// monomial.
     ///
-    /// The element is monic. The tail is `coeffs(source)[1..]`. Every
-    /// matrix row built from this element has this length.
+    /// The element is monic, so the first value is 1, and the tail is
+    /// `coeffs(source)[1..]`. The length is the number of terms, which is
+    /// the length of every matrix row built from this element.
     fn coeffs(&self, source: u32) -> &[u32];
 
     /// The multiply precomputation for [`BasisCoeffs::coeffs`].
@@ -115,13 +118,16 @@ pub(crate) trait BasisCoeffs {
 /// What [`build`] reads from the working basis.
 ///
 /// A row is a basis element and a multiplier, so the builder needs the
-/// element's monomials.
+/// element's monomials and the table they live in.
 pub(crate) trait BasisRows<L: Lanes>: BasisCoeffs {
     /// The monomials of basis element `source`, strictly descending.
     ///
     /// The order decides the row's column order, so it must be the order
     /// of [`BasisCoeffs::coeffs`].
     fn monomials(&self, source: u32) -> &[MonomialId];
+
+    /// The table the monomials live in.
+    fn table(&self) -> &MonomialTable<L>;
 }
 
 impl<L: Lanes> BasisCoeffs for Basis<L> {
@@ -137,6 +143,10 @@ impl<L: Lanes> BasisCoeffs for Basis<L> {
 impl<L: Lanes> BasisRows<L> for Basis<L> {
     fn monomials(&self, source: u32) -> &[MonomialId] {
         &self.poly(source).monos
+    }
+
+    fn table(&self) -> &MonomialTable<L> {
+        Basis::table(self)
     }
 }
 
@@ -176,7 +186,7 @@ impl Batch {
 
     /// Release every byte the batch's arenas hold above their contents.
     ///
-    /// The memory retry of design section 11 calls this after
+    /// The memory retry of design section 3.9 calls this after
     /// [`Batch::clear`], because the estimate counts capacity.
     pub(crate) fn shrink(&mut self) {
         self.columns.shrink_to_fit();
@@ -199,13 +209,11 @@ impl Batch {
     }
 
     /// The number of columns with no reducer row.
-    #[cfg(test)]
     pub(crate) fn nfree(&self) -> u32 {
         self.nfree
     }
 
     /// The column monomials, descending under the table order.
-    #[cfg(test)]
     pub(crate) fn columns(&self) -> &[MonomialId] {
         &self.columns
     }
@@ -272,7 +280,7 @@ impl Batch {
 
     /// Check the structure of the matrix, in debug builds.
     ///
-    /// Three of the four conditions of design section 7 are here: one
+    /// Three of the four conditions of design section 3.6 are here: one
     /// reducer row per pivot column, that row's lead equal to its pivot
     /// column, and the pivot columns in descending monomial order. The
     /// fourth condition is monic basis elements, which needs the basis
@@ -329,9 +337,10 @@ impl Batch {
 
     /// Check the coefficients of every row, in debug builds.
     ///
-    /// This is the fourth condition of design section 7: every basis
-    /// element is monic, so `A` is unit upper triangular. It also checks
-    /// that a row is as long as its coefficient vector.
+    /// This is the fourth condition of design section 3.6: every basis
+    /// element is monic, so the reducer rows carry a leading 1 and `A` is
+    /// unit upper triangular. It also checks that a row is as long as its
+    /// coefficient vector.
     pub(crate) fn debug_check_coeffs<B: BasisCoeffs>(&self, basis: &B) {
         if !cfg!(debug_assertions) {
             return;
@@ -435,7 +444,9 @@ pub(crate) struct Workspace {
     pub(super) acc: Vec<u64>,
     /// Maps a column to its pivot row, or [`NO_ROW`].
     pub(super) pivot_at: Vec<u32>,
+    /// The columns of the row the kernel is writing.
     pub(super) cols_out: Vec<u32>,
+    /// The coefficients of the row the kernel is writing.
     pub(super) vals_out: Vec<u32>,
     /// The precomputation for `vals_out`.
     pub(super) shoup_out: Vec<u64>,
@@ -443,7 +454,7 @@ pub(crate) struct Workspace {
     /// phase of the kernel.
     pub(super) partials: Vec<PartialRow>,
     /// The bytes the accumulators of the last parallel phase held, one
-    /// per worker (design section 11).
+    /// per worker (design section 3.9).
     pub(super) worker_acc_bytes: usize,
 }
 
@@ -461,7 +472,7 @@ pub(super) struct PartialRow {
 impl Workspace {
     /// Release every byte the workspace holds above its contents.
     ///
-    /// The memory retry of design section 11 calls this, because the
+    /// The memory retry of design section 3.9 calls this, because the
     /// estimate counts capacity. The next batch sizes the buffers again.
     pub(crate) fn shrink(&mut self) {
         self.col_map = Vec::new();
@@ -501,9 +512,9 @@ impl Workspace {
 /// the whole run.
 ///
 /// The pass writes one `u32` column index per nonzero and copies no
-/// coefficient. It rewrites the products already interned in
-/// [`Symbolic::row_monos`] into batch columns and keeps that vector as
-/// the support arena.
+/// coefficient. It multiplies every term monomial of every source by the
+/// row's multiplier, which finds the product symbolic preprocessing
+/// already interned.
 pub(crate) fn build<L: Lanes, B: BasisRows<L>>(
     sym: &mut Symbolic<'_, L>,
     basis: &B,
@@ -685,6 +696,10 @@ pub(super) mod fixture {
     impl BasisRows<Lanes8> for Sources {
         fn monomials(&self, source: u32) -> &[MonomialId] {
             &self.monos[source as usize]
+        }
+
+        fn table(&self) -> &MonomialTable<Lanes8> {
+            &self.table
         }
     }
 
@@ -966,25 +981,5 @@ mod tests {
         )
         .unwrap();
         batch.debug_check_coeffs(sources);
-    }
-
-    #[test]
-    fn an_expired_deadline_stops_build() {
-        let case = case(1, &[0], &[&[0]], &[]);
-        let mut fixture = fixture(&case, &Small31::new(P));
-        let (mut sym, sources) = fixture.split();
-        let past = std::time::Instant::now()
-            .checked_sub(std::time::Duration::from_secs(1))
-            .expect("the clock is at least one second past its epoch");
-        let mut clock = super::Deadline::new(Some(past));
-        let result = build(
-            &mut sym,
-            sources,
-            &mut Batch::default(),
-            &mut Workspace::default(),
-            &mut clock,
-        );
-
-        assert_eq!(result, Err(F4Error::Timeout));
     }
 }

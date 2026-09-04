@@ -79,7 +79,17 @@ pub(super) fn trace(
     let mut state = TraceState::default();
 
     for id in 0..count {
-        let decoded = decode_node(reader, id, pool, input, &nodes, &mut state, ctx)?;
+        let decoded = decode_node(
+            id,
+            &mut NodeDecoder {
+                reader,
+                pool,
+                input,
+                nodes: &nodes,
+                state: &mut state,
+                ctx,
+            },
+        )?;
         for src in decoded.sources {
             nodes.use_once(src, &mut ctx.meter)?;
         }
@@ -103,26 +113,29 @@ fn trace_count(reader: &mut Reader<'_>, ctx: &mut Ctx<'_>) -> Result<usize, Veri
     Ok(count)
 }
 
-#[allow(clippy::too_many_arguments)]
+struct NodeDecoder<'a, 'data, 'ctx> {
+    reader: &'a mut Reader<'data>,
+    pool: &'a mut Pool,
+    input: &'a [Poly],
+    nodes: &'a Nodes,
+    state: &'a mut TraceState,
+    ctx: &'a mut Ctx<'ctx>,
+}
+
 fn decode_node(
-    reader: &mut Reader<'_>,
     id: usize,
-    pool: &mut Pool,
-    input: &[Poly],
-    nodes: &Nodes,
-    state: &mut TraceState,
-    ctx: &mut Ctx<'_>,
+    decoder: &mut NodeDecoder<'_, '_, '_>,
 ) -> Result<DecodedNode, VerifyError> {
-    ctx.meter.charge(1)?;
-    let kind = reader.varint(&mut ctx.meter)?;
-    let use_count = reader.varint(&mut ctx.meter)?;
+    decoder.ctx.meter.charge(1)?;
+    let kind = decoder.reader.varint(&mut decoder.ctx.meter)?;
+    let use_count = decoder.reader.varint(&mut decoder.ctx.meter)?;
     if use_count == 0 {
         return Err(VerifyError::Trace {
             node: id,
             fault: NodeFault::UseCountZero,
         });
     }
-    let (value, sources) = decode_node_value(reader, id, kind, pool, input, nodes, state, ctx)?;
+    let (value, sources) = decode_node_value(id, kind, decoder)?;
     Ok(DecodedNode {
         value,
         sources,
@@ -130,30 +143,36 @@ fn decode_node(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 fn decode_node_value(
-    reader: &mut Reader<'_>,
     id: usize,
     kind: u64,
-    pool: &mut Pool,
-    input: &[Poly],
-    nodes: &Nodes,
-    state: &mut TraceState,
-    ctx: &mut Ctx<'_>,
+    decoder: &mut NodeDecoder<'_, '_, '_>,
 ) -> Result<(Poly, Vec<usize>), VerifyError> {
     match kind {
-        KIND_INPUT => input_node(reader, id, input, state, ctx),
+        KIND_INPUT => input_node(
+            decoder.reader,
+            id,
+            decoder.input,
+            decoder.state,
+            decoder.ctx,
+        ),
         KIND_MUL => {
-            state.seen_other_kind = true;
-            mul_node(reader, id, pool, nodes, ctx)
+            decoder.state.seen_other_kind = true;
+            mul_node(decoder.reader, id, decoder.pool, decoder.nodes, decoder.ctx)
         }
         KIND_SCALE => {
-            state.seen_other_kind = true;
-            scale_node(reader, id, nodes, ctx)
+            decoder.state.seen_other_kind = true;
+            scale_node(decoder.reader, id, decoder.nodes, decoder.ctx)
         }
         KIND_COMB => {
-            state.seen_other_kind = true;
-            comb_node(reader, id, nodes, state, ctx)
+            decoder.state.seen_other_kind = true;
+            comb_node(
+                decoder.reader,
+                id,
+                decoder.nodes,
+                decoder.state,
+                decoder.ctx,
+            )
         }
         other => Err(VerifyError::Trace {
             node: id,

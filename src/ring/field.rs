@@ -2,13 +2,46 @@
 //!
 //! Every value is held as its representative in `[0, p)`. The modulus
 //! travels as an argument, so one type serves every prime the crate
-//! supports.
+//! supports. [`PrimeOps`] is the same modulus in the form the shared
+//! polynomial code calls.
+
+use std::fmt;
+
+use num_bigint::BigInt;
+use num_traits::Signed;
+
+use super::{Coefficient, Domain, DomainOps, PrimeField, RingError, sealed};
+
+/// Multiply two values below `p`, modulo `p`.
+///
+/// A ring holds a modulus of at most 2^31 - 1, so both factors are below
+/// 2^31 and the product fits a `u64` without widening. Every field
+/// multiplication in the crate calls this. Barrett reduction measures
+/// slower on every benchmark input, so the plain division stays.
+#[inline]
+pub(crate) fn mul_residue(a: u64, b: u64, p: u64) -> u64 {
+    debug_assert!(a < p && b < p, "both factors must be below the modulus");
+    debug_assert!(p < 1 << 32, "a ring modulus is below 2^31");
+    a * b % p
+}
 
 /// One element of the prime field.
+///
+/// The value is the representative in `[0, p)` of the ring that built it.
+/// A term of a [`Polynomial<PrimeField>`] carries one.
+/// [`Felt::value`] reads the representative back.
+///
+/// [`Polynomial<PrimeField>`]: crate::Polynomial
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
-pub(crate) struct Felt(u64);
+pub struct Felt(u64);
 
 impl Felt {
+    /// The representative in `[0, p)`.
+    #[inline]
+    pub fn value(self) -> u64 {
+        self.0
+    }
+
     /// Reduce a signed integer into the field.
     #[inline]
     pub(crate) fn new(value: i64, p: u64) -> Self {
@@ -20,12 +53,6 @@ impl Felt {
     #[inline]
     pub(crate) fn from_residue(value: u64) -> Self {
         Felt(value)
-    }
-
-    /// The representative in `[0, p)`.
-    #[inline]
-    pub(crate) fn value(self) -> u64 {
-        self.0
     }
 
     #[inline]
@@ -50,8 +77,8 @@ impl Felt {
 
     /// Subtract in the field.
     ///
-    /// A ring holds a modulus of at most 2^31 - 1, so the difference fits
-    /// a `u64`.
+    /// A ring holds a modulus of at most 2^31 - 1, so the borrow fits a
+    /// `u64`.
     #[inline]
     pub(crate) fn sub(self, other: Self, p: u64) -> Self {
         debug_assert!(p < 1 << 32, "a ring modulus is below 2^31");
@@ -74,18 +101,16 @@ impl Felt {
     /// Multiply in the field.
     ///
     /// A ring holds a modulus of at most 2^31 - 1, so the product fits a
-    /// `u64`.
+    /// `u64` without widening. This operation divides once per call.
     #[inline]
     pub(crate) fn mul(self, other: Self, p: u64) -> Self {
-        debug_assert!(self.0 < p && other.0 < p, "both factors must be below p");
-        debug_assert!(p < 1 << 32, "a ring modulus is below 2^31");
-        Felt(self.0 * other.0 % p)
+        Felt(mul_residue(self.0, other.0, p))
     }
 
     /// The multiplicative inverse, by the extended Euclidean algorithm.
     ///
-    /// Zero has no inverse. One is its own inverse, which every monic
-    /// polynomial hits.
+    /// Zero has no inverse. The caller must not pass it. One is its own
+    /// inverse, which every monic polynomial hits.
     pub(crate) fn inv(self, p: u64) -> Self {
         assert!(!self.is_zero(), "zero has no inverse in a field");
         if self.0 == 1 {
@@ -113,6 +138,7 @@ impl Felt {
     /// Divide in the field.
     ///
     /// A divisor of one is common, because every basis element is monic.
+    /// It needs no inversion.
     #[inline]
     pub(crate) fn div(self, other: Self, p: u64) -> Self {
         if other.0 == 1 {
@@ -128,12 +154,127 @@ impl std::fmt::Display for Felt {
     }
 }
 
+/// The prime field operations the shared polynomial code calls.
+///
+/// The value is the modulus. The ring holds one and hands it to every
+/// polynomial operation, in place of the `p` argument each of them took
+/// before the coefficient-domain parameter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PrimeOps {
+    p: u64,
+}
+
+impl PrimeOps {
+    pub(crate) fn new(p: u64) -> Self {
+        PrimeOps { p }
+    }
+
+    /// The prime.
+    #[inline]
+    pub(crate) fn modulus(&self) -> u64 {
+        self.p
+    }
+}
+
+impl sealed::Sealed for PrimeOps {}
+
+impl DomainOps for PrimeOps {
+    type Coeff = Felt;
+
+    #[inline]
+    fn one(&self) -> Felt {
+        Felt::one()
+    }
+
+    #[inline]
+    fn is_one(&self, a: &Felt) -> bool {
+        a.value() == 1
+    }
+
+    #[inline]
+    fn add(&self, a: &Felt, b: &Felt) -> Option<Felt> {
+        let sum = a.add(*b, self.p);
+        (!sum.is_zero()).then_some(sum)
+    }
+
+    #[inline]
+    fn sub(&self, a: &Felt, b: &Felt) -> Option<Felt> {
+        let difference = a.sub(*b, self.p);
+        (!difference.is_zero()).then_some(difference)
+    }
+
+    #[inline]
+    fn neg(&self, a: &Felt) -> Felt {
+        a.neg(self.p)
+    }
+
+    #[inline]
+    fn mul(&self, a: &Felt, b: &Felt) -> Felt {
+        a.mul(*b, self.p)
+    }
+
+    #[inline]
+    fn inv(&self, a: &Felt) -> Felt {
+        a.inv(self.p)
+    }
+
+    fn convert(&self, value: &Coefficient) -> Result<Option<Felt>, RingError> {
+        if let Coefficient::Small(small) = value {
+            let coefficient = Felt::new(*small, self.p);
+            return Ok((!coefficient.is_zero()).then_some(coefficient));
+        }
+        // The fraction is reduced first, so 3/3 over F_3 is the value 1
+        // and not a noninvertible denominator.
+        let (numerator, denominator) = value.normalized()?;
+        let divisor = residue(&denominator, self.p);
+        if divisor == 0 {
+            return Err(RingError::CoefficientNotInvertible { denominator });
+        }
+        let coefficient = Felt::from_residue(residue(&numerator, self.p))
+            .div(Felt::from_residue(divisor), self.p);
+        Ok((!coefficient.is_zero()).then_some(coefficient))
+    }
+
+    fn write(&self, a: &Felt, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", a.value())
+    }
+
+    /// Report whether the coefficient prints with a minus sign, which no
+    /// residue of a prime field does.
+    fn is_negative(&self, _a: &Felt) -> bool {
+        false
+    }
+
+    /// The heap bytes one coefficient holds, which is none: a [`Felt`] is
+    /// one `u64`.
+    fn heap_bytes(&self, _a: &Felt) -> usize {
+        0
+    }
+}
+
+impl Domain for PrimeField {
+    type Coeff = Felt;
+    type Ops = PrimeOps;
+    type BasisMeta = ();
+}
+
+/// The representative of `value` in `[0, p)`.
+pub(crate) fn residue(value: &BigInt, p: u64) -> u64 {
+    let modulus = BigInt::from(p);
+    let mut rest = value % &modulus;
+    if rest.is_negative() {
+        rest += &modulus;
+    }
+    debug_assert!(!rest.is_negative());
+    // the value is below the modulus, which is below 2^31.
+    u64::try_from(rest).expect("a residue below the modulus fits a u64")
+}
+
 /// Multiply two values below `n`, modulo `n`, for `n` up to `u64::MAX`.
 ///
 /// The primality test below checks a candidate modulus before a ring
-/// bounds it, so it widens through a `u128`. The field multiply in
-/// [`Felt::mul`] holds only for a modulus below 2^32 and cannot serve
-/// here.
+/// bounds it, so it widens through a `u128` rather than share
+/// [`mul_residue`], which only holds for a modulus below 2^32.
 #[inline]
 fn wide_mul_residue(a: u64, b: u64, n: u64) -> u64 {
     ((a as u128 * b as u128) % n as u128) as u64
@@ -237,7 +378,10 @@ mod tests {
     #[test]
     fn primality_agrees_with_trial_division_below_ten_thousand() {
         for n in 0u64..10_000 {
-            let trial = n >= 2 && (2..).take_while(|d| d * d <= n).all(|d| n % d != 0);
+            let trial = n >= 2
+                && (2..)
+                    .take_while(|d| d * d <= n)
+                    .all(|d| !n.is_multiple_of(d));
             assert_eq!(is_prime(n), trial, "disagreement at {n}");
         }
     }

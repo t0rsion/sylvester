@@ -1,10 +1,21 @@
-//! Gröbner bases over finite prime fields, with a default F4 engine, a
+//! Gröbner bases over prime fields and the rationals.
+//!
+//! The crate provides an F4 engine, a multimodular rational driver, a
 //! classic F5 oracle, and independent certificate verifiers.
 //!
-//! Every value is built through a [`PolynomialRing`], which fixes the prime,
-//! the variable names, and the variable order. The monomial order is
-//! grevlex over that variable order, and certificates name it
-//! `grevlex-v1`.
+//! Every value is built through a [`PolynomialRing`], which fixes the
+//! coefficient domain, the variable names, and the variable order. The
+//! domain is a sealed type parameter. [`PrimeField`] is the default, so
+//! `PolynomialRing` alone names a ring over `F_p`, and [`Rationals`] is
+//! the exact domain `Q`. The monomial order is grevlex over that variable
+//! order, and certificates name it `grevlex-v1`. [`Ideal::groebner_basis`]
+//! returns the basis the engine computed.
+//! [`Ideal::groebner_basis_certified`] returns one a verifier accepted.
+//!
+//! Over `Q` the engine is multimodular: it computes a basis modulo many
+//! primes and lifts the residues to rational numbers. That path is a
+//! heuristic and has no certified form. `GroebnerBasis::lift` carries the
+//! counters of the run and names what its stopping rule observed.
 //!
 //! ```
 //! use sylvester::{ComputeOptions, PolynomialRing};
@@ -25,44 +36,64 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
-//! # Correctness status: repaired, checked against oracles, not proven
+//! # Correctness status: checked, not proven
 //!
-//! Counterexamples proved the originally extracted engines incorrect.
-//! This crate carries the repair. The tests in `tests/known_defects.rs`
-//! assert the hand-verified correct bases through an independent checker.
-//! A randomized differential suite checks F4 and classic against a
-//! self-contained Buchberger oracle in `tests/differential.rs`.
-//! Termination has a pen-and-paper proof by Dickson's lemma. No proof
-//! here is machine-checked. The verifier is trusted, unproven code.
+//! Two counterexamples proved the two engines of the original extraction
+//! incorrect. This crate carries the repair. `KNOWN_ISSUES.md` records the
+//! systems, the wrong outputs, the witnesses, and the root causes.
+//!
+//! The counterexample tests in `tests/known_defects.rs` assert correct
+//! behavior through an independent checker and pass here. So does a
+//! randomized differential suite against a self-contained Buchberger
+//! oracle, in `tests/differential.rs`. The F4 backend is checked three
+//! ways: against the classic backend, against that Buchberger oracle, and
+//! against msolve on the comparison record under
+//! `benchmarks/gb-comparison`. Termination of the classic backend has a
+//! pen-and-paper proof by Dickson's lemma, also in `KNOWN_ISSUES.md`. No
+//! proof here is machine-checked, and neither backend is proven correct.
 //!
 //! [`Ideal::groebner_basis`] is the unproven path. It reports an exhausted
-//! budget, or a monomial past the degree an exponent's width supports: an
-//! input generator, a critical pair's least common multiple, or a signature
-//! or cofactor product. It says nothing else about the basis it returns.
-//! [`Ideal::groebner_basis_certified`] runs the selected backend and writes
-//! its certificate. It returns a value only after the independent verifier
-//! in [`verify`] accepts the bytes, and the basis it returns is decoded
-//! from those bytes. Classic writes `sylv-gb-cert-v1`; F4 writes
-//! `sylv-gb-cert-v2`.
+//! budget, or a monomial past the width of one exponent, and nothing else
+//! about the basis it returns.
+//! [`Ideal::groebner_basis_certified`] runs the backend the options name
+//! and writes a certificate for it. It returns a value only after the
+//! independent verifier in [`verify`] accepts the bytes, and the basis it
+//! returns is decoded from those bytes. The format follows the backend:
+//! the classic backend writes `sylv-gb-cert-v1` from the cofactors it
+//! tracks, and F4 writes `sylv-gb-cert-v2` from the trace it records.
 //!
 //! # Backends
 //!
 //! [`Backend::F4`] is the default. It batches critical pairs by degree,
-//! builds sparse matrices over interned monomials, and uses Gebauer-Moller
-//! pair management. [`Backend::Classic`] processes pairs one at a time in
-//! signature order. It is the differential oracle and the v1 path.
+//! builds one sparse matrix per batch over interned monomials, and reduces
+//! it. Pair management is Gebauer-Moller. There are no signatures in it,
+//! and it writes `sylv-gb-cert-v2`.
 //!
-//! [`ComputeOptions::threads`] controls F4's rayon parallelism. Classic and
-//! certified runs stay on one thread. The crate has no feature flags.
+//! [`Backend::Classic`] processes critical pairs one at a time in
+//! signature order, as classic F5 does. It is much slower than F4 on the
+//! comparison record. It stays as the oracle the differential suite
+//! compares against and as the `sylv-gb-cert-v1` path.
+//!
+//! # Threads
+//!
+//! [`ComputeOptions::threads`] sets the thread count of one computation.
+//! The default is the rayon global pool, which reads `RAYON_NUM_THREADS`.
+//! The F4 kernel reduces the rows of one batch against the frozen pivots
+//! in parallel once the batch passes an internal work threshold. Below the
+//! threshold, and at a count of 1, every row reduces on the calling
+//! thread. The classic backend computes on one thread. The thread count
+//! changes no byte of a basis or of a certificate. The crate has no
+//! feature flags.
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
-#![warn(unreachable_pub)]
 
 mod cert;
 mod certificate;
 mod compute;
+mod hilbert;
 mod ideal;
+mod normal_form;
 mod poly;
 mod ring;
 pub mod verify;
@@ -70,7 +101,15 @@ pub mod verify;
 pub use certificate::{
     CertificateCap, CertifiedGroebnerBasis, CertifyError, EmitterFault, Place, TraceFault,
 };
-pub use compute::{Backend, ComputeError, ComputeOptions, ComputeReport, F4Counters};
+pub use compute::{
+    Backend, Budget, ComputeError, ComputeOptions, ComputeReport, F4Counters, RationalOptions,
+    RationalStop,
+};
+pub use hilbert::{HilbertError, HilbertSeries};
 pub use ideal::{GroebnerBasis, Ideal};
+pub use normal_form::{BasisError, NormalFormError};
 pub use poly::Polynomial;
-pub use ring::{ParseError, PolynomialRing, RingError};
+pub use ring::{
+    Coefficient, Domain, DomainOps, Established, Felt, ModularLift, ParseError, PolynomialRing,
+    PrimeField, PrimeOps, RationalMeta, RationalOps, Rationals, RingError,
+};

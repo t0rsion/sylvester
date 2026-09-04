@@ -1,12 +1,14 @@
-//! Interned monomials for the F4 engine (design section 3).
+//! Interned monomials for the F4 engine (design section 2).
 //!
 //! A [`MonomialTable`] packs an exponent vector into `u64` words, hash-conses
 //! it, and returns one [`MonomialId`] per distinct vector. The table is
 //! append-only, so an id stays valid until [`MonomialTable::clear`] resets the
-//! table. An id is table-local: it means nothing in another table.
+//! table. An id is table-local. It means nothing in another table, and the
+//! free functions at the end of this module move a monomial between tables.
 //!
-//! [`MonomialId`] has no [`Ord`], because numeric id order has nothing to do
-//! with the monomial order. Comparison goes through [`MonomialTable::cmp`].
+//! The order is grevlex, sealed as `grevlex-v1`. Comparison goes through
+//! [`MonomialTable::cmp`]. [`MonomialId`] has no [`Ord`], because numeric id
+//! order has nothing to do with the monomial order.
 
 use std::cmp::Ordering;
 use std::marker::PhantomData;
@@ -21,7 +23,7 @@ use super::F4Error;
 /// engine holds to it at every lane width.
 pub(crate) const MAX_EXPONENT: u32 = u16::MAX as u32;
 
-/// The seed of the linear hash of design section 3.1.
+/// The seed of the linear hash of section 2.8.
 ///
 /// It is a constant, not a random value, so two runs of the same input agree
 /// on every hash and on every id.
@@ -137,7 +139,6 @@ impl<L: Lanes> MonomialTable<L> {
     ///
     /// This ladder suits an input whose exponents stay small. When the input
     /// carries larger exponents, use [`MonomialTable::with_max_exponent`].
-    #[cfg(test)]
     pub(crate) fn new(nvars: usize) -> Self {
         Self::with_max_exponent(nvars, 0)
     }
@@ -184,6 +185,11 @@ impl<L: Lanes> MonomialTable<L> {
         self
     }
 
+    /// The number of variables every monomial of this table holds.
+    pub(crate) fn nvars(&self) -> usize {
+        self.nvars
+    }
+
     /// The number of distinct monomials the table holds.
     pub(crate) fn len(&self) -> usize {
         self.meta.len()
@@ -191,7 +197,7 @@ impl<L: Lanes> MonomialTable<L> {
 
     /// Drop every monomial except the identity, keeping the allocations.
     ///
-    /// The update workspace and symbolic tables of design section 3.4 are
+    /// The update workspace and the symbolic table of design section 2.7 are
     /// reset this way. Every id the caller still holds becomes meaningless.
     pub(crate) fn clear(&mut self) {
         self.exps.clear();
@@ -203,7 +209,7 @@ impl<L: Lanes> MonomialTable<L> {
     /// Release every byte the table's allocations hold above their
     /// contents.
     ///
-    /// The memory retry of design section 11 calls this after
+    /// The memory retry of design section 3.9 calls this after
     /// [`MonomialTable::clear`], because the estimate counts capacity and
     /// a retry that holds the failed attempt's capacity cannot fit a
     /// smaller batch.
@@ -287,12 +293,20 @@ impl<L: Lanes> MonomialTable<L> {
     /// The hash is `sum_i r_i * e_i` with wrapping arithmetic, so it is
     /// additive: `hash(a * b) == hash(a) + hash(b)`. Two tables over the same
     /// variable count agree on it.
-    #[cfg(test)]
     pub(crate) fn hash(&self, a: MonomialId) -> u64 {
         self.meta[a.index()].hash
     }
 
+    /// The exponent of variable `var` in `a`.
+    pub(crate) fn exponent(&self, a: MonomialId, var: usize) -> u32 {
+        debug_assert!(var < self.nvars);
+        lane::<L>(self.words_of(a), var)
+    }
+
     /// Write the exponent vector of `a` into `out`, replacing its contents.
+    ///
+    /// The engine converts a basis back to [`crate::poly::Polynomial`] this
+    /// way, at the run boundary.
     pub(crate) fn unpack(&self, a: MonomialId, out: &mut Vec<u32>) {
         out.clear();
         let words = self.words_of(a);
@@ -312,7 +326,7 @@ impl<L: Lanes> MonomialTable<L> {
                 return Err(width_error(e));
             }
             // A ring holds at most 256 variables and an exponent at most
-            // 65535, so the sum stays below u32::MAX (design section 3.2).
+            // 65535, so the sum stays below u32::MAX (design section 2.3).
             deg += e;
         }
         let mut hash = 0u64;
@@ -343,7 +357,7 @@ impl<L: Lanes> MonomialTable<L> {
     ///
     /// The table stores no separate key slab. The reversed scan below gives
     /// the grevlex tail order from the exponent words alone (design section
-    /// 3.1).
+    /// 2.4 left the choice to a measurement).
     fn tail_cmp(&self, ia: usize, ib: usize) -> Ordering {
         let wa = self.words_at(ia);
         let wb = self.words_at(ib);
@@ -382,7 +396,6 @@ impl<L: Lanes> MonomialTable<L> {
     }
 
     /// Intern the product `a * b`.
-    #[cfg(test)]
     pub(crate) fn mul(&mut self, a: MonomialId, b: MonomialId) -> Result<MonomialId, F4Error> {
         let (ia, ib) = (a.index() * self.words, b.index() * self.words);
         let mut over = 0u64;
@@ -427,7 +440,6 @@ impl<L: Lanes> MonomialTable<L> {
     }
 
     /// Intern the least common multiple of `a` and `b`.
-    #[cfg(test)]
     pub(crate) fn lcm(&mut self, a: MonomialId, b: MonomialId) -> Result<MonomialId, F4Error> {
         let (ia, ib) = (a.index() * self.words, b.index() * self.words);
         for k in 0..self.words {
@@ -719,7 +731,7 @@ mod tests {
     use crate::poly::Monomial;
     use proptest::prelude::*;
 
-    /// The v0.1 monomial of `src/poly.rs`, the reference for every operation.
+    /// The public monomial of `src/poly.rs`, the reference for every operation.
     fn reference(exps: &[u32]) -> Monomial {
         Monomial::from_exps(exps.iter().map(|&e| e as u16).collect())
     }
@@ -746,7 +758,17 @@ mod tests {
         check_mask(&table, ia, ib, &ra, &rb);
         check_quotient(&mut table, ia, ib, &ra, &rb);
         check_lcm(&mut table, ia, ib, &ra, &rb);
-        check_product(&mut table, ia, ib, &a, &b, &ra, &rb);
+        check_product(
+            &mut table,
+            ProductCase {
+                left: ia,
+                right: ib,
+                left_exps: &a,
+                right_exps: &b,
+                left_ref: &ra,
+                right_ref: &rb,
+            },
+        );
     }
 
     fn check_basic_operations<L: Lanes>(
@@ -811,38 +833,44 @@ mod tests {
         assert_eq!(table.degree(actual), expected.deg);
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn check_product<L: Lanes>(
-        table: &mut MonomialTable<L>,
+    struct ProductCase<'a> {
         left: MonomialId,
         right: MonomialId,
-        left_exps: &[u32],
-        right_exps: &[u32],
-        left_ref: &Monomial,
-        right_ref: &Monomial,
-    ) {
-        let fits = left_exps
+        left_exps: &'a [u32],
+        right_exps: &'a [u32],
+        left_ref: &'a Monomial,
+        right_ref: &'a Monomial,
+    }
+
+    fn check_product<L: Lanes>(table: &mut MonomialTable<L>, case: ProductCase<'_>) {
+        let fits = case
+            .left_exps
             .iter()
-            .zip(right_exps)
+            .zip(case.right_exps)
             .all(|(&x, &y)| x + y <= L::BOUND);
-        match table.mul(left, right) {
+        match table.mul(case.left, case.right) {
             Ok(product) => {
                 assert!(fits);
                 assert_eq!(
                     exps_of(table, product),
                     widen(
-                        &left_ref
-                            .checked_mul(right_ref)
+                        &case
+                            .left_ref
+                            .checked_mul(case.right_ref)
                             .expect("the reference product fits")
                     )
                 );
-                assert_eq!(table.degree(product), left_ref.deg + right_ref.deg);
+                assert_eq!(
+                    table.degree(product),
+                    case.left_ref.deg + case.right_ref.deg
+                );
             }
             Err(error) => {
                 assert!(!fits);
-                let worst = left_exps
+                let worst = case
+                    .left_exps
                     .iter()
-                    .zip(right_exps)
+                    .zip(case.right_exps)
                     .map(|(&x, &y)| x + y)
                     .max()
                     .unwrap();

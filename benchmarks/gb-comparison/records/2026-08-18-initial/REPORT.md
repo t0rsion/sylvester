@@ -113,7 +113,7 @@ The July and this record used different core pinning (E-cores under
 here), so a cross-run ratio is approximate, not a clean speedup measurement.
 With that caveat, the sylvester cells moved with the optimization pass
 recorded in
-`benchmarks/gb-comparison/records/2026-08-18-v0.1-optimizations.md`:
+`benchmarks/gb-comparison/records/2026-08-18-optimizations.md`:
 
 - katsura-8 matrix: 5.52 s in July, 2.015 s now.
 - katsura-9: 88.1 s (matrix) and DNF (classic) in July; now 61.1 s classic,
@@ -136,5 +136,5 @@ the classic backend on eco-9) are fixed and recorded in `KNOWN_ISSUES.md`.
 - `inputs/`: generated systems in each tool's syntax.
 - `records/2026-07-25-archive/REPORT.md`: the July record, for historic
   numbers and the two resource-exhaustion defects it found.
-- `records/2026-08-18-v0.1-optimizations.md`: the per-commit optimization
+- `records/2026-08-18-optimizations.md`: the per-commit optimization
   measurements behind the sylvester numbers in this record.

@@ -1,7 +1,8 @@
 //! The byte format of `sylv-gb-cert-v2` (contract section 5).
 //!
-//! Every integer is a canonical varint. The header declares the byte
-//! length of each section.
+//! Every integer is a canonical varint. The sections are written into
+//! their own buffers, and the header then declares the byte length of
+//! each of them.
 
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
@@ -12,13 +13,15 @@ use crate::poly::{Monomial, Polynomial};
 use super::divide::Step;
 use super::record::Node;
 use super::witness::Witness;
-use super::{Budget, MAX_POOL_ENTRIES, MAX_POOL_MONOMIALS, cap};
+use super::{MAX_POOL_ENTRIES, MAX_POOL_MONOMIALS, WriterBudget, cap};
 
 /// The eight magic bytes: `SYLVGB`, format 2, revision 0.
 const MAGIC: [u8; 8] = [0x53, 0x59, 0x4c, 0x56, 0x47, 0x42, 0x02, 0x00];
 
+/// The schema string.
 const SCHEMA: &[u8] = b"sylv-gb-cert-v2";
 
+/// The order string.
 const ORDER: &[u8] = b"grevlex-v1";
 
 /// The pool of monomials the certificate references.
@@ -37,7 +40,7 @@ impl Pool {
     /// and never the whole pool.
     pub(super) fn build(
         monomials: impl IntoIterator<Item = Monomial>,
-        budget: &mut Budget,
+        budget: &mut WriterBudget,
     ) -> Result<Self, CertifyError> {
         let mut index: BTreeMap<Monomial, u32> = BTreeMap::new();
         let mut entries = 0usize;
@@ -68,10 +71,12 @@ impl Pool {
         Ok(Pool { index })
     }
 
+    /// The number of monomials.
     pub(super) fn len(&self) -> usize {
         self.index.len()
     }
 
+    /// The pool index of `mono`.
     fn at(&self, mono: &Monomial) -> u32 {
         *self
             .index
@@ -82,13 +87,17 @@ impl Pool {
 
 /// What one certificate holds.
 pub(super) struct Parts<'a> {
+    /// The prime.
     pub(super) modulus: u64,
+    /// The number of variables.
     pub(super) nvars: usize,
+    /// The monomial pool.
     pub(super) pool: &'a Pool,
     /// The input list, in the caller's order.
     pub(super) input: &'a [Polynomial],
     /// The nodes, in emission order.
     pub(super) nodes: &'a [Node],
+    /// The use count of each node.
     pub(super) uses: &'a [u32],
     /// The node of each basis element.
     pub(super) basis: &'a [u32],
@@ -114,10 +123,11 @@ const SECTIONS: [Section; 6] = [
 ///
 /// The header declares the byte length of every section, so the sections
 /// go into one buffer and the header goes in front of it. The writer holds
-/// that buffer and the certificate at once, so its peak is the certificate
-/// twice over. A section is charged after it is written, so the writer
-/// passes the limit by at most one section.
-pub(super) fn write(parts: &Parts<'_>, budget: &mut Budget) -> Result<Vec<u8>, CertifyError> {
+/// that buffer and the certificate at once and nothing else, so its peak
+/// is the certificate twice over. The budget takes each section as it is
+/// written and the copy before it is made. A section is charged after it
+/// is written, so the writer passes the limit by at most one section.
+pub(super) fn write(parts: &Parts<'_>, budget: &mut WriterBudget) -> Result<Vec<u8>, CertifyError> {
     let mut body: Vec<u8> = Vec::new();
     let mut lengths = [0usize; SECTIONS.len()];
     for (section, length) in SECTIONS.iter().zip(lengths.iter_mut()) {

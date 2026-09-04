@@ -1,0 +1,14 @@
+cff-version: 1.2.0
+message: "If you use sylvester, cite it with the metadata below."
+title: sylvester
+type: software
+authors:
+  - family-names: Kringeland
+    given-names: Tor
+    email: tor@vixe.re
+version: 0.3.0
+repository-code: "https://github.com/t0rsion/sylvester"
+url: "https://github.com/t0rsion/sylvester"
+license:
+  - Apache-2.0
+  - MIT

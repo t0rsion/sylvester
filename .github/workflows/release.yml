@@ -19,6 +19,9 @@ jobs:
         run: |
           TAG="${GITHUB_REF_NAME#v}"
           grep -q "^version = \"$TAG\"$" Cargo.toml || { echo "Cargo.toml does not declare version $TAG"; exit 1; }
+          grep -q "^version = \"$TAG\"$" crates/sylvester-cli/Cargo.toml || { echo "sylvester-cli does not declare version $TAG"; exit 1; }
+          grep -q "^version = \"$TAG\"$" crates/sylvester-py/Cargo.toml || { echo "sylvester-py does not declare version $TAG"; exit 1; }
+          grep -q "^version = \"$TAG\"$" crates/sylvester-py/pyproject.toml || { echo "pyproject.toml does not declare version $TAG"; exit 1; }
 
   preflight:
     needs: check-version
@@ -33,39 +36,86 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Require the tag to lie on the tested main history
+      - name: Require the tag to be an ancestor of origin/main
         run: |
           git fetch origin main:refs/remotes/origin/main
           git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main
       - uses: dtolnay/rust-toolchain@1.92.0
       - name: Test the workspace at the tag
         run: cargo +1.92.0 test --workspace --locked
-      - name: Package and test inside the extracted package
+      - name: Package and test the extracted library
         env:
           CARGO_PROFILE_DEV_OPT_LEVEL: "2"
         run: |
-          cargo +1.92.0 package --locked
+          cargo +1.92.0 package -p sylvester --locked
           PKG_DIR=$(cygpath -u "$RUNNER_TEMP" 2>/dev/null || printf '%s' "$RUNNER_TEMP")/pkg
           mkdir -p "$PKG_DIR"
           tar xzf target/package/sylvester-*.crate -C "$PKG_DIR"
           cd "$PKG_DIR"/sylvester-*
           cargo +1.92.0 test --locked
+  python-wheels:
+    needs: check-version
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - uses: dtolnay/rust-toolchain@1.92.0
+      - run: python -m pip install "maturin>=1.11,<2"
+      - run: maturin build --release --locked --out dist
+        working-directory: crates/sylvester-py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-wheel-${{ matrix.os }}
+          path: crates/sylvester-py/dist/*.whl
+
+  python-sdist:
+    needs: check-version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - uses: dtolnay/rust-toolchain@1.92.0
+      - run: python -m pip install "maturin>=1.11,<2"
+      - run: maturin sdist --out dist
+        working-directory: crates/sylvester-py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-sdist
+          path: crates/sylvester-py/dist/*.tar.gz
 
   crates-io:
-    # Publication is irreversible, so every fallible build and test job runs
-    # first.
-    needs: preflight
+    # Every check that does not require the published library runs first.
+    needs: [preflight, python-wheels, python-sdist]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.92.0
-      - name: Publish unless this version is already on crates.io
+      - name: Publish the library and CLI unless the version exists
         run: |
           V="${GITHUB_REF_NAME#v}"
           if curl -sf -A "sylvester-release-ci" "https://crates.io/api/v1/crates/sylvester/$V" > /dev/null; then
             echo "sylvester $V already published; skipping"
           else
-            cargo +1.92.0 publish --locked
+            cargo +1.92.0 publish -p sylvester --locked
+          fi
+          for attempt in $(seq 1 30); do
+            curl -sf -A "sylvester-release-ci" "https://crates.io/api/v1/crates/sylvester/$V" > /dev/null && break
+            echo "waiting for crates.io index attempt $attempt of 30"
+            sleep 10
+          done
+          curl -sf -A "sylvester-release-ci" "https://crates.io/api/v1/crates/sylvester/$V" > /dev/null
+          if curl -sf -A "sylvester-release-ci" "https://crates.io/api/v1/crates/sylvester-cli/$V" > /dev/null; then
+            echo "sylvester-cli $V already published; skipping"
+          else
+            cargo +1.92.0 publish -p sylvester-cli --locked
           fi
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
@@ -78,13 +128,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.92.0
-      - name: Build the crate archive and its checksum
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: python-*
+          path: target/release-artifacts
+          merge-multiple: true
+      - name: Build crate archives and checksums
         run: |
-          cargo +1.92.0 package --locked
-          cd target/package
-          sha256sum sylvester-*.crate > SHA256SUMS
+          cargo +1.92.0 package -p sylvester --locked
+          cargo +1.92.0 package -p sylvester-cli --locked
+          cp target/package/*.crate target/release-artifacts/
+          cd target/release-artifacts
+          sha256sum -- * > SHA256SUMS
       - uses: softprops/action-gh-release@v2
         with:
           files: |
-            target/package/sylvester-*.crate
-            target/package/SHA256SUMS
+            target/release-artifacts/*

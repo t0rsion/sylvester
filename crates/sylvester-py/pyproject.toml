@@ -1,0 +1,29 @@
+[build-system]
+requires = ["maturin>=1.11,<2"]
+build-backend = "maturin"
+
+[project]
+name = "sylvester"
+version = "0.3.0"
+description = "Gröbner bases over prime fields and over the rational numbers, with independent certificate verifiers"
+requires-python = ">=3.10"
+license = "MIT OR Apache-2.0"
+keywords = ["groebner", "f4", "algebra", "polynomial", "mathematics"]
+# "Private :: Do Not Upload" is not a registered classifier, so PyPI
+# refuses the distribution. The package is never published while
+# correctness certification is incomplete.
+classifiers = [
+    "Private :: Do Not Upload",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Mathematics",
+]
+
+[project.urls]
+Homepage = "https://github.com/t0rsion/sylvester"
+Repository = "https://github.com/t0rsion/sylvester"
+
+[tool.maturin]
+python-source = "python"
+module-name = "sylvester._sylvester"

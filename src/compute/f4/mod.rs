@@ -1,10 +1,20 @@
-//! The F4 engine (design sections 3 through 12).
+//! The F4 engine (design section 3).
 //!
-//! [`groebner_basis`] interns the generators, runs the batch loop,
-//! interreduces, and converts the result back to [`Polynomial`]. A run
-//! starts at the narrowest packing the generators' exponents fit and
-//! starts again at the next width on [`F4Error::LaneOverflow`] (design
-//! section 3.2).
+//! [`groebner_basis`] is the whole engine: it interns the generators, runs
+//! the batch loop, interreduces, and converts the result back to
+//! [`Polynomial`]. Everything inside the run works on interned monomials
+//! ([`monomial`]), on column indices ([`matrix`]), and on one field
+//! context ([`field`]).
+//!
+//! The lane width comes from the input: a run starts at the narrowest
+//! packing the generators' exponents fit and starts again at the next
+//! width on [`F4Error::LaneOverflow`] (design section 2.3). The monomial
+//! order is grevlex, sealed.
+
+// The interfaces of design section 9 are frozen, so every module carries
+// the whole API the later chunks compile against, not only what the run
+// loop calls today.
+#![allow(dead_code)]
 
 pub(crate) mod basis;
 pub(crate) mod field;
@@ -15,6 +25,8 @@ pub(crate) mod pairs;
 pub(crate) mod symbolic;
 pub(crate) mod trace;
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use basis::{Basis, BasisPoly, InputPoly};
@@ -25,7 +37,7 @@ use pairs::{PairCounters, PairSet, SelectOptions};
 use symbolic::{Strategy, Symbolic};
 use trace::{BatchRow, BatchRows, Insertion, NoTrace, Returned, RowId, Trace};
 
-use super::{ComputeError, ComputeOptions, DEGREE_LIMIT};
+use super::{ComputeError, ComputeLimits, DEGREE_LIMIT, RunError};
 use crate::poly::{Exps, Monomial, Polynomial, Term};
 use crate::ring::PolynomialRing;
 use crate::ring::field::Felt;
@@ -34,7 +46,7 @@ use crate::ring::field::Felt;
 ///
 /// [`F4Error::LaneOverflow`] is internal. The run loop catches it, discards
 /// the run state, and starts again at the next lane width (design section
-/// 3.2). [`F4Error::ExponentOverflow`] surfaces as
+/// 2.3). [`F4Error::ExponentOverflow`] surfaces as
 /// [`ComputeError::ExponentLimit`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum F4Error {
@@ -49,40 +61,54 @@ pub(crate) enum F4Error {
     ExponentOverflow,
     /// A table reached `u32::MAX - 1` monomials.
     TableFull,
+    /// The cancellation flag of the run was set.
+    Cancelled,
 }
 
 /// The number of items one loop takes between two reads of the clock.
 ///
 /// Reading the clock costs more than one pass of the loops that call
-/// [`Deadline::tick`].
+/// [`Deadline::tick`], so a loop counts its items and reads the clock
+/// every [`TICK`] of them.
 const TICK: u32 = 64;
 
-/// The deadline of one run, checked at a fixed cadence.
+/// The deadline and the cancellation flag of one run, checked at a fixed
+/// cadence.
 ///
 /// [`Deadline::tick`] is what a loop calls per item. It reads the clock
 /// once every [`TICK`] calls. [`Deadline::check`] reads it at once and is
-/// what the run loop calls between batches.
+/// what the run loop calls between batches. A cancelled run stops at the
+/// same cadence, so the flag stops it within [`TICK`] items of being set.
 pub(crate) struct Deadline {
     at: Option<Instant>,
+    cancel: Option<Arc<AtomicBool>>,
     ticks: u32,
 }
 
 impl Deadline {
-    /// The deadline `at`, or no deadline for `None`.
-    pub(crate) fn new(at: Option<Instant>) -> Self {
-        Deadline { at, ticks: 0 }
+    /// The deadline and the cancellation flag of `limits`.
+    pub(crate) fn of(limits: &ComputeLimits) -> Self {
+        Deadline {
+            at: limits.deadline,
+            cancel: limits.cancel.clone(),
+            ticks: 0,
+        }
     }
 
     /// A deadline that never passes.
     #[cfg(test)]
     pub(crate) fn none() -> Self {
-        Deadline::new(None)
+        Deadline {
+            at: None,
+            cancel: None,
+            ticks: 0,
+        }
     }
 
     /// Count one item, and check the clock every [`TICK`] items.
     #[inline]
     pub(crate) fn tick(&mut self) -> Result<(), F4Error> {
-        if self.at.is_none() {
+        if self.at.is_none() && self.cancel.is_none() {
             return Ok(());
         }
         self.ticks += 1;
@@ -93,16 +119,26 @@ impl Deadline {
         self.check()
     }
 
-    /// The instant this deadline stands at, or `None` for no deadline.
+    /// A deadline at the same instant, with the same cancellation flag.
     ///
-    /// The parallel phase of the kernel builds one deadline per worker
-    /// from it, because a worker counts its own items.
-    pub(crate) fn at(&self) -> Option<Instant> {
-        self.at
+    /// The parallel phase of the kernel builds one per worker, because a
+    /// worker counts its own items. A worker reads the flag, so cancelling
+    /// a run stops it inside a parallel batch too.
+    pub(crate) fn fork(&self) -> Self {
+        Deadline {
+            at: self.at,
+            cancel: self.cancel.clone(),
+            ticks: 0,
+        }
     }
 
-    /// Check the clock now.
+    /// Check the flag and the clock now.
     pub(crate) fn check(&mut self) -> Result<(), F4Error> {
+        if let Some(flag) = &self.cancel
+            && flag.load(Ordering::Relaxed)
+        {
+            return Err(F4Error::Cancelled);
+        }
         match self.at {
             Some(at) if Instant::now() >= at => Err(F4Error::Timeout),
             _ => Ok(()),
@@ -112,8 +148,9 @@ impl Deadline {
 
 /// The internal settings of one F4 run.
 ///
-/// `max_batch_pairs` defaults to no cap. The symbolic strategy uses the
-/// default in design section 6.
+/// None of these is public (design open decision 7). `max_batch_pairs`
+/// defaults to no cap, and the strategy defaults are the M1 baseline of
+/// design section 3.5.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct F4Options {
     /// The largest number of pairs one batch takes, or `None` for no cap.
@@ -129,7 +166,7 @@ pub(crate) struct F4Options {
 /// What one run did, for the benchmark harness and the tests.
 ///
 /// The counters are a report, never an input to a decision. Design section
-/// 2 lists them.
+/// 8.6 lists them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RunCounters {
     /// The batches the run reduced, including the final interreduction.
@@ -140,15 +177,18 @@ pub(crate) struct RunCounters {
     pub(crate) matrix_columns: u64,
     /// The nonzero entries of every batch, before reduction.
     pub(crate) matrix_nonzeros: u64,
+    /// The rows that reduced to zero.
     pub(crate) zero_rows: u64,
+    /// The pivots the reduction installed.
     pub(crate) new_pivots: u64,
-    /// The lane restarts of design section 3.2.
+    /// The lane restarts of design section 2.3.
     pub(crate) lane_restarts: u32,
     /// The monomials of the basis table at the end of the run.
     pub(crate) basis_monomials: usize,
     /// The batches the run built, found too large for the budget, and
     /// built again with half the pairs.
     pub(crate) batch_retries: u64,
+    /// The counters of the pair set.
     pub(crate) pairs: PairCounters,
     /// The pool the run computed in, or `None` for the rayon global pool.
     pub(crate) threads: Option<usize>,
@@ -157,28 +197,23 @@ pub(crate) struct RunCounters {
 /// Compute the reduced Gröbner basis with the F4 engine.
 ///
 /// The result is monic and sorted strictly descending by leading monomial.
-/// `options` carries the deadline, the memory limit, and the thread count.
+/// `limits` carries the deadline, the memory limit, the thread count, and
+/// the cancellation flag.
 pub(crate) fn groebner_basis(
     ring: &PolynomialRing,
     generators: &[Polynomial],
-    options: &ComputeOptions,
-) -> Result<Vec<Polynomial>, ComputeError> {
-    solve(ring, generators, options).map(|(basis, _)| basis)
+    limits: &ComputeLimits,
+) -> Result<Vec<Polynomial>, RunError> {
+    solve(ring, generators, limits).map(|(basis, _)| basis)
 }
 
 /// Compute the basis and report the run counters.
 pub(crate) fn solve(
     ring: &PolynomialRing,
     generators: &[Polynomial],
-    options: &ComputeOptions,
-) -> Result<(Vec<Polynomial>, RunCounters), ComputeError> {
-    solve_recorded(
-        ring,
-        generators,
-        options,
-        &Limits::of(options),
-        &mut NoTrace,
-    )
+    limits: &ComputeLimits,
+) -> Result<(Vec<Polynomial>, RunCounters), RunError> {
+    solve_recorded(ring, generators, limits, &mut NoTrace)
 }
 
 /// Compute the basis and report every operation to `trace`.
@@ -192,20 +227,19 @@ pub(crate) fn solve(
 /// caller asked for and no others. Building the pool is best effort: a
 /// machine that refuses it leaves the run on the calling thread, and
 /// `RunCounters::threads` then reports 1. Neither the pool nor the thread
-/// count changes the basis (design section 12).
+/// count changes the basis (design section 5).
 pub(crate) fn solve_recorded<T: Trace + Send>(
     ring: &PolynomialRing,
     generators: &[Polynomial],
-    options: &ComputeOptions,
-    limits: &Limits,
+    limits: &ComputeLimits,
     trace: &mut T,
-) -> Result<(Vec<Polynomial>, RunCounters), ComputeError> {
+) -> Result<(Vec<Polynomial>, RunCounters), RunError> {
     let mut f4 = F4Options {
-        threads: options.threads,
+        threads: limits.threads,
         ..F4Options::default()
     };
     if !T::RECORDS
-        && let Some(count) = options.threads
+        && let Some(count) = limits.threads
         && count > 1
     {
         match rayon::ThreadPoolBuilder::new().num_threads(count).build() {
@@ -224,28 +258,9 @@ pub(crate) fn solve_recorded<T: Trace + Send>(
     Ok((basis, counters))
 }
 
-/// The deadline and the memory limit of one run, taken once.
-///
-/// The certified path takes one value and threads it through the engine,
-/// the recorder, and the writer, so the whole run holds to one budget.
-pub(crate) struct Limits {
-    pub(crate) deadline: Option<Instant>,
-    pub(crate) memory: Option<usize>,
-}
-
-impl Limits {
-    /// The limits `options` names, with the deadline taken now.
-    pub(crate) fn of(options: &ComputeOptions) -> Self {
-        Limits {
-            deadline: options.deadline(),
-            memory: options.memory_limit,
-        }
-    }
-}
-
-/// Map an engine stop onto the public report.
-fn report(error: F4Error) -> ComputeError {
-    match error {
+/// Map an engine stop onto the report the crate passes on.
+fn report(error: F4Error) -> RunError {
+    let compute = match error {
         F4Error::Timeout => ComputeError::Timeout,
         F4Error::MemoryLimitExceeded => ComputeError::MemoryLimitExceeded,
         F4Error::ExponentOverflow => ComputeError::ExponentLimit {
@@ -258,7 +273,9 @@ fn report(error: F4Error) -> ComputeError {
         F4Error::LaneOverflow => ComputeError::ExponentLimit {
             limit: DEGREE_LIMIT,
         },
-    }
+        F4Error::Cancelled => return RunError::Cancelled,
+    };
+    RunError::Compute(compute)
 }
 
 /// One lane packing of the monomial tables.
@@ -304,7 +321,7 @@ fn dispatch<T: Trace>(
     ring: &PolynomialRing,
     generators: &[Polynomial],
     options: &F4Options,
-    limits: &Limits,
+    limits: &ComputeLimits,
     trace: &mut T,
 ) -> Result<(Vec<Polynomial>, RunCounters), F4Error> {
     // A public exponent is a u16, so it is at most MAX_EXPONENT and the
@@ -353,7 +370,7 @@ fn start<L: Lanes, T: Trace>(
     ring: &PolynomialRing,
     generators: &[Polynomial],
     options: &F4Options,
-    limits: &Limits,
+    limits: &ComputeLimits,
     max_exponent: u32,
     trace: &mut T,
 ) -> Result<(Vec<Polynomial>, RunCounters), F4Error> {
@@ -371,18 +388,18 @@ fn start<L: Lanes, T: Trace>(
     )
 }
 
-/// One run at one lane width, with one field kernel (design sections 8 to 10).
+/// One run at one lane width, with one field kernel (design section 3.2).
 fn run<L: Lanes, F: FieldOps<Coeff = u32> + Sync, T: Trace>(
     ring: &PolynomialRing,
     generators: &[Polynomial],
     field: &F,
     options: &F4Options,
-    limits: &Limits,
+    limits: &ComputeLimits,
     max_exponent: u32,
     trace: &mut T,
 ) -> Result<(Vec<Polynomial>, RunCounters), F4Error> {
     let nvars = ring.nvars();
-    let mut clock = Deadline::new(limits.deadline);
+    let mut clock = Deadline::of(limits);
     clock.check()?;
 
     if generators.is_empty() {
@@ -395,9 +412,11 @@ fn run<L: Lanes, F: FieldOps<Coeff = u32> + Sync, T: Trace>(
     let mut state = F4State::<L>::new(
         generators,
         field,
-        nvars,
-        max_exponent,
-        limits,
+        RunSetup {
+            nvars,
+            max_exponent,
+            limits,
+        },
         trace,
         &mut clock,
     )?;
@@ -420,26 +439,29 @@ struct F4State<L: Lanes> {
     nvars: usize,
 }
 
+struct RunSetup<'a> {
+    nvars: usize,
+    max_exponent: u32,
+    limits: &'a ComputeLimits,
+}
+
 impl<L: Lanes> F4State<L> {
-    #[allow(clippy::too_many_arguments)]
     fn new<F: FieldOps<Coeff = u32>, T: Trace>(
         generators: &[Polynomial],
         field: &F,
-        nvars: usize,
-        max_exponent: u32,
-        limits: &Limits,
+        setup: RunSetup<'_>,
         trace: &T,
         clock: &mut Deadline,
     ) -> Result<Self, F4Error> {
-        let mut table =
-            MonomialTable::<L>::with_max_exponent(nvars, max_exponent).with_limit(limits.memory);
+        let mut table = MonomialTable::<L>::with_max_exponent(setup.nvars, setup.max_exponent)
+            .with_limit(setup.limits.memory);
         let inputs = intern_generators(generators, &mut table)?;
         let mut state = F4State {
             basis: Basis::new(table),
-            update_ws: MonomialTable::<L>::with_max_exponent(nvars, max_exponent)
-                .with_limit(limits.memory),
-            sym_table: MonomialTable::<L>::with_max_exponent(nvars, max_exponent)
-                .with_limit(limits.memory),
+            update_ws: MonomialTable::<L>::with_max_exponent(setup.nvars, setup.max_exponent)
+                .with_limit(setup.limits.memory),
+            sym_table: MonomialTable::<L>::with_max_exponent(setup.nvars, setup.max_exponent)
+                .with_limit(setup.limits.memory),
             pairs: PairSet::new(),
             batch: Batch::default(),
             ws: Workspace::default(),
@@ -448,13 +470,13 @@ impl<L: Lanes> F4State<L> {
             coeffs: Vec::new(),
             report: Report::default(),
             seed_unit: false,
-            nvars,
+            nvars: setup.nvars,
         };
         state
             .basis
             .seed(field, inputs, &mut state.pairs, &mut state.update_ws, clock)?;
         state.seed_unit = state.basis.is_unit();
-        state.check_memory(limits.memory, trace)?;
+        state.check_memory(setup.limits.memory, trace)?;
         Ok(state)
     }
 
@@ -477,7 +499,7 @@ impl<L: Lanes> F4State<L> {
         &mut self,
         field: &F,
         options: &F4Options,
-        limits: &Limits,
+        limits: &ComputeLimits,
         trace: &mut T,
         clock: &mut Deadline,
     ) -> Result<(), F4Error>
@@ -503,7 +525,7 @@ impl<L: Lanes> F4State<L> {
         selected: Vec<pairs::Pair>,
         field: &F,
         options: &F4Options,
-        limits: &Limits,
+        limits: &ComputeLimits,
         trace: &mut T,
         clock: &mut Deadline,
     ) -> Result<(), F4Error>
@@ -516,16 +538,15 @@ impl<L: Lanes> F4State<L> {
         if T::RECORDS {
             self.report.send_rows(self.nvars, trace);
         }
-        let reduction = kernel::reduce(
-            &mut self.batch,
+        let mut context = kernel::ReductionContext::new(
             &self.basis,
             field,
             trace,
-            &mut self.ws,
             clock,
             limits.memory,
             options.threads,
-        )?;
+        );
+        let reduction = kernel::reduce(&mut self.batch, &mut self.ws, &mut context)?;
         self.counters.zero_rows += u64::from(reduction.zero_rows);
         self.counters.new_pivots += u64::from(reduction.new_pivots);
         self.insert_pivots(field, trace, clock)?;
@@ -536,7 +557,7 @@ impl<L: Lanes> F4State<L> {
         &mut self,
         mut selected: Vec<pairs::Pair>,
         options: &F4Options,
-        limits: &Limits,
+        limits: &ComputeLimits,
         trace: &T,
         clock: &mut Deadline,
     ) -> Result<(), F4Error> {
@@ -653,7 +674,7 @@ impl<L: Lanes> F4State<L> {
         ring: &PolynomialRing,
         field: &F,
         options: &F4Options,
-        limits: &Limits,
+        limits: &ComputeLimits,
         trace: &mut T,
         clock: &mut Deadline,
     ) -> Result<(Vec<Polynomial>, RunCounters), F4Error>
@@ -696,7 +717,7 @@ impl<L: Lanes> F4State<L> {
         ring: &PolynomialRing,
         field: &F,
         options: &F4Options,
-        limits: &Limits,
+        limits: &ComputeLimits,
         trace: &mut T,
         clock: &mut Deadline,
     ) -> Result<Vec<Polynomial>, F4Error>
@@ -865,7 +886,7 @@ fn nonzeros(batch: &Batch) -> u64 {
     rows.map(|row| u64::from(row.len())).sum()
 }
 
-/// The bytes the run holds, counting capacities (design section 11).
+/// The bytes the run holds, counting capacities (design section 3.9).
 ///
 /// The trace is part of the run, so a recorded run charges its nodes to
 /// the same limit the engine holds to.
@@ -912,7 +933,7 @@ fn max_exponent(generators: &[Polynomial]) -> u32 {
         .unwrap_or(0)
 }
 
-/// Intern the generators into the basis table (design section 10).
+/// Intern the generators into the basis table (design section 2.1).
 ///
 /// One pass, in the caller's order. The index of a generator in the result
 /// is its public input index, which [`Basis::seed`] records.
@@ -934,14 +955,15 @@ fn intern_generators<L: Lanes>(
             monos.push(table.intern(&exps)?);
             // The ring caps the modulus at 2^31 - 1, so a residue fits a
             // u32.
-            coeffs.push(coeff as u32);
+            coeffs.push(coeff.value() as u32);
         }
         inputs.push(InputPoly { monos, coeffs });
     }
     Ok(inputs)
 }
 
-/// Convert the interreduced basis back to [`Polynomial`] (design section 9).
+/// Convert the interreduced basis back to [`Polynomial`] (design section
+/// 2.1).
 ///
 /// The rows of `batch` are the live basis elements and the reducer
 /// multiples symbolic closure added. A row whose `raw` index is below the
@@ -1001,7 +1023,7 @@ mod tests {
             parse(&ring, "x1^3 - x0*x2"),
         ];
         let (basis, counters) =
-            solve(&ring, &generators, &ComputeOptions::new()).expect("no limit");
+            solve(&ring, &generators, &ComputeLimits::default()).expect("no limit");
 
         assert!(!basis.is_empty());
         assert!(counters.batches > 1, "{counters:?}");
@@ -1027,7 +1049,7 @@ mod tests {
             parse(&ring, "x0^30*x1^100 - 1"),
         ];
         let (basis, counters) =
-            solve(&ring, &generators, &ComputeOptions::new()).expect("no limit");
+            solve(&ring, &generators, &ComputeLimits::default()).expect("no limit");
         assert!(!basis.is_empty());
         assert_eq!(counters.lane_restarts, 1, "{counters:?}");
     }

@@ -1,0 +1,5 @@
+# vars: x, y
+# modulus: 32003
+x - 1
+y
+x*y + 1

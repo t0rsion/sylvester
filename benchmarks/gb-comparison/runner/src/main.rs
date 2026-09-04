@@ -1,6 +1,6 @@
 //! One-instance-per-invocation runner for the sylvester Gröbner engine.
 //!
-//! Usage: sylv-runner <input.syl> <f4|classic|certified|f4-certified>
+//! Usage: sylv-runner <input> <f4|classic|certified|f4-certified|rational>
 //! <threads> <modulus>
 //!
 //! `threads` goes to `ComputeOptions::threads`. A count of 1 keeps the
@@ -16,24 +16,56 @@
 //! bundled verifier. It is not comparable to the raw `TIME_S` of the
 //! same backend. `driver.py` computes `split` from the two cells.
 //!
-//! Input format: line 1 is nvars. Each further line is one polynomial as
-//! terms separated by `;`, each term `coeff,e1,e2,...,en`.
+//! `rational` runs `Ideal::<Rationals>::groebner_basis_with_report` with
+//! `RationalOptions::new()`, over the field `Q`. The input is a `.sylq`
+//! file (see below); the trailing `<modulus>` argument is unused in this
+//! mode and read only to keep the command line the same shape as the
+//! other four, so a caller passes `0` by convention, matching the
+//! characteristic line of the `.ms` format.
 //!
-//! Output: `TIME_S` (wall seconds of the compute call), `SIZE`, one
-//! `LM e1 e2 ... en` line per basis element (grevlex leading monomial,
-//! x1 > x2 > ... > xn, independent of engine term order), then one
-//! `POLY <term count>` block per element with terms sorted grevlex
-//! descending. Coefficients are the crate's reduced values, not monic.
-//! `driver.py` applies the same monic normalization to every engine.
-//! Raw modes add one `COUNTERS <key>=<value> ...` line from
-//! `Ideal::groebner_basis_with_report`. Certified modes add `CERT_BYTES`
-//! and `VERIFY_S`. Every mode prints `PEAK_RSS_KB` last, from
-//! `/proc/self/status`.
+//! Input format for `f4`, `classic`, `certified`, and `f4-certified`
+//! (`.syl`): line 1 = nvars; each further line = one polynomial as terms
+//! separated by ';', each term "coeff,e1,e2,...,en", coeff a decimal
+//! integer.
+//!
+//! Input format for `rational` (`.sylq`): the same shape as `.syl`, line
+//! for line and term for term, except a term's coefficient field also
+//! accepts "numerator/denominator". `.sylq` is a separate extension
+//! rather than a characteristic line inside `.syl`, because `.syl` carries
+//! no ring at all: the domain comes from this runner's own arguments (the
+//! mode, here), not from the file, and every existing `.syl` file and its
+//! parsing above are unchanged. `gen.py`'s family generators write
+//! integer coefficients only, so reading the fraction form is a superset
+//! of what it writes.
+//!
+//! Prints: TIME_S <wall seconds of the compute call only>, SIZE <n>,
+//! one "LM e1 e2 ... en" line per basis element (grevlex leading
+//! monomial, x1 > x2 > ... > xn), computed independently of the term
+//! order the engine returns, then one "POLY <term count>" block per
+//! basis element with one "coeff e1 e2 ... en" line per term, terms
+//! sorted grevlex descending. Under `f4`, `classic`, `certified`, and
+//! `f4-certified`, `coeff` is the crate's own reduced value (already in
+//! 0..p) and not normalized to a monic leading coefficient: driver.py
+//! does that normalization the same way for every engine, so no engine's
+//! runner special-cases it. Under `rational`, `coeff` is
+//! "numerator/denominator" in lowest terms with a positive denominator,
+//! and the basis is already monic: the multimodular engine returns it
+//! that way, so nothing here renormalizes it.
+//!
+//! The two prime-field raw modes add one "COUNTERS <key>=<value> ..."
+//! line from `Ideal::groebner_basis_with_report`, and the two certified
+//! modes add CERT_BYTES <n> and VERIFY_S <seconds>. `rational` adds one
+//! "LIFT <key>=<value> ..." line from the run's `ModularLift`, with
+//! `established` printed as `unchanged` or `contains_input`. Every mode
+//! prints PEAK_RSS_KB <n> last, read from `/proc/self/status`.
 
 use std::cmp::Ordering;
 use std::time::{Duration, Instant};
 
-use sylvester::{Backend, ComputeError, ComputeOptions, ComputeReport, Polynomial, PolynomialRing};
+use sylvester::{
+    Backend, ComputeError, ComputeOptions, ComputeReport, Established, Felt, ModularLift,
+    Polynomial, PolynomialRing, RationalOptions, Rationals,
+};
 
 fn grevlex_cmp(a: &[u16], b: &[u16]) -> Ordering {
     let da: u32 = a.iter().map(|&e| e as u32).sum();
@@ -52,6 +84,23 @@ fn grevlex_cmp(a: &[u16], b: &[u16]) -> Ordering {
     }
 }
 
+/// The `x1 .. xn` names every format in this harness uses. No format here
+/// carries variable names of its own.
+fn variable_names(nvars: usize) -> Vec<String> {
+    (1..=nvars).map(|index| format!("x{index}")).collect()
+}
+
+fn read_nvars_and_lines(text: &str) -> (usize, impl Iterator<Item = &str>) {
+    let mut lines = text.lines().filter(|l| !l.trim().is_empty());
+    let nvars: usize = lines
+        .next()
+        .expect("nvars line")
+        .trim()
+        .parse()
+        .expect("nvars");
+    (nvars, lines)
+}
+
 fn print_basis(polys: &[Polynomial]) {
     for poly in polys {
         let lm = poly
@@ -63,12 +112,33 @@ fn print_basis(polys: &[Polynomial]) {
         println!("LM {}", s.join(" "));
     }
     for poly in polys {
-        let mut terms: Vec<(u64, &[u16])> = poly.terms().collect();
+        let mut terms: Vec<(&Felt, &[u16])> = poly.terms().collect();
         terms.sort_by(|(_, a), (_, b)| grevlex_cmp(b, a));
         println!("POLY {}", terms.len());
         for (coeff, exps) in terms {
             let s: Vec<String> = exps.iter().map(|e| e.to_string()).collect();
-            println!("{coeff} {}", s.join(" "));
+            println!("{} {}", coeff.value(), s.join(" "));
+        }
+    }
+}
+
+fn print_basis_rational(polys: &[Polynomial<Rationals>]) {
+    for poly in polys {
+        let lm = poly
+            .terms()
+            .map(|(_, exps)| exps)
+            .max_by(|a, b| grevlex_cmp(a, b))
+            .expect("nonzero poly");
+        let s: Vec<String> = lm.iter().map(|e| e.to_string()).collect();
+        println!("LM {}", s.join(" "));
+    }
+    for poly in polys {
+        let mut terms: Vec<_> = poly.terms().collect();
+        terms.sort_by(|(_, a), (_, b)| grevlex_cmp(b, a));
+        println!("POLY {}", terms.len());
+        for (coeff, exps) in terms {
+            let s: Vec<String> = exps.iter().map(|e| e.to_string()).collect();
+            println!("{}/{} {}", coeff.numer(), coeff.denom(), s.join(" "));
         }
     }
 }
@@ -121,6 +191,26 @@ fn print_counters(report: &ComputeReport) {
     println!("{line}");
 }
 
+/// One "LIFT <key>=<value> ..." line from the rational run's
+/// `ModularLift`. The keys are its field names; `established` is
+/// `unchanged` or `contains_input`.
+fn print_lift(lift: &ModularLift) {
+    let established = match lift.established {
+        Established::Unchanged => "unchanged",
+        Established::ContainsInput => "contains_input",
+    };
+    println!(
+        "LIFT primes_consumed={} primes_skipped={} primes_folded={} \
+         primes_discarded={} confirming_primes={} modulus_bits={} established={established}",
+        lift.primes_consumed,
+        lift.primes_skipped,
+        lift.primes_folded,
+        lift.primes_discarded,
+        lift.confirming_primes,
+        lift.modulus_bits,
+    );
+}
+
 fn print_peak_rss() {
     match peak_rss_kb() {
         Some(kb) => println!("PEAK_RSS_KB {kb}"),
@@ -128,27 +218,75 @@ fn print_peak_rss() {
     }
 }
 
-fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() != 5 {
-        eprintln!(
-            "usage: sylv-runner <input.syl> <f4|classic|certified|f4-certified> <threads> <modulus>"
-        );
-        std::process::exit(2);
+/// Parse one `.sylq` coefficient field: a decimal integer, or
+/// "numerator/denominator". The generators under `inputs/` write integers
+/// only; this reads the wider grammar `docs/rational-design.md` section 8.3
+/// gives the harness's `.syl` coefficient field, which `.sylq` shares.
+fn parse_coeff_q(field: &str) -> sylvester::Coefficient {
+    match field.split_once('/') {
+        Some((numerator, denominator)) => sylvester::Coefficient::Fraction {
+            numerator: numerator.parse().expect("numerator"),
+            denominator: denominator.parse().expect("denominator"),
+        },
+        None => sylvester::Coefficient::Integer(field.parse().expect("coeff")),
     }
-    let text = std::fs::read_to_string(&args[1]).expect("read input");
-    let mode = args[2].as_str();
-    let threads: usize = args[3].parse().expect("threads");
-    let modulus: u64 = args[4].parse().expect("modulus");
+}
 
-    let mut lines = text.lines().filter(|l| !l.trim().is_empty());
-    let nvars: usize = lines
-        .next()
-        .expect("nvars line")
-        .trim()
-        .parse()
-        .expect("nvars");
-    let names: Vec<String> = (0..nvars).map(|index| format!("x{index}")).collect();
+fn run_rational(text: &str, threads: usize) {
+    let (nvars, lines) = read_nvars_and_lines(text);
+    let names = variable_names(nvars);
+    let ring = PolynomialRing::rationals(names).expect("rational ring");
+
+    let mut polys = Vec::new();
+    for line in lines {
+        let mut terms = Vec::new();
+        for term in line.trim().split(';') {
+            let mut it = term.split(',');
+            let coeff = parse_coeff_q(it.next().expect("coeff"));
+            let exps: Vec<u16> = it.map(|e| e.parse().expect("exp")).collect();
+            assert_eq!(exps.len(), nvars, "bad exponent vector length");
+            terms.push((coeff, exps));
+        }
+        polys.push(ring.polynomial(terms).expect("exponent vector width"));
+    }
+    let ideal = ring.ideal(polys).expect("one ring");
+
+    // The multimodular driver runs each prime on one thread; `threads`
+    // sets how many prime runs go at once, matching how `threads` sets
+    // the F4 kernel's row-reduction pool in the prime-field modes.
+    let options = RationalOptions::new().compute(
+        ComputeOptions::new()
+            .threads(threads)
+            .timeout(Duration::from_secs(120)),
+    );
+    let start = Instant::now();
+    let result = ideal.groebner_basis_with_report(options);
+    let elapsed = start.elapsed().as_secs_f64();
+
+    match result {
+        Ok((gb, report)) => {
+            println!("TIME_S {elapsed}");
+            println!("SIZE {}", gb.len());
+            let polys: Vec<Polynomial<Rationals>> = gb.into_polynomials();
+            print_basis_rational(&polys);
+            print_lift(&report.modular.expect("a rational run always lifts"));
+            print_peak_rss();
+        }
+        Err(ComputeError::Timeout) => {
+            println!("STATUS TIMEOUT");
+            println!("TIME_S {elapsed}");
+            print_peak_rss();
+        }
+        Err(e) => {
+            println!("STATUS ERROR {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn run_prime_field(text: &str, mode: &str, threads: usize, modulus: u64) {
+    let (nvars, lines) = read_nvars_and_lines(text);
+    let names = variable_names(nvars);
     let ring = PolynomialRing::prime_field(modulus, names).expect("prime modulus");
 
     let mut polys = Vec::new();
@@ -249,4 +387,24 @@ fn main() {
             std::process::exit(1);
         }
     }
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() != 5 {
+        eprintln!(
+            "usage: sylv-runner <input> <f4|classic|certified|f4-certified|rational> <threads> <modulus>"
+        );
+        std::process::exit(2);
+    }
+    let text = std::fs::read_to_string(&args[1]).expect("read input");
+    let mode = args[2].as_str();
+    let threads: usize = args[3].parse().expect("threads");
+
+    if mode == "rational" {
+        run_rational(&text, threads);
+        return;
+    }
+    let modulus: u64 = args[4].parse().expect("modulus");
+    run_prime_field(&text, mode, threads, modulus);
 }

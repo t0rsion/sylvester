@@ -1,0 +1,4 @@
+# maturin develop drops the built extension next to the package source.
+*.so
+__pycache__/
+.pytest_cache/

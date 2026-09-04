@@ -1,0 +1,5 @@
+# vars: x, y, z
+# coefficients: rationals
+x + y + z
+x*y + y*z + x*z
+x*y*z - 1

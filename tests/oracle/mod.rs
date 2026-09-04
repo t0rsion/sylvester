@@ -375,7 +375,7 @@ pub(crate) fn engine_output_to_polys(output: &GroebnerBasis, p: u64, nvars: usiz
                 let mut exps = exps.to_vec();
                 exps.resize(nvars, 0);
                 let entry = out.terms.entry(exps).or_insert(0);
-                *entry = (*entry + coeff % p) % p;
+                *entry = (*entry + coeff.value() % p) % p;
             }
             out.terms.retain(|_, c| *c != 0);
             out

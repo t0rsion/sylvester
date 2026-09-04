@@ -1,9 +1,11 @@
-//! The reduction kernel and new pivot discovery (design section 9).
+//! The reduction kernel and new pivot discovery (design section 3.7).
 //!
-//! A row scatters into a dense `u64` accumulator, one lane per column,
-//! then walks columns in increasing order. At a column with a pivot row,
-//! the walk adds `p - v` times that pivot's tail. Every lane the walk
-//! reads becomes physical zero, so the next row needs no clearing pass.
+//! One row reduces in three steps. It scatters into a dense `u64`
+//! accumulator, one lane per column. It walks the columns in increasing
+//! order and, at every column that has a pivot row, adds `p - v` times
+//! that pivot's tail. It gathers what is left. The walk covers every
+//! column of the row, and it sets every lane it reads to physical zero, so
+//! the accumulator is clean for the next row without a clearing pass.
 //!
 //! The kernel reads column indices and coefficients. It never touches a
 //! monomial table.
@@ -25,8 +27,8 @@ pub(crate) struct Reduction {
     pub(crate) zero_rows: u32,
     /// A new pivot is a nonzero constant, so the ideal is the whole ring.
     ///
-    /// The run stops at once and returns the unit basis (design section 4).
-    /// The rows after the constant are not reduced.
+    /// The run stops at once and returns the unit basis (design section
+    /// 3.2). The rows after the constant are not reduced.
     pub(crate) unit: bool,
 }
 
@@ -39,6 +41,35 @@ struct Scratch<'a> {
     shoup: &'a mut Vec<u64>,
 }
 
+pub(crate) struct ReductionContext<'a, F, B, T> {
+    basis: &'a B,
+    field: &'a F,
+    trace: &'a mut T,
+    clock: &'a mut Deadline,
+    memory: Option<usize>,
+    threads: Option<usize>,
+}
+
+impl<'a, F, B, T> ReductionContext<'a, F, B, T> {
+    pub(crate) fn new(
+        basis: &'a B,
+        field: &'a F,
+        trace: &'a mut T,
+        clock: &'a mut Deadline,
+        memory: Option<usize>,
+        threads: Option<usize>,
+    ) -> Self {
+        Self {
+            basis,
+            field,
+            trace,
+            clock,
+            memory,
+            threads,
+        }
+    }
+}
+
 enum LoadedRow {
     Zero,
     Start(usize),
@@ -48,27 +79,21 @@ enum LoadedRow {
 ///
 /// Rows reduce in batch order, and a row that survives becomes the pivot
 /// of its leading column at once, so every later row reduces against it
-/// (design section 9). After the row loop the new pivots are
+/// (design section 3.7). After the row loop the new pivots are
 /// interreduced backward, and [`Batch::new_pivots`] holds them sorted by
 /// leading column.
 ///
 /// `threads` is the count the caller asked for, or `None` for the rayon
 /// global pool. A count of 1 keeps every row on the calling thread.
 ///
-/// [`FieldOps::Coeff`] is `u32`. The kernel needs a coefficient multiply
-/// for the monic normalization, which it does as one
+/// Both field kernels carry `Coeff = u32`. The kernel needs a coefficient
+/// multiply for the monic normalization, which it does as one
 /// [`FieldOps::reduce_acc`] of the `u64` product, so it names the concrete
 /// coefficient type.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn reduce<F, B, T>(
     batch: &mut Batch,
-    basis: &B,
-    field: &F,
-    trace: &mut T,
     ws: &mut Workspace,
-    clock: &mut Deadline,
-    memory: Option<usize>,
-    threads: Option<usize>,
+    context: &mut ReductionContext<'_, F, B, T>,
 ) -> Result<Reduction, F4Error>
 where
     F: FieldOps<Coeff = u32> + Sync,
@@ -77,42 +102,27 @@ where
 {
     let ncols = batch.ncols();
     prepare(batch, ws, ncols)?;
-    batch.debug_check_coeffs(basis);
+    batch.debug_check_coeffs(context.basis);
     let npiv = batch.npiv() as usize;
     // The parallel phase writes here, and taking the vector out of the
     // workspace keeps its allocations and frees the borrow the scratch
     // holds.
     let mut partials = core::mem::take(&mut ws.partials);
-    let frozen = phase_one::<F, B, T>(
-        batch,
-        basis,
-        field,
-        ws,
-        &mut partials,
-        clock,
-        memory,
-        threads,
-    )?;
+    let frozen = phase_one::<F, B, T>(batch, ws, &mut partials, context)?;
     let mut sc = scratch(ws, ncols);
 
-    let mut out = reduce_lower_rows(
-        batch, basis, field, trace, &mut sc, &partials, frozen, clock,
-    )?;
-    finish_reduction(batch, basis, field, trace, &mut sc, npiv, &mut out, clock)?;
+    let mut out = reduce_lower_rows(batch, &mut sc, &partials, frozen, context)?;
+    finish_reduction(batch, &mut sc, npiv, &mut out, context)?;
     ws.partials = partials;
     Ok(out)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn reduce_lower_rows<F, B, T>(
     batch: &mut Batch,
-    basis: &B,
-    field: &F,
-    trace: &mut T,
     sc: &mut Scratch<'_>,
     partials: &[PartialRow],
     frozen: bool,
-    clock: &mut Deadline,
+    context: &mut ReductionContext<'_, F, B, T>,
 ) -> Result<Reduction, F4Error>
 where
     F: FieldOps<Coeff = u32>,
@@ -121,20 +131,19 @@ where
 {
     let mut out = Reduction::default();
     for r in 0..batch.lower().len() {
-        clock.tick()?;
+        context.clock.tick()?;
         let row = batch.lower()[r];
         if reduce_lower_row(
             batch,
-            basis,
-            field,
-            trace,
             sc,
-            partials.get(r),
-            frozen,
-            r,
-            row,
+            LowerRow {
+                partial: partials.get(r),
+                frozen,
+                index: r,
+                row,
+            },
             &mut out,
-            clock,
+            context,
         )? {
             break;
         }
@@ -142,40 +151,50 @@ where
     Ok(out)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn reduce_lower_row<F, B, T>(
-    batch: &mut Batch,
-    basis: &B,
-    field: &F,
-    trace: &mut T,
-    sc: &mut Scratch<'_>,
-    partial: Option<&PartialRow>,
+struct LowerRow<'a> {
+    partial: Option<&'a PartialRow>,
     frozen: bool,
     index: usize,
     row: super::matrix::RowRef,
+}
+
+fn reduce_lower_row<F, B, T>(
+    batch: &mut Batch,
+    sc: &mut Scratch<'_>,
+    row: LowerRow<'_>,
     out: &mut Reduction,
-    clock: &mut Deadline,
+    context: &mut ReductionContext<'_, F, B, T>,
 ) -> Result<bool, F4Error>
 where
     F: FieldOps<Coeff = u32>,
     B: BasisCoeffs,
     T: Trace,
 {
-    let place = RowId::Lower(index as u32);
-    let LoadedRow::Start(first) = load_row(batch, basis, sc, partial, frozen, row) else {
+    let place = RowId::Lower(row.index as u32);
+    let LoadedRow::Start(first) =
+        load_row(batch, context.basis, sc, row.partial, row.frozen, row.row)
+    else {
         out.zero_rows += 1;
-        trace.start(place);
-        trace.end(None);
+        context.trace.start(place);
+        context.trace.end(None);
         return Ok(false);
     };
-    trace.start(place);
-    eliminate(batch, basis, field, trace, sc, first, clock)?;
+    context.trace.start(place);
+    eliminate(
+        batch,
+        context.basis,
+        context.field,
+        context.trace,
+        sc,
+        first,
+        context.clock,
+    )?;
     if sc.cols.is_empty() {
         out.zero_rows += 1;
-        trace.end(None);
+        context.trace.end(None);
         return Ok(false);
     }
-    let pivot = install(batch, field, trace, sc, NO_ROW)?;
+    let pivot = install(batch, context.field, context.trace, sc, NO_ROW)?;
     out.new_pivots += 1;
     let row = batch.pivot(pivot);
     let unit = row.len() == 1 && batch.column(row.lead()) == MonomialId::ONE;
@@ -205,30 +224,34 @@ fn load_row<B: BasisCoeffs>(
     LoadedRow::Start(row.lead() as usize)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn finish_reduction<F, B, T>(
     batch: &mut Batch,
-    basis: &B,
-    field: &F,
-    trace: &mut T,
     sc: &mut Scratch<'_>,
     npiv: usize,
     out: &mut Reduction,
-    clock: &mut Deadline,
+    context: &mut ReductionContext<'_, F, B, T>,
 ) -> Result<(), F4Error>
 where
     F: FieldOps<Coeff = u32>,
     B: BasisCoeffs,
     T: Trace,
 {
-    sort_new_pivots(batch, trace, npiv);
+    sort_new_pivots(batch, context.trace, npiv);
     if out.unit {
         return Ok(());
     }
     for i in npiv as u32..batch.pivot_count() {
         sc.pivot_at[batch.pivot(i).lead() as usize] = i;
     }
-    backward(batch, basis, field, trace, sc, npiv as u32, clock)
+    backward(
+        batch,
+        context.basis,
+        context.field,
+        context.trace,
+        sc,
+        npiv as u32,
+        context.clock,
+    )
 }
 
 /// Sort the pivots from `npiv` on, and report the permutation.
@@ -261,7 +284,7 @@ const WALK_STRIDE: usize = 1024;
 /// The nonzero count one batch must reach before the parallel phase pays.
 ///
 /// The estimate is the nonzero count of the rows to reduce, which is the
-/// row count times the mean row length of design section 9. Below the
+/// row count times the mean row length of design section 5. Below the
 /// threshold a batch runs on the calling thread and makes no rayon call.
 /// The value comes from the measurement in the M2 report: noon-6 and
 /// cyclic-7, whose batches sit on both sides of it.
@@ -279,45 +302,48 @@ const PARALLEL_WORK_THRESHOLD: u64 = 2_500;
 /// installs later leads in a column no reducer row leads in, and it holds
 /// no entry in a reducer row's column, so applying it after this phase
 /// gives what the one-pass walk gives.
-#[allow(clippy::too_many_arguments)]
 fn phase_one<F, B, T>(
     batch: &Batch,
-    basis: &B,
-    field: &F,
     ws: &mut Workspace,
     partials: &mut Vec<PartialRow>,
-    clock: &mut Deadline,
-    memory: Option<usize>,
-    threads: Option<usize>,
+    context: &mut ReductionContext<'_, F, B, T>,
 ) -> Result<bool, F4Error>
 where
     F: FieldOps<Coeff = u32> + Sync,
     B: BasisCoeffs + Sync,
     T: Trace,
 {
-    if !parallel_enabled::<T>(batch, threads) {
+    if !parallel_enabled::<T>(batch, context.threads) {
         return Ok(false);
     }
-    clock.check()?;
+    context.clock.check()?;
     let ncols = batch.ncols();
     let worker_acc_bytes = rayon::current_num_threads()
         .saturating_mul(ncols)
         .saturating_mul(size_of::<u64>());
-    check_worker_memory(worker_acc_bytes, memory)?;
+    check_worker_memory(worker_acc_bytes, context.memory)?;
     let rows = batch.lower().len();
     prepare_partials(partials, rows)?;
-    let at = clock.at();
+    let forked = context.clock.fork();
     ws.worker_acc_bytes = worker_acc_bytes;
     let pivot_at: &[u32] = &ws.pivot_at[..ncols];
-    let stopped = run_parallel_rows(batch, basis, field, partials, ncols, pivot_at, at);
+    let stopped = run_parallel_rows(
+        batch,
+        context.basis,
+        context.field,
+        partials,
+        ncols,
+        pivot_at,
+        &forked,
+    );
     if stopped {
+        context.clock.check()?;
         return Err(F4Error::Timeout);
     }
-    clock.check()?;
+    context.clock.check()?;
     Ok(true)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_parallel_rows<F, B>(
     batch: &Batch,
     basis: &B,
@@ -325,7 +351,7 @@ fn run_parallel_rows<F, B>(
     partials: &mut [PartialRow],
     ncols: usize,
     pivot_at: &[u32],
-    deadline: Option<std::time::Instant>,
+    template: &Deadline,
 ) -> bool
 where
     F: FieldOps<Coeff = u32> + Sync,
@@ -340,7 +366,7 @@ where
         .par_iter()
         .zip(partials[..rows].par_iter_mut())
         .for_each_init(
-            || (vec![0u64; ncols], Deadline::new(deadline)),
+            || (vec![0u64; ncols], template.fork()),
             |(acc, clock), (row, out)| {
                 if stopped.load(Ordering::Relaxed) {
                     return;
@@ -356,13 +382,15 @@ where
                     batch,
                     basis,
                     field,
-                    &mut NoTrace,
-                    acc,
-                    pivot_at,
-                    &mut out.cols,
-                    &mut out.vals,
                     row.lead() as usize,
-                    clock,
+                    &mut WalkState {
+                        trace: &mut NoTrace,
+                        acc,
+                        pivot_at,
+                        cols_out: &mut out.cols,
+                        vals_out: &mut out.vals,
+                        clock,
+                    },
                 );
                 if walked.is_err() {
                     stopped.store(true, Ordering::Relaxed);
@@ -395,7 +423,7 @@ fn prepare_partials(partials: &mut Vec<PartialRow>, rows: usize) -> Result<(), F
     Ok(())
 }
 
-/// Reduce the tail of every pivot row of `batch` (design section 9).
+/// Reduce the tail of every pivot row of `batch` (design section 3.8).
 ///
 /// The caller builds a batch whose pivot rows are the whole basis: one
 /// raw row per live element with multiplier 1, then symbolic
@@ -488,63 +516,70 @@ where
         batch,
         basis,
         field,
-        trace,
-        sc.acc,
-        sc.pivot_at,
-        sc.cols,
-        sc.vals,
         first,
-        clock,
+        &mut WalkState {
+            trace,
+            acc: sc.acc,
+            pivot_at: sc.pivot_at,
+            cols_out: sc.cols,
+            vals_out: sc.vals,
+            clock,
+        },
     )
 }
 
 /// The elimination walk over one accumulator.
 ///
 /// `acc` holds the row, `pivot_at` maps a column to its pivot row, and
-/// the result lands in `cols` and `vals`, ascending by column.
+/// the result lands in `cols` and `vals`, ascending by column. Every lane
+/// the walk reads becomes physical zero, so the accumulator is clean for
+/// the next row without a clearing pass.
 ///
 /// One row is unbounded work, so the walk reads the clock once per
 /// [`WALK_STRIDE`] columns. A run past its deadline stops inside the row,
 /// not after it.
-#[allow(clippy::too_many_arguments)]
+struct WalkState<'a, T> {
+    trace: &'a mut T,
+    acc: &'a mut [u64],
+    pivot_at: &'a [u32],
+    cols_out: &'a mut Vec<u32>,
+    vals_out: &'a mut Vec<u32>,
+    clock: &'a mut Deadline,
+}
+
 fn walk<F, B, T>(
     batch: &Batch,
     basis: &B,
     field: &F,
-    trace: &mut T,
-    acc: &mut [u64],
-    pivot_at: &[u32],
-    cols_out: &mut Vec<u32>,
-    vals_out: &mut Vec<u32>,
     first: usize,
-    clock: &mut Deadline,
+    state: &mut WalkState<'_, T>,
 ) -> Result<(), F4Error>
 where
     F: FieldOps<Coeff = u32>,
     B: BasisCoeffs,
     T: Trace,
 {
-    cols_out.clear();
-    vals_out.clear();
-    let ncols = acc.len();
+    state.cols_out.clear();
+    state.vals_out.clear();
+    let ncols = state.acc.len();
     let between_sweeps = field.applications_between_sweeps();
     let mut applied = 0u64;
     for col in first..ncols {
-        if col % WALK_STRIDE == 0 {
-            clock.check()?;
+        if col.is_multiple_of(WALK_STRIDE) {
+            state.clock.check()?;
         }
-        let val = field.reduce_acc(acc[col]);
-        // A lane whose value is a nonzero multiple of p must still become
-        // physical zero. The walk covers every column, so no clearing pass
-        // follows.
-        acc[col] = 0;
+        let val = field.reduce_acc(state.acc[col]);
+        // Every lane the walk reads becomes physical zero, including a
+        // lane whose value is a nonzero multiple of p. The walk covers
+        // every column of the row, so no clearing pass is needed.
+        state.acc[col] = 0;
         if val == 0 {
             continue;
         }
-        let index = pivot_at[col];
+        let index = state.pivot_at[col];
         if index == NO_ROW {
-            cols_out.push(col as u32);
-            vals_out.push(val);
+            state.cols_out.push(col as u32);
+            state.vals_out.push(val);
             continue;
         }
         let pivot = batch.pivot(index);
@@ -552,7 +587,7 @@ where
         // The lane count is enforced, not assumed: a lane takes at most
         // `between_sweeps` additions before it can pass u64.
         if applied == between_sweeps {
-            field.sweep(&mut acc[col + 1..]);
+            field.sweep(&mut state.acc[col + 1..]);
             applied = 0;
         }
         // The pivot's leading coefficient is 1 and lane `col` is already
@@ -561,9 +596,9 @@ where
         let factor = field.sub(0, val);
         let cols = tail(batch.row_columns(&pivot));
         let (vals, shoup) = batch.row_coeffs(&pivot, basis);
-        field.axpy(acc, cols, tail(vals), tail(shoup), factor);
+        field.axpy(state.acc, cols, tail(vals), tail(shoup), factor);
         applied += 1;
-        trace.step(index, factor);
+        state.trace.step(index, factor);
     }
     Ok(())
 }
@@ -789,17 +824,11 @@ mod tests {
         let (mut sym, sources) = held.split();
         let mut batch = Batch::default();
         build(&mut sym, sources, &mut batch, ws, &mut Deadline::none()).unwrap();
-        let out = reduce(
-            &mut batch,
-            sources,
-            field,
-            &mut NoTrace,
-            ws,
-            &mut Deadline::none(),
-            None,
-            Some(1),
-        )
-        .unwrap();
+        let mut clock = Deadline::none();
+        let mut trace = NoTrace;
+        let mut context =
+            ReductionContext::new(sources, field, &mut trace, &mut clock, None, Some(1));
+        let out = reduce(&mut batch, ws, &mut context).unwrap();
         let pivots = batch
             .new_pivots()
             .iter()
@@ -1131,17 +1160,10 @@ mod tests {
         )
         .unwrap();
         let mut counts = Counts::default();
-        let out = reduce(
-            &mut batch,
-            sources,
-            &field,
-            &mut counts,
-            &mut ws,
-            &mut Deadline::none(),
-            None,
-            Some(1),
-        )
-        .unwrap();
+        let mut clock = Deadline::none();
+        let mut context =
+            ReductionContext::new(sources, &field, &mut counts, &mut clock, None, Some(1));
+        let out = reduce(&mut batch, &mut ws, &mut context).unwrap();
         assert!(
             counts.starts >= case.lower.len() as u32,
             "every row to reduce starts"
@@ -1152,49 +1174,6 @@ mod tests {
             "every new pivot is reported"
         );
         assert!(counts.scales <= case.lower.len() as u32);
-    }
-
-    #[test]
-    fn worker_accumulators_are_charged_before_allocation() {
-        if rayon::current_num_threads() < 2 {
-            return;
-        }
-
-        let field = Small31::new(SMALL_P);
-        let case = random_case(&mut Rng(0x9e02), SMALL_P, 120, 60, 240);
-        let mut held = fixture(&case, &field);
-        let (mut sym, sources) = held.split();
-        let mut batch = Batch::default();
-        let mut ws = Workspace::default();
-        build(
-            &mut sym,
-            sources,
-            &mut batch,
-            &mut ws,
-            &mut Deadline::none(),
-        )
-        .unwrap();
-        let ncols = batch.ncols();
-        let threads = rayon::current_num_threads();
-        let limit = threads
-            .saturating_mul(ncols)
-            .saturating_mul(size_of::<u64>())
-            / 2;
-        let work: u64 = batch.lower().iter().map(|r| u64::from(r.len())).sum();
-        assert!(work >= 2500, "case too small: {work}");
-
-        let result = reduce(
-            &mut batch,
-            sources,
-            &field,
-            &mut NoTrace,
-            &mut ws,
-            &mut Deadline::none(),
-            Some(limit),
-            None,
-        );
-
-        assert_eq!(result, Err(F4Error::MemoryLimitExceeded));
     }
 
     #[test]

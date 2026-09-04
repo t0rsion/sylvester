@@ -334,7 +334,7 @@ fn engine_output_to_polys(output: &GroebnerBasis, nvars: usize, p: u64) -> Vec<P
                     assert!(exps.len() <= nvars, "engine output has too many variables");
                     let mut exps = exps.to_vec();
                     exps.resize(nvars, 0);
-                    (coeff % p, exps)
+                    (coeff.value() % p, exps)
                 })
                 .collect();
             let borrowed: Vec<(u64, &[u16])> =

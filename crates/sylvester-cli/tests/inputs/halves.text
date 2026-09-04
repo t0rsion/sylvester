@@ -1,0 +1,4 @@
+# vars: x, y
+# coefficients: rationals
+1/2*x^2 - y
+x*y - 1/3

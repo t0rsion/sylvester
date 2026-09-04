@@ -74,7 +74,7 @@ included.
 
 ## The gate
 
-Section 1.1 of `docs/v0.2-design.md` sets the release gate on four
+Section 1.1 of `docs/f4-design.md` sets the release gate on four
 cells, cyclic-7, katsura-9, eco-9, and noon-6, each run under 16 GB of
 memory and a 120 s deadline, on the same thread count as the reference
 engine (one thread, msolve's `-t 1`). It passes when the geometric mean

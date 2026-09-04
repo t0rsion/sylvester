@@ -10,7 +10,7 @@ Both prime-field engines are empirically checked. Neither engine is proven
 correct. An accepted certificate establishes the result through an independent
 verifier. Neither verifier is machine-checked.
 
-The F4 engine replaces the matrix engine in 0.2.0. The classic F5 engine remains
+The F4 engine replaced the matrix engine. The classic F5 engine remains
 an independent oracle. The matrix defects below remain part of the record.
 
 ## Counterexamples
@@ -115,6 +115,59 @@ The matrix engine used Buchberger's product criterion inside a signature
 algorithm. No proof connected that deletion to the engine's signature coverage
 argument. The repair removed the criterion. The classic engine never used it.
 
+## Current limits
+
+### The rational path is a heuristic
+
+`Ideal::<Rationals>::groebner_basis` clears denominators, runs the chosen
+backend modulo a descending sequence of 31-bit primes, combines the runs
+by the Chinese remainder theorem, and lifts the result by rational
+reconstruction (`src/compute/modular`). No isolated verifier checks the
+vote over leading monomial sets, the combination, or the lift, and there
+is no certified path over `Q`: `groebner_basis_certified` exists on
+`Ideal<PrimeField>` alone. `GroebnerBasis::<Rationals>::lift` reports what
+the stopping rule established, through `Established`. The default rule,
+`RationalStop::Unchanged`, establishes nothing about the ideal: it stops
+once the lifted basis agrees with itself over a fixed number of further
+confirming primes, and agreement with itself is not agreement with the
+input. `RationalStop::ContainsInput` adds two exact tests over `Q` (every
+generator reduces to zero modulo the basis, and every S-polynomial of the
+basis does too) and establishes that the returned basis is the reduced
+Gröbner basis of an ideal that *contains* the input ideal. It does not
+establish equality: the basis `{1}` passes both tests, the same failure
+mode `tests/known_defects.rs` exists to block on the certified path. The
+memory ledger of a rational run also carries an estimate, not a measured
+figure: `DomainOps::heap_bytes` over `Rationals` reports the used bits of
+a `BigRational`'s numerator and denominator rounded up to limbs, because
+`num-bigint` does not expose its allocated capacity (`src/ring/rational.rs`).
+
+### Hilbert series has no work bound
+
+`GroebnerBasis::hilbert_series` computes the numerator of \(N(t)/(1-t)^n\)
+by a recursion on the minimal generators of a leading monomial ideal
+(`src/hilbert.rs`). This release offers no proof that bounds how far it
+branches. The call takes a `Budget` and reports
+`HilbertError::Timeout` or `HilbertError::MemoryLimitExceeded`. The
+recursion runs on a heap-allocated worklist that the budget charges, so a
+deep chain of colon ideals costs memory the budget sees, not calling
+stack the process cannot report: the basis `[x^65535*y, z]` reaches
+65,535 nodes.
+
+### Performance
+
+In the initial record, sylvester was far slower than msolve and Groebner.jl.
+It did not finish instances they finished quickly.
+`benchmarks/gb-comparison/records/2026-07-25-archive/REPORT.md` holds the
+July record, and
+`benchmarks/gb-comparison/records/2026-08-18-optimizations.md` holds
+the per-commit optimization log behind those numbers. The gap was
+structural: msolve and Groebner.jl ran F4 with dense block linear algebra,
+while the Macaulay-matrix backend here did sparse elimination without that
+block structure, under a signature discipline that additionally forbade
+some reductions. The F4 replacement removed that backend and replaced it
+engine described above. `benchmarks/gb-comparison/REPORT.md` holds the
+current record. Read the numbers there.
+
 ## F4 termination
 
 The F4 engine accepts a nonunit candidate only if its leading monomial is
@@ -138,8 +191,8 @@ This argument proves termination. It does not prove partial correctness.
 
 The old CSR matrix path allocated until the operating system killed the
 process on `cyclic-7`. The plain sparse path did not show the same growth. The
-repair removed the CSR path. Version 0.2.0 removes the whole matrix engine.
-The crate has no feature flags.
+repair removed the CSR path. The F4 replacement removes the whole matrix
+engine. The crate has no feature flags.
 
 The July comparison record preserves the measurements:
 `benchmarks/gb-comparison/records/2026-07-25-archive/REPORT.md`.
@@ -155,12 +208,36 @@ control flow before a debugger identified one routine.
 
 ## Other fixed defects
 
-- `Felt` is private and reduced at every construction site.
-- Final interreduction runs under the computation deadline and memory budget.
-- A classic pair whose least common multiple exceeds the exponent width returns
-  `ComputeError::DegreeLimit`.
-- An F4 monomial whose exponent exceeds the width returns
-  `ComputeError::ExponentLimit`.
+- `SparseMatrix::image_basis` returned a basis of the row space, not the
+  column space, and `SparseMatrix::row_echelon_form` inverted the pivot
+  coefficient 1 once per eliminated row and cloned the pivot row once per
+  eliminated row. `src/linalg.rs` is deleted; the matrix backend carried
+  its own elimination until the F4 replacement removed the backend itself.
+- `Felt` was a bare public `u64` whose `add`, `sub`, and `neg` assumed
+  reduced operands with nothing to enforce it. The type lives in
+  `src/ring/field.rs`, `Felt::new` reduces its argument, and
+  `Felt::from_residue` states that its argument is already reduced. Every
+  arithmetic method is crate-private. The current API exports the type as the
+  coefficient a term of a prime-field polynomial carries, with
+  `Felt::value` its only public method.
+- The final interreduction ran outside every limit check. Both backends of
+  that time called `reduced_groebner_basis_checked` or
+  `reduced_groebner_basis_tracked` in `src/compute/interreduce.rs`, which
+  tested the deadline and the memory budget as they worked. The F4 replacement
+  removed the matrix backend; the classic backend still calls those functions,
+  and the F4 engine runs its own final interreduction under the same limits, in
+  `src/compute/f4/kernel.rs`.
+- With the `csr` feature enabled, the `parallel` option was silently
+  ignored. The `csr` feature is gone.
+- A critical pair whose leading monomials had a least common multiple past
+  exponent 65535 panicked inside `Monomial::mul`. Both backends of that
+  time checked the pair's degree in `push_pair` before they built it and
+  returned `ComputeError::DegreeLimit` instead (`src/compute/classic.rs`,
+  `src/compute/matrix.rs`). This is a limit report on the input's degree,
+  not exhaustion of a budget. The F4 replacement removed `src/compute/matrix.rs`; the
+  classic backend still checks the pair's degree the same way, and the F4
+  backend checks each exponent separately, since it holds exponents apart
+  instead of one combined degree, and returns `ComputeError::ExponentLimit`.
 - An exhausted F4 monomial table returns `ComputeError::TableFull`.
 - The crate contains no unsafe code.
 
