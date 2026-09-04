@@ -5,20 +5,19 @@ use std::cmp::Ordering;
 use std::fmt;
 use std::mem::size_of;
 
-use crate::ring::PolynomialRing;
-use crate::ring::field::Felt;
+use crate::ring::{Domain, DomainOps, PolynomialRing, PrimeField};
 
 /// The exponent vector of a monomial.
 ///
-/// Past [`INLINE_VARIABLES`] variables, the vector spills to the heap.
+/// A ring with more than [`INLINE_VARIABLES`] variables still works: the
+/// vector spills to the heap.
 pub(crate) type Exps = SmallVec<[u16; INLINE_VARIABLES]>;
 
 /// The number of exponents a monomial holds inline.
 ///
 /// Eleven exponents are the most that fit the space `SmallVec` reserves
-/// for the inline array, so `Monomial` stays 40 bytes and `Term` 48. A
-/// wider inline array grows both and measures slower on every benchmark
-/// input.
+/// anyway, so `Monomial` stays 40 bytes and `Term` 48. A wider inline
+/// array grows both and measures slower on every benchmark input.
 const INLINE_VARIABLES: usize = 11;
 
 /// The heap bytes one monomial's exponent vector costs beyond what
@@ -37,74 +36,21 @@ pub(crate) fn heap_exps_bytes(nvars: usize) -> usize {
     }
 }
 
-/// A monomial product past the width one exponent holds.
-///
-/// [`Monomial::checked_mul`] reports this. The engines turn it into
-/// [`crate::compute::ComputeError::DegreeLimit`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ExponentOverflow;
-
 /// A monomial as an exponent vector with its total degree.
 ///
 /// Every monomial of one ring holds one exponent per variable. The
 /// arithmetic checks that width in debug builds, because a mismatch is a
-/// defect.
-#[derive(Debug, PartialEq, Eq, Hash)]
+/// defect and not a value.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct Monomial {
     pub(crate) exps: Exps,
     pub(crate) deg: u32,
 }
 
-/// Copy an exponent vector.
-///
-/// Every monomial the engines build starts from a copy of one they hold,
-/// so this is the innermost step of both backends. `SmallVec`'s `Clone`
-/// runs a capacity check per element, and `from_slice` calls `memcpy`.
-/// A ring inside the inline width copies a fixed-width buffer instead,
-/// which the compiler unrolls.
-#[inline]
-fn copy_exps(exps: &[u16]) -> Exps {
-    if exps.len() > INLINE_VARIABLES {
-        return Exps::from_slice(exps);
-    }
-    let mut buf = [0u16; INLINE_VARIABLES];
-    for (slot, &exp) in buf.iter_mut().zip(exps) {
-        *slot = exp;
-    }
-    Exps::from_buf_and_len(buf, exps.len())
-}
-
-/// Build an exponent vector from two of the same width, entry by entry.
-///
-/// This is [`copy_exps`] with one operation folded into the copy, so a
-/// monomial product or quotient passes over the exponents once.
-#[inline]
-fn combine_exps(a: &[u16], b: &[u16], op: impl Fn(u16, u16) -> u16) -> Exps {
-    debug_assert_eq!(a.len(), b.len(), "monomials must share nvars");
-    if a.len() > INLINE_VARIABLES {
-        return a.iter().zip(b).map(|(&x, &y)| op(x, y)).collect();
-    }
-    let mut buf = [0u16; INLINE_VARIABLES];
-    for (slot, (&x, &y)) in buf.iter_mut().zip(a.iter().zip(b)) {
-        *slot = op(x, y);
-    }
-    Exps::from_buf_and_len(buf, a.len())
-}
-
-impl Clone for Monomial {
-    #[inline]
-    fn clone(&self) -> Self {
-        Monomial {
-            exps: copy_exps(&self.exps),
-            deg: self.deg,
-        }
-    }
-}
-
 impl Monomial {
     pub(crate) fn one(nvars: usize) -> Self {
         Monomial {
-            exps: Exps::from_elem(0u16, nvars),
+            exps: std::iter::repeat_n(0u16, nvars).collect(),
             deg: 0,
         }
     }
@@ -113,7 +59,8 @@ impl Monomial {
         let deg = exps
             .iter()
             .try_fold(0u32, |acc, &e| acc.checked_add(e as u32))
-            // A ring holds at most 256 variables, each below 2^16.
+            // a ring holds at most 65535 variables and every
+            // exponent fits a u16, so the sum fits a u32.
             .expect("monomial degree overflow");
         Monomial { exps, deg }
     }
@@ -128,30 +75,41 @@ impl Monomial {
         self.deg <= other.deg && self.exps.iter().zip(&other.exps).all(|(a, b)| a <= b)
     }
 
-    /// Return `self * other`, or [`ExponentOverflow`] when an exponent of
-    /// the product leaves the width a `u16` holds.
+    pub(crate) fn mul(&self, other: &Self) -> Self {
+        debug_assert_eq!(self.nvars(), other.nvars(), "monomials must share nvars");
+        let exps = self
+            .exps
+            .iter()
+            .zip(&other.exps)
+            // The engines check every critical pair's lcm against
+            // compute::DEGREE_LIMIT before they build a product from it, so
+            // this addition never overflows a u16 on a path that check
+            // guards. The expect documents that invariant; it is not a
+            // check a caller can trigger.
+            .map(|(&a, &b)| a.checked_add(b).expect("monomial exponent overflow"))
+            .collect();
+        Monomial {
+            exps,
+            deg: self.deg + other.deg,
+        }
+    }
+
+    /// Return `self * other`, or report an exponent past the width of a
+    /// `u16`.
     ///
-    /// The degree of the product is the sum of the two degrees, which fits
-    /// a `u32` for the same reason [`Monomial::from_exps`] gives.
+    /// Division by a basis bounds no degree in advance: reducing
+    /// `x^65535*y` by `x^65535 + y^65535` needs `y^65536`. Every step that
+    /// runs without such a bound multiplies here.
     pub(crate) fn checked_mul(&self, other: &Self) -> Result<Self, ExponentOverflow> {
         debug_assert_eq!(self.nvars(), other.nvars(), "monomials must share nvars");
-        let deg = self.deg + other.deg;
-        // Every exponent of the product is at most the product's degree, so
-        // a degree inside a u16 rules out an exponent overflow and the
-        // addition needs no per-entry check. Past that width one entry may
-        // overflow, so that path checks each entry and reports it.
-        if deg <= u16::MAX as u32 {
-            Ok(Monomial {
-                exps: combine_exps(&self.exps, &other.exps, u16::wrapping_add),
-                deg,
-            })
-        } else {
-            let mut exps = copy_exps(&self.exps);
-            for (slot, &b) in exps.iter_mut().zip(&other.exps) {
-                *slot = slot.checked_add(b).ok_or(ExponentOverflow)?;
-            }
-            Ok(Monomial { exps, deg })
+        let mut exps = Exps::with_capacity(self.nvars());
+        for (&a, &b) in self.exps.iter().zip(&other.exps) {
+            exps.push(a.checked_add(b).ok_or(ExponentOverflow)?);
         }
+        Ok(Monomial {
+            exps,
+            deg: self.deg + other.deg,
+        })
     }
 
     pub(crate) fn quotient(&self, divisor: &Self) -> Option<Self> {
@@ -159,15 +117,27 @@ impl Monomial {
         if !divisor.divides(self) {
             return None;
         }
+        let exps = self
+            .exps
+            .iter()
+            .zip(&divisor.exps)
+            .map(|(&a, &b)| a - b)
+            .collect();
         Some(Monomial {
-            exps: combine_exps(&self.exps, &divisor.exps, |a, b| a - b),
+            exps,
             deg: self.deg - divisor.deg,
         })
     }
 
     pub(crate) fn lcm(&self, other: &Self) -> Self {
         debug_assert_eq!(self.nvars(), other.nvars(), "monomials must share nvars");
-        Monomial::from_exps(combine_exps(&self.exps, &other.exps, u16::max))
+        let exps: Exps = self
+            .exps
+            .iter()
+            .zip(&other.exps)
+            .map(|(&a, &b)| a.max(b))
+            .collect();
+        Monomial::from_exps(exps)
     }
 
     /// Compare `self * (num / den)` with `other` without building the product.
@@ -194,18 +164,19 @@ impl Monomial {
         }
     }
 
-    /// The first sixteen exponents in four bits each, capped at seven.
+    /// One bit per variable the monomial uses, for the first 64 variables.
     ///
-    /// A divisor's exponents all sit at or below its multiple's, and the
-    /// cap keeps that true, so [`key_divides`] rejects a candidate without
-    /// reading either exponent vector. Variables past the sixteenth hold
-    /// no field, which only makes the test accept more.
-    pub(crate) fn divisor_key(&self) -> u64 {
-        let mut key = 0u64;
-        for (index, &exp) in self.exps.iter().take(16).enumerate() {
-            key |= (exp.min(7) as u64) << (index * 4);
+    /// A divisor uses a subset of the variables of its multiple, so a bit
+    /// set here and clear in the multiple rejects the divisor. Variables
+    /// past the 64th set no bit, which only makes the test accept more.
+    pub(crate) fn var_mask(&self) -> u64 {
+        let mut mask = 0u64;
+        for (index, &exp) in self.exps.iter().take(64).enumerate() {
+            if exp != 0 {
+                mask |= 1 << index;
+            }
         }
-        key
+        mask
     }
 
     /// Report whether no variable appears in both monomials.
@@ -217,57 +188,27 @@ impl Monomial {
     }
 }
 
-/// Report whether every field of `divisor` is at or below `multiple`.
+/// The report that a monomial product passes the width of one exponent.
 ///
-/// Both keys come from [`Monomial::divisor_key`], so every field is at
-/// most seven and the borrow of one field never reaches the next.
-#[inline]
-pub(crate) fn key_divides(divisor: u64, multiple: u64) -> bool {
-    const HIGH: u64 = 0x8888_8888_8888_8888;
-    ((multiple | HIGH) - divisor) & HIGH == HIGH
-}
-
-/// Four exponents as one integer, the later variable in the higher bits.
-///
-/// Comparing two of these as integers gives the reverse-lexicographic
-/// order of the four exponents they hold.
-#[inline]
-fn pack_four(exps: &[u16]) -> u64 {
-    let [a, b, c, d]: [u16; 4] = exps.try_into().expect("a chunk holds four exponents");
-    a as u64 | (b as u64) << 16 | (c as u64) << 32 | (d as u64) << 48
-}
-
-/// Compare two exponent vectors of one width by the last entry that
-/// differs, with the smaller entry the greater monomial.
-///
-/// This is the tie-break of grevlex, and the merge inside every reduction
-/// step runs it once per term, so it takes four exponents per comparison
-/// where the width allows.
-#[inline]
-fn reverse_lex(a: &[u16], b: &[u16]) -> Ordering {
-    let mut a_chunks = a.rchunks_exact(4);
-    let mut b_chunks = b.rchunks_exact(4);
-    for (a_chunk, b_chunk) in a_chunks.by_ref().zip(b_chunks.by_ref()) {
-        let (a_word, b_word) = (pack_four(a_chunk), pack_four(b_chunk));
-        if a_word != b_word {
-            return a_word.cmp(&b_word).reverse();
-        }
-    }
-    for (&a, &b) in a_chunks.remainder().iter().zip(b_chunks.remainder()).rev() {
-        match a.cmp(&b) {
-            Ordering::Equal => continue,
-            ord => return ord.reverse(),
-        }
-    }
-    Ordering::Equal
-}
+/// The width is 65,535, the largest value a `u16` holds. Each caller maps
+/// this to its own limit error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ExponentOverflow;
 
 /// Grevlex, with the larger monomial the greater value.
 impl Ord for Monomial {
     fn cmp(&self, other: &Self) -> Ordering {
         debug_assert_eq!(self.nvars(), other.nvars(), "monomials must share nvars");
         match self.deg.cmp(&other.deg) {
-            Ordering::Equal => reverse_lex(&self.exps, &other.exps),
+            Ordering::Equal => {
+                for (&a, &b) in self.exps.iter().zip(&other.exps).rev() {
+                    match a.cmp(&b) {
+                        Ordering::Equal => continue,
+                        ord => return ord.reverse(),
+                    }
+                }
+                Ordering::Equal
+            }
             ord => ord,
         }
     }
@@ -280,9 +221,12 @@ impl PartialOrd for Monomial {
 }
 
 /// One coefficient and one monomial.
+///
+/// The domain parameter defaults to [`PrimeField`], as it does on
+/// [`Polynomial`].
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Term {
-    pub(crate) coeff: Felt,
+pub(crate) struct Term<D: Domain = PrimeField> {
+    pub(crate) coeff: D::Coeff,
     pub(crate) mono: Monomial,
 }
 
@@ -290,22 +234,26 @@ pub(crate) struct Term {
 ///
 /// Build one with [`PolynomialRing::polynomial`] or
 /// [`PolynomialRing::parse_polynomial`]. A polynomial carries its ring, so
-/// the zero polynomial names its variables and its prime. The coefficients
-/// are reduced, the monomials are distinct, and no coefficient is zero.
+/// even the zero polynomial names its variables and its domain. The
+/// coefficients are reduced, the monomials are distinct, and no coefficient
+/// is zero.
+///
+/// The domain parameter defaults to [`PrimeField`], so `Polynomial` alone
+/// names a polynomial over `F_p`.
 ///
 /// `Display` writes the syntax [`PolynomialRing::parse_polynomial`] reads,
 /// with the terms in descending grevlex order.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Polynomial {
-    ring: PolynomialRing,
+pub struct Polynomial<D: Domain = PrimeField> {
+    ring: PolynomialRing<D>,
     /// Terms in ascending grevlex order, so the last term is the leading
     /// term.
-    pub(crate) terms: Vec<Term>,
+    pub(crate) terms: Vec<Term<D>>,
 }
 
-impl Polynomial {
+impl<D: Domain> Polynomial<D> {
     /// The ring this polynomial belongs to.
-    pub fn ring(&self) -> &PolynomialRing {
+    pub fn ring(&self) -> &PolynomialRing<D> {
         &self.ring
     }
 
@@ -316,19 +264,23 @@ impl Polynomial {
 
     /// The terms, largest monomial first.
     ///
-    /// Each item is the coefficient, a representative in `[1, p)`, and one
-    /// exponent per variable.
-    pub fn terms(&self) -> impl ExactSizeIterator<Item = (u64, &[u16])> {
+    /// Each item is the coefficient of the domain and one exponent per
+    /// variable. Over [`PrimeField`] the coefficient is a [`Felt`], whose
+    /// [`value`] is the representative in `[1, p)`.
+    ///
+    /// [`Felt`]: crate::Felt
+    /// [`value`]: crate::Felt::value
+    pub fn terms(&self) -> impl ExactSizeIterator<Item = (&D::Coeff, &[u16])> {
         self.terms
             .iter()
             .rev()
-            .map(|term| (term.coeff.value(), term.mono.exps.as_slice()))
+            .map(|term| (&term.coeff, term.mono.exps.as_slice()))
     }
 
     /// The largest term, or `None` for the zero polynomial.
-    pub fn leading_term(&self) -> Option<(u64, &[u16])> {
+    pub fn leading_term(&self) -> Option<(&D::Coeff, &[u16])> {
         self.lt()
-            .map(|term| (term.coeff.value(), term.mono.exps.as_slice()))
+            .map(|term| (&term.coeff, term.mono.exps.as_slice()))
     }
 
     /// The total degree, or `None` for the zero polynomial.
@@ -338,40 +290,64 @@ impl Polynomial {
         self.lt().map(|term| term.mono.deg)
     }
 
+    /// The heap bytes this polynomial holds beyond its own value.
+    ///
+    /// One term costs its own size, the exponents that spill to the heap
+    /// past [`INLINE_VARIABLES`] variables, and the heap bytes of its
+    /// coefficient. A [`Felt`] holds none, so the count over a prime field
+    /// is the term bytes alone. The classic backend and the interreduction
+    /// size a polynomial with this. The certificate writer estimates the
+    /// terms from its own per-term figure and adds
+    /// [`Polynomial::coefficient_bytes`].
+    ///
+    /// [`Felt`]: crate::Felt
+    pub(crate) fn heap_bytes(&self) -> usize {
+        let per_term = size_of::<Term<D>>() + heap_exps_bytes(self.ring.nvars());
+        let terms = self.terms.len().saturating_mul(per_term);
+        terms.saturating_add(self.coefficient_bytes())
+    }
+
+    /// The heap bytes the coefficients of this polynomial hold.
+    ///
+    /// It is 0 over a prime field, where a coefficient is one `u64`.
+    pub(crate) fn coefficient_bytes(&self) -> usize {
+        let ops = self.ring.ops();
+        self.terms.iter().fold(0usize, |bytes, term| {
+            bytes.saturating_add(ops.heap_bytes(&term.coeff))
+        })
+    }
+
     /// Build a polynomial from terms that already hold the invariants.
     ///
     /// The terms run strictly ascending under grevlex, no coefficient is
     /// zero, and every monomial holds one exponent per variable.
-    pub(crate) fn from_sorted_terms(ring: PolynomialRing, terms: Vec<Term>) -> Self {
+    pub(crate) fn from_sorted_terms(ring: PolynomialRing<D>, terms: Vec<Term<D>>) -> Self {
         debug_assert!(
-            terms.iter().all(|term| {
-                !term.coeff.is_zero()
-                    && term.coeff.value() < ring.modulus()
-                    && term.mono.nvars() == ring.nvars()
-            }) && terms.windows(2).all(|pair| pair[0].mono < pair[1].mono),
-            "a polynomial must hold reduced coefficients and ascending distinct monomials"
+            terms.iter().all(|term| term.mono.nvars() == ring.nvars())
+                && terms.windows(2).all(|pair| pair[0].mono < pair[1].mono),
+            "a polynomial must hold ascending distinct monomials of the ring's width"
         );
         Polynomial { ring, terms }
     }
 
-    /// Build a polynomial from unsorted terms, merging like monomials.
+    /// Sort and merge terms whose coefficients are already nonzero.
     ///
-    /// A term that reduces to zero drops out.
-    pub(crate) fn from_terms(ring: PolynomialRing, mut terms: Vec<Term>) -> Self {
-        let p = ring.modulus();
-        terms.retain(|t| !t.coeff.is_zero());
+    /// A merge that cancels drops the monomial, so the result holds no
+    /// zero coefficient either.
+    pub(crate) fn from_terms(ring: PolynomialRing<D>, mut terms: Vec<Term<D>>) -> Self {
+        let ops = ring.ops();
         terms.sort_by(|a, b| a.mono.cmp(&b.mono));
 
-        let mut out: Vec<Term> = Vec::with_capacity(terms.len());
+        let mut out: Vec<Term<D>> = Vec::with_capacity(terms.len());
         for term in terms {
             if let Some(last) = out.last_mut()
                 && last.mono == term.mono
             {
-                let c = last.coeff.add(term.coeff, p);
-                if c.is_zero() {
-                    out.pop();
-                } else {
-                    last.coeff = c;
+                match ops.add(&last.coeff, &term.coeff) {
+                    Some(coeff) => last.coeff = coeff,
+                    None => {
+                        out.pop();
+                    }
                 }
                 continue;
             }
@@ -388,77 +364,104 @@ impl Polynomial {
         }
     }
 
-    /// Stop a step that mixes two rings, or that names the wrong prime.
+    /// Stop a step that mixes two rings, or that names the wrong domain
+    /// arithmetic.
     ///
-    /// The arithmetic takes the modulus as an argument, so this is what
-    /// ties the argument back to the ring the result claims.
-    fn check_operand(&self, other: &Self, p: u64) {
-        debug_assert_eq!(p, self.ring.modulus(), "the modulus must be the ring's");
+    /// The arithmetic travels as an argument, so this is what ties the
+    /// argument back to the ring the result claims.
+    fn check_operand(&self, other: &Self, ops: &D::Ops) {
+        debug_assert!(ops == self.ring.ops(), "the arithmetic must be the ring's");
         debug_assert!(self.ring == other.ring, "both operands must share a ring");
     }
 
-    fn with_terms(&self, terms: Vec<Term>) -> Self {
+    fn with_terms(&self, terms: Vec<Term<D>>) -> Self {
         Polynomial {
             ring: self.ring.clone(),
             terms,
         }
     }
 
-    pub(crate) fn lt(&self) -> Option<&Term> {
+    pub(crate) fn lt(&self) -> Option<&Term<D>> {
         self.terms.last()
     }
 
-    pub(crate) fn lc(&self) -> Option<Felt> {
-        self.lt().map(|t| t.coeff)
+    pub(crate) fn lc(&self) -> Option<&D::Coeff> {
+        self.lt().map(|t| &t.coeff)
     }
 
     pub(crate) fn lm(&self) -> Option<&Monomial> {
         self.lt().map(|t| &t.mono)
     }
 
-    pub(crate) fn pop_lt(&mut self) -> Option<Term> {
+    pub(crate) fn pop_lt(&mut self) -> Option<Term<D>> {
         self.terms.pop()
     }
 
-    pub(crate) fn push_term(&mut self, term: Term, p: u64) {
-        if term.coeff.is_zero() {
+    /// Add one term whose coefficient is nonzero.
+    pub(crate) fn push_term(&mut self, term: Term<D>, ops: &D::Ops) {
+        if self.terms.is_empty() {
+            self.terms.push(term);
             return;
         }
+
         match self
             .terms
             .binary_search_by(|probe| probe.mono.cmp(&term.mono))
         {
-            Ok(pos) => {
-                let new_coeff = self.terms[pos].coeff.add(term.coeff, p);
-                if new_coeff.is_zero() {
+            Ok(pos) => match ops.add(&self.terms[pos].coeff, &term.coeff) {
+                Some(coeff) => self.terms[pos].coeff = coeff,
+                None => {
                     self.terms.remove(pos);
-                } else {
-                    self.terms[pos].coeff = new_coeff;
                 }
-            }
+            },
             Err(pos) => self.terms.insert(pos, term),
         }
     }
 
-    pub(crate) fn add(&self, other: &Self, p: u64) -> Self {
-        self.merge::<false>(other, p)
-    }
-
-    pub(crate) fn sub(&self, other: &Self, p: u64) -> Self {
-        self.merge::<true>(other, p)
-    }
-
-    /// Merge two polynomials of one ring under grevlex.
-    ///
-    /// `SUB` negates every term of `other`, so one loop serves both
-    /// `self + other` and `self - other`. The choice is a `const`, so the
-    /// compiler resolves it and the loop carries no runtime branch for it.
-    fn merge<const SUB: bool>(&self, other: &Self, p: u64) -> Self {
-        self.check_operand(other, p);
-        let mut out: Vec<Term> = Vec::with_capacity(self.terms.len() + other.terms.len());
+    pub(crate) fn add(&self, other: &Self, ops: &D::Ops) -> Self {
+        self.check_operand(other, ops);
+        let mut out: Vec<Term<D>> = Vec::with_capacity(self.terms.len() + other.terms.len());
 
         let mut i = 0usize;
         let mut j = 0usize;
+
+        while i < self.terms.len() && j < other.terms.len() {
+            let a = &self.terms[i];
+            let b = &other.terms[j];
+            match a.mono.cmp(&b.mono) {
+                Ordering::Less => {
+                    out.push(a.clone());
+                    i += 1;
+                }
+                Ordering::Greater => {
+                    out.push(b.clone());
+                    j += 1;
+                }
+                Ordering::Equal => {
+                    if let Some(coeff) = ops.add(&a.coeff, &b.coeff) {
+                        out.push(Term {
+                            coeff,
+                            mono: a.mono.clone(),
+                        });
+                    }
+                    i += 1;
+                    j += 1;
+                }
+            }
+        }
+
+        out.extend(self.terms[i..].iter().cloned());
+        out.extend(other.terms[j..].iter().cloned());
+        self.with_terms(out)
+    }
+
+    pub(crate) fn sub(&self, other: &Self, ops: &D::Ops) -> Self {
+        self.check_operand(other, ops);
+        let mut out: Vec<Term<D>> = Vec::with_capacity(self.terms.len() + other.terms.len());
+
+        let mut i = 0usize;
+        let mut j = 0usize;
+
         while i < self.terms.len() && j < other.terms.len() {
             let a = &self.terms[i];
             let b = &other.terms[j];
@@ -469,20 +472,15 @@ impl Polynomial {
                 }
                 Ordering::Greater => {
                     out.push(Term {
-                        coeff: if SUB { b.coeff.neg(p) } else { b.coeff },
+                        coeff: ops.neg(&b.coeff),
                         mono: b.mono.clone(),
                     });
                     j += 1;
                 }
                 Ordering::Equal => {
-                    let c = if SUB {
-                        a.coeff.sub(b.coeff, p)
-                    } else {
-                        a.coeff.add(b.coeff, p)
-                    };
-                    if !c.is_zero() {
+                    if let Some(coeff) = ops.sub(&a.coeff, &b.coeff) {
                         out.push(Term {
-                            coeff: c,
+                            coeff,
                             mono: a.mono.clone(),
                         });
                     }
@@ -494,66 +492,203 @@ impl Polynomial {
 
         out.extend(self.terms[i..].iter().cloned());
         out.extend(other.terms[j..].iter().map(|term| Term {
-            coeff: if SUB { term.coeff.neg(p) } else { term.coeff },
+            coeff: ops.neg(&term.coeff),
             mono: term.mono.clone(),
         }));
+
         self.with_terms(out)
     }
 
-    /// Return `c * m * self`, or [`ExponentOverflow`] when a product leaves
-    /// the width one exponent holds.
-    pub(crate) fn scale_monomial(
-        &self,
-        c: Felt,
-        m: &Monomial,
-        p: u64,
-    ) -> Result<Self, ExponentOverflow> {
-        if c.is_zero() || self.is_zero() {
-            return Ok(self.zero_like());
+    /// Return `c * m * self`, for a nonzero `c`.
+    ///
+    /// The multiplication is unchecked. The engines bound the degree of a
+    /// critical pair before they build any product from it. A caller
+    /// without that bound takes [`Polynomial::scale_monomial_checked`].
+    pub(crate) fn scale_monomial(&self, c: &D::Coeff, m: &Monomial, ops: &D::Ops) -> Self {
+        if self.is_zero() {
+            return self.zero_like();
         }
-        if c == Felt::one() {
+        if ops.is_one(c) {
             return self.shift_monomial(m);
         }
-        let mut terms: Vec<Term> = Vec::with_capacity(self.terms.len());
-        for t in &self.terms {
-            terms.push(Term {
-                coeff: t.coeff.mul(c, p),
-                mono: t.mono.checked_mul(m)?,
-            });
-        }
-        Ok(self.with_terms(terms))
+        let terms: Vec<Term<D>> = self
+            .terms
+            .iter()
+            .map(|t| Term {
+                coeff: ops.mul(&t.coeff, c),
+                mono: t.mono.mul(m),
+            })
+            .collect();
+        self.with_terms(terms)
     }
 
-    /// Return `m * self`, or [`ExponentOverflow`] when a product leaves the
-    /// width one exponent holds.
+    /// Return `m * self`.
     ///
-    /// Grevlex is a monomial order, so the terms stay in ascending order.
-    pub(crate) fn shift_monomial(&self, m: &Monomial) -> Result<Self, ExponentOverflow> {
-        let mut terms: Vec<Term> = Vec::with_capacity(self.terms.len());
+    /// The coefficients are copied. Grevlex is a monomial order, so the
+    /// terms stay in ascending order.
+    pub(crate) fn shift_monomial(&self, m: &Monomial) -> Self {
+        let terms: Vec<Term<D>> = self
+            .terms
+            .iter()
+            .map(|t| Term {
+                coeff: t.coeff.clone(),
+                mono: t.mono.mul(m),
+            })
+            .collect();
+        self.with_terms(terms)
+    }
+
+    /// Return `c * m * self`, or report an exponent past the width.
+    ///
+    /// This is [`Polynomial::scale_monomial`] with every product checked.
+    pub(crate) fn scale_monomial_checked(
+        &self,
+        c: &D::Coeff,
+        m: &Monomial,
+        ops: &D::Ops,
+    ) -> Result<Self, ExponentOverflow> {
+        if self.is_zero() {
+            return Ok(self.zero_like());
+        }
+        if ops.is_one(c) {
+            return self.shift_monomial_checked(m);
+        }
+        let mut terms: Vec<Term<D>> = Vec::with_capacity(self.terms.len());
         for t in &self.terms {
             terms.push(Term {
-                coeff: t.coeff,
+                coeff: ops.mul(&t.coeff, c),
                 mono: t.mono.checked_mul(m)?,
             });
         }
         Ok(self.with_terms(terms))
     }
 
-    /// Return `self - c * m * other`, or [`ExponentOverflow`] when a
-    /// product leaves the width one exponent holds.
+    /// Return `m * self`, or report an exponent past the width.
+    fn shift_monomial_checked(&self, m: &Monomial) -> Result<Self, ExponentOverflow> {
+        let mut terms: Vec<Term<D>> = Vec::with_capacity(self.terms.len());
+        for t in &self.terms {
+            terms.push(Term {
+                coeff: t.coeff.clone(),
+                mono: t.mono.checked_mul(m)?,
+            });
+        }
+        Ok(self.with_terms(terms))
+    }
+
+    /// Return `self - c * m * other`, for a nonzero `c`.
+    ///
+    /// The multiplication is unchecked, as in
+    /// [`Polynomial::scale_monomial`]. A caller without a degree bound
+    /// takes [`Polynomial::sub_scaled_checked`].
     pub(crate) fn sub_scaled(
         &self,
         other: &Self,
-        c: Felt,
+        c: &D::Coeff,
         m: &Monomial,
-        p: u64,
+        ops: &D::Ops,
+    ) -> Self {
+        self.check_operand(other, ops);
+        if other.is_zero() {
+            return self.clone();
+        }
+
+        let mut out: Vec<Term<D>> = Vec::with_capacity(self.terms.len() + other.terms.len());
+
+        let mut i = 0usize;
+        let mut j = 0usize;
+        // The multiple of the term at `j`, held across the iterations that
+        // advance `i` only.
+        let mut b_mono: Option<Monomial> = None;
+
+        while i < self.terms.len() && j < other.terms.len() {
+            let a = &self.terms[i];
+            let b0 = &other.terms[j];
+            if b_mono.is_none() {
+                b_mono = Some(b0.mono.mul(m));
+            }
+            let ord = a.mono.cmp(b_mono.as_ref().expect("the multiple is held"));
+            match ord {
+                Ordering::Less => {
+                    out.push(a.clone());
+                    i += 1;
+                }
+                Ordering::Greater => {
+                    let coeff = ops.neg(&ops.mul(&b0.coeff, c));
+                    let mono = b_mono.take().expect("the multiple is held");
+                    out.push(Term { coeff, mono });
+                    j += 1;
+                }
+                Ordering::Equal => {
+                    let scaled = ops.mul(&b0.coeff, c);
+                    // The monomials are equal, so the held multiple is
+                    // a.mono.
+                    let mono = b_mono.take().expect("the multiple is held");
+                    if let Some(coeff) = ops.sub(&a.coeff, &scaled) {
+                        out.push(Term { coeff, mono });
+                    }
+                    i += 1;
+                    j += 1;
+                }
+            }
+        }
+
+        out.extend(self.terms[i..].iter().cloned());
+        while j < other.terms.len() {
+            let b0 = &other.terms[j];
+            let coeff = ops.neg(&ops.mul(&b0.coeff, c));
+            let mono = b_mono.take().unwrap_or_else(|| b0.mono.mul(m));
+            out.push(Term { coeff, mono });
+            j += 1;
+        }
+
+        self.with_terms(out)
+    }
+
+    /// The bytes `self - c * m * other` holds at most, before the
+    /// subtraction runs.
+    ///
+    /// The result holds at most one term per term of the two operands.
+    /// Over `Q` the coefficient of a term of `other` grows by the size of
+    /// `c`, which is why `c` is read here. The count is an estimate by the
+    /// meter of [`Polynomial::heap_bytes`]: a subtraction that carries can
+    /// add one limb per term.
+    pub(crate) fn sub_scaled_bytes(&self, other: &Self, c: &D::Coeff, ops: &D::Ops) -> usize {
+        let per_term = size_of::<Term<D>>() + heap_exps_bytes(self.ring.nvars());
+        let terms = self
+            .terms
+            .len()
+            .saturating_add(other.terms.len())
+            .saturating_mul(per_term);
+        let scale = ops.heap_bytes(c);
+        other.terms.iter().fold(
+            terms.saturating_add(self.coefficient_bytes()),
+            |bytes, term| {
+                bytes
+                    .saturating_add(ops.heap_bytes(&term.coeff))
+                    .saturating_add(scale)
+            },
+        )
+    }
+
+    /// Return `self - c * m * other`, or report an exponent past the
+    /// width.
+    ///
+    /// This is [`Polynomial::sub_scaled`] with every product checked. The
+    /// multiplier reaches every term of `other`, so a product past the
+    /// width can appear in the tail while both leading monomials fit.
+    pub(crate) fn sub_scaled_checked(
+        &self,
+        other: &Self,
+        c: &D::Coeff,
+        m: &Monomial,
+        ops: &D::Ops,
     ) -> Result<Self, ExponentOverflow> {
-        self.check_operand(other, p);
-        if other.is_zero() || c.is_zero() {
+        self.check_operand(other, ops);
+        if other.is_zero() {
             return Ok(self.clone());
         }
 
-        let mut out: Vec<Term> = Vec::with_capacity(self.terms.len() + other.terms.len());
+        let mut out: Vec<Term<D>> = Vec::with_capacity(self.terms.len() + other.terms.len());
 
         let mut i = 0usize;
         let mut j = 0usize;
@@ -574,23 +709,18 @@ impl Polynomial {
                     i += 1;
                 }
                 Ordering::Greater => {
-                    let b_coeff = b0.coeff.mul(c, p).neg(p);
+                    let coeff = ops.neg(&ops.mul(&b0.coeff, c));
                     let mono = b_mono.take().expect("the multiple is held");
-                    out.push(Term {
-                        coeff: b_coeff,
-                        mono,
-                    });
+                    out.push(Term { coeff, mono });
                     j += 1;
                 }
                 Ordering::Equal => {
-                    let b_coeff = b0.coeff.mul(c, p);
-                    let new_coeff = a.coeff.sub(b_coeff, p);
+                    let scaled = ops.mul(&b0.coeff, c);
+                    // The monomials are equal, so the held multiple is
+                    // a.mono.
                     let mono = b_mono.take().expect("the multiple is held");
-                    if !new_coeff.is_zero() {
-                        out.push(Term {
-                            coeff: new_coeff,
-                            mono,
-                        });
+                    if let Some(coeff) = ops.sub(&a.coeff, &scaled) {
+                        out.push(Term { coeff, mono });
                     }
                     i += 1;
                     j += 1;
@@ -599,24 +729,24 @@ impl Polynomial {
         }
 
         out.extend(self.terms[i..].iter().cloned());
-        append_scaled_tail(&mut out, &other.terms, j, b_mono, c, m, p)?;
+        append_scaled_tail(&mut out, &other.terms, j, b_mono, c, m, ops)?;
 
         Ok(self.with_terms(out))
     }
 
-    pub(crate) fn make_monic(&self, p: u64) -> Self {
+    pub(crate) fn make_monic(&self, ops: &D::Ops) -> Self {
         let Some(lc) = self.lc() else {
             return self.clone();
         };
-        if lc == Felt::one() {
+        if ops.is_one(lc) {
             return self.clone();
         }
-        let inv = lc.inv(p);
-        let terms: Vec<Term> = self
+        let inv = ops.inv(lc);
+        let terms: Vec<Term<D>> = self
             .terms
             .iter()
             .map(|t| Term {
-                coeff: t.coeff.mul(inv, p),
+                coeff: ops.mul(&t.coeff, &inv),
                 mono: t.mono.clone(),
             })
             .collect();
@@ -624,27 +754,16 @@ impl Polynomial {
     }
 
     #[cfg(test)]
-    pub(crate) fn normal_form(
-        &self,
-        reducers: &[Polynomial],
-        p: u64,
-    ) -> Result<Self, ExponentOverflow> {
-        let reducers: Vec<&Polynomial> = reducers.iter().collect();
-        self.normal_form_refs(&reducers, p)
+    pub(crate) fn normal_form(&self, reducers: &[Polynomial<D>], ops: &D::Ops) -> Self {
+        let reducers: Vec<&Polynomial<D>> = reducers.iter().collect();
+        self.normal_form_refs(&reducers, ops)
     }
 
-    /// Reduce `self` by `reducers` and return the remainder, or
-    /// [`ExponentOverflow`] when a reduction multiple leaves the width one
-    /// exponent holds.
-    pub(crate) fn normal_form_refs(
-        &self,
-        reducers: &[&Polynomial],
-        p: u64,
-    ) -> Result<Self, ExponentOverflow> {
+    pub(crate) fn normal_form_refs(&self, reducers: &[&Polynomial<D>], ops: &D::Ops) -> Self {
         let mut poly = self.clone();
         // The remainder grows by the largest term left, so it is built
         // descending and turned around once.
-        let mut remainder: Vec<Term> = Vec::new();
+        let mut remainder: Vec<Term<D>> = Vec::new();
 
         while let Some(lt_p) = poly.lt().cloned() {
             let mut reduced = false;
@@ -655,80 +774,147 @@ impl Polynomial {
                     let m = lt_p
                         .mono
                         .quotient(&lt_g.mono)
+                        // divides() implies a quotient exists.
                         .expect("divides() implies quotient()");
-                    let scale = lt_p.coeff.div(lt_g.coeff, p);
-                    poly = poly.sub_scaled(g, scale, &m, p)?;
+                    let scale = divide_coefficients::<D>(ops, &lt_p.coeff, &lt_g.coeff);
+                    poly = poly.sub_scaled(g, &scale, &m, ops);
                     reduced = true;
                     break;
                 }
             }
 
             if !reduced {
-                let term = poly.pop_lt().expect("lt_p was Some, so poly is non-empty");
+                let term = poly
+                    .pop_lt()
+                    // lt_p was Some, so poly is non-empty here.
+                    .expect("polynomial should not be empty");
                 remainder.push(term);
             }
         }
 
         remainder.reverse();
-        Ok(Polynomial::from_sorted_terms(self.ring.clone(), remainder))
+        Polynomial::from_sorted_terms(self.ring.clone(), remainder)
     }
 
-    /// Return the S-polynomial of `self` and `other`, or
-    /// [`ExponentOverflow`] when a multiplier leaves the width one exponent
-    /// holds.
-    pub(crate) fn s_polynomial(&self, other: &Self, p: u64) -> Result<Self, ExponentOverflow> {
-        self.check_operand(other, p);
+    /// Return the S-polynomial of `self` and `other`.
+    ///
+    /// The multiplication is unchecked, as in
+    /// [`Polynomial::scale_monomial`]. A caller without a degree bound
+    /// takes [`Polynomial::s_polynomial_checked`].
+    pub(crate) fn s_polynomial(&self, other: &Self, ops: &D::Ops) -> Self {
+        self.check_operand(other, ops);
         if self.is_zero() || other.is_zero() {
-            return Ok(self.zero_like());
+            return self.zero_like();
         }
+        // both polynomials are non-zero here.
         let lt_f = self.lt().expect("non-zero polynomial must have lt");
+        // both polynomials are non-zero here.
         let lt_g = other.lt().expect("non-zero polynomial must have lt");
         let lcm = lt_f.mono.lcm(&lt_g.mono);
 
+        // lcm is a multiple of lt_f.mono.
         let m_f = lcm.quotient(&lt_f.mono).expect("lm(f) divides lcm");
+        // lcm is a multiple of lt_g.mono.
         let m_g = lcm.quotient(&lt_g.mono).expect("lm(g) divides lcm");
 
-        let f_scaled = self.scale_monomial(lt_g.coeff, &m_f, p)?;
-        let g_scaled = other.scale_monomial(lt_f.coeff, &m_g, p)?;
-        Ok(f_scaled.sub(&g_scaled, p))
+        let f_scaled = self.scale_monomial(&lt_g.coeff, &m_f, ops);
+        let g_scaled = other.scale_monomial(&lt_f.coeff, &m_g, ops);
+        f_scaled.sub(&g_scaled, ops)
+    }
+    /// Return the S-polynomial of `self` and `other`, or report an
+    /// exponent past the width.
+    ///
+    /// The least common multiple of the two leading monomials fits by
+    /// construction. The tail of each side is multiplied by a quotient of
+    /// it, and that product can pass the width.
+    pub(crate) fn s_polynomial_checked(
+        &self,
+        other: &Self,
+        ops: &D::Ops,
+    ) -> Result<Self, ExponentOverflow> {
+        self.check_operand(other, ops);
+        if self.is_zero() || other.is_zero() {
+            return Ok(self.zero_like());
+        }
+        // both polynomials are non-zero here.
+        let lt_f = self.lt().expect("non-zero polynomial must have lt");
+        // both polynomials are non-zero here.
+        let lt_g = other.lt().expect("non-zero polynomial must have lt");
+        let lcm = lt_f.mono.lcm(&lt_g.mono);
+
+        // lcm is a multiple of lt_f.mono.
+        let m_f = lcm.quotient(&lt_f.mono).expect("lm(f) divides lcm");
+        // lcm is a multiple of lt_g.mono.
+        let m_g = lcm.quotient(&lt_g.mono).expect("lm(g) divides lcm");
+
+        let f_scaled = self.scale_monomial_checked(&lt_g.coeff, &m_f, ops)?;
+        let g_scaled = other.scale_monomial_checked(&lt_f.coeff, &m_g, ops)?;
+        Ok(f_scaled.sub(&g_scaled, ops))
     }
 }
 
-fn append_scaled_tail(
-    out: &mut Vec<Term>,
-    terms: &[Term],
+/// Return `a / b` in the domain.
+///
+/// Every basis element is monic, so a divisor of 1 is the common case and
+/// it needs no inversion.
+pub(crate) fn divide_coefficients<D: Domain>(ops: &D::Ops, a: &D::Coeff, b: &D::Coeff) -> D::Coeff {
+    if ops.is_one(b) {
+        a.clone()
+    } else {
+        ops.mul(a, &ops.inv(b))
+    }
+}
+
+fn append_scaled_tail<D: Domain>(
+    out: &mut Vec<Term<D>>,
+    terms: &[Term<D>],
     mut start: usize,
     held: Option<Monomial>,
-    c: Felt,
+    c: &D::Coeff,
     m: &Monomial,
-    p: u64,
+    ops: &D::Ops,
 ) -> Result<(), ExponentOverflow> {
     if let Some(mono) = held {
-        push_negated_scaled(out, &terms[start], c, mono, p);
+        push_negated_scaled(out, &terms[start], c, mono, ops);
         start += 1;
     }
     for term in &terms[start..] {
-        push_negated_scaled(out, term, c, term.mono.checked_mul(m)?, p);
+        push_negated_scaled(out, term, c, term.mono.checked_mul(m)?, ops);
     }
     Ok(())
 }
 
-fn push_negated_scaled(out: &mut Vec<Term>, term: &Term, c: Felt, mono: Monomial, p: u64) {
+fn push_negated_scaled<D: Domain>(
+    out: &mut Vec<Term<D>>,
+    term: &Term<D>,
+    c: &D::Coeff,
+    mono: Monomial,
+    ops: &D::Ops,
+) {
     out.push(Term {
-        coeff: term.coeff.mul(c, p).neg(p),
+        coeff: ops.neg(&ops.mul(&term.coeff, c)),
         mono,
     });
 }
 
-fn write_term(
+fn write_term<D: Domain>(
     f: &mut fmt::Formatter<'_>,
     variables: &[String],
-    coeff: u64,
+    ops: &D::Ops,
+    coeff: &D::Coeff,
     exps: &[u16],
 ) -> fmt::Result {
+    let negative = ops.is_negative(coeff);
+    let magnitude;
+    let value = if negative {
+        magnitude = ops.neg(coeff);
+        &magnitude
+    } else {
+        coeff
+    };
     let mut written = false;
-    if coeff != 1 || exps.iter().all(|&exp| exp == 0) {
-        write!(f, "{coeff}")?;
+    if !ops.is_one(value) || exps.iter().all(|&exp| exp == 0) {
+        ops.write(value, f)?;
         written = true;
     }
     for (name, &exp) in variables.iter().zip(exps) {
@@ -757,17 +943,21 @@ fn write_variable(
     Ok(written)
 }
 
-impl fmt::Display for Polynomial {
+impl<D: Domain> fmt::Display for Polynomial<D> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.is_zero() {
             return f.write_str("0");
         }
+        let ops = self.ring.ops();
         let variables = self.ring.variables();
         for (index, (coeff, exps)) in self.terms().enumerate() {
+            let negative = ops.is_negative(coeff);
             if index > 0 {
-                f.write_str(" + ")?;
+                f.write_str(if negative { " - " } else { " + " })?;
+            } else if negative {
+                f.write_str("-")?;
             }
-            write_term(f, variables, coeff, exps)?;
+            write_term::<D>(f, variables, ops, coeff, exps)?;
         }
         Ok(())
     }
@@ -776,7 +966,7 @@ impl fmt::Display for Polynomial {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ring::PolynomialRing;
+    use crate::ring::{Felt, PolynomialRing, Rationals};
 
     fn ring() -> PolynomialRing {
         PolynomialRing::prime_field(7, ["x", "y"]).expect("7 is prime")
@@ -786,80 +976,18 @@ mod tests {
         Monomial::from_exps(exps.iter().copied().collect())
     }
 
+    /// The leading term as a residue and its exponents.
+    fn lead(poly: &Polynomial) -> Option<(u64, &[u16])> {
+        poly.leading_term()
+            .map(|(coeff, exps)| (coeff.value(), exps))
+    }
+
     #[test]
     fn grevlex_orders_by_degree_then_reverse_lex() {
         assert!(mono(&[3, 0]) > mono(&[0, 2]));
         assert!(mono(&[2, 0]) > mono(&[1, 1]));
         assert!(mono(&[1, 1]) > mono(&[0, 2]));
         assert!(mono(&[2, 1]) > mono(&[1, 2]));
-    }
-
-    #[test]
-    fn packed_comparison_agrees_with_the_entry_by_entry_order() {
-        fn by_entry(a: &Monomial, b: &Monomial) -> Ordering {
-            match a.deg.cmp(&b.deg) {
-                Ordering::Equal => {
-                    for (&x, &y) in a.exps.iter().zip(&b.exps).rev() {
-                        match x.cmp(&y) {
-                            Ordering::Equal => continue,
-                            ord => return ord.reverse(),
-                        }
-                    }
-                    Ordering::Equal
-                }
-                ord => ord,
-            }
-        }
-
-        let mut state = 0x9e37_79b9_7f4a_7c15u64;
-        for nvars in 1..=13usize {
-            for _ in 0..2000 {
-                let draw = |state: &mut u64| {
-                    let exps: Exps = (0..nvars)
-                        .map(|_| {
-                            *state ^= *state << 13;
-                            *state ^= *state >> 7;
-                            *state ^= *state << 17;
-                            (*state % 4) as u16
-                        })
-                        .collect();
-                    Monomial::from_exps(exps)
-                };
-                let a = draw(&mut state);
-                let b = draw(&mut state);
-                assert_eq!(a.cmp(&b), by_entry(&a, &b), "at {:?} {:?}", a.exps, b.exps);
-            }
-        }
-    }
-
-    #[test]
-    fn the_divisor_key_never_rejects_a_divisor() {
-        let mut state = 0x243f_6a88_85a3_08d3u64;
-        for nvars in 1..=18usize {
-            for _ in 0..2000 {
-                let draw = |state: &mut u64, bound: u64| {
-                    let exps: Exps = (0..nvars)
-                        .map(|_| {
-                            *state ^= *state << 13;
-                            *state ^= *state >> 7;
-                            *state ^= *state << 17;
-                            (*state % bound) as u16
-                        })
-                        .collect();
-                    Monomial::from_exps(exps)
-                };
-                let a = draw(&mut state, 12);
-                let b = draw(&mut state, 12);
-                if a.divides(&b) {
-                    assert!(
-                        key_divides(a.divisor_key(), b.divisor_key()),
-                        "the key rejected a divisor: {:?} | {:?}",
-                        a.exps,
-                        b.exps
-                    );
-                }
-            }
-        }
     }
 
     #[test]
@@ -872,6 +1000,42 @@ mod tests {
         assert_eq!(a.lcm(&mono(&[1, 3])), mono(&[2, 3]));
         assert!(mono(&[2, 0]).is_coprime(&mono(&[0, 3])));
         assert!(!mono(&[2, 1]).is_coprime(&mono(&[0, 3])));
+    }
+
+    /// The engines bound the degree of a pair before they multiply, so
+    /// `Monomial::mul` panics on an overflow it is not meant to see.
+    /// Division by a basis takes `checked_mul` and reports it.
+    #[test]
+    fn a_checked_multiply_reports_an_exponent_past_the_width() {
+        let half = mono(&[40000, 1]);
+        let product = half.checked_mul(&mono(&[25535, 2])).expect("65535 fits");
+        assert_eq!(product.exps.as_slice(), [65535, 3]);
+        assert_eq!(product.deg, 65538);
+        assert_eq!(half.checked_mul(&mono(&[25536, 0])), Err(ExponentOverflow));
+        assert_eq!(
+            mono(&[0, 65535]).checked_mul(&mono(&[0, 1])),
+            Err(ExponentOverflow)
+        );
+    }
+
+    /// The multiplier reaches every term of the reducer, so the tail can
+    /// pass the width while both leading monomials fit.
+    #[test]
+    fn a_checked_subtraction_reports_the_tail_that_passes_the_width() {
+        let ring = ring();
+        let f = ring.polynomial([(1, [65535, 1])]).expect("fits");
+        let g = ring
+            .polynomial([(1, [65535, 0]), (1, [0, 65535])])
+            .expect("fits");
+        let one = Felt::new(1, 7);
+        assert_eq!(
+            f.sub_scaled_checked(&g, &one, &mono(&[0, 1]), ring.ops()),
+            Err(ExponentOverflow)
+        );
+        assert_eq!(
+            f.s_polynomial_checked(&g, ring.ops()),
+            Err(ExponentOverflow)
+        );
     }
 
     #[test]
@@ -891,7 +1055,7 @@ mod tests {
         let f = ring.parse_polynomial("y^2 + x^2 + x").expect("parses");
         let monomials: Vec<Vec<u16>> = f.terms().map(|(_, exps)| exps.to_vec()).collect();
         assert_eq!(monomials, vec![vec![2, 0], vec![0, 2], vec![1, 0]]);
-        assert_eq!(f.leading_term(), Some((1, [2u16, 0].as_slice())));
+        assert_eq!(lead(&f), Some((1, [2u16, 0].as_slice())));
         assert_eq!(f.degree(), Some(2));
     }
 
@@ -908,10 +1072,8 @@ mod tests {
         let ring = ring();
         let f = ring.polynomial([(2, [2, 0]), (1, [0, 0])]).expect("fits");
         let g = ring.polynomial([(1, [1, 0]), (1, [0, 0])]).expect("fits");
-        let out = f
-            .sub_scaled(&g, Felt::new(2, 7), &mono(&[1, 0]), 7)
-            .expect("the product fits");
-        assert_eq!(out.leading_term(), Some((5, [1u16, 0].as_slice())));
+        let out = f.sub_scaled(&g, &Felt::new(2, 7), &mono(&[1, 0]), ring.ops());
+        assert_eq!(lead(&out), Some((5, [1u16, 0].as_slice())));
     }
 
     #[test]
@@ -921,9 +1083,9 @@ mod tests {
             .polynomial([(1, [2, 0]), (2, [1, 0]), (3, [0, 0])])
             .expect("fits");
         let g = ring.polynomial([(1, [1, 0])]).expect("fits");
-        let r = f.normal_form(&[g], 7).expect("the product fits");
+        let r = f.normal_form(&[g], ring.ops());
         assert_eq!(r.terms.len(), 1);
-        assert_eq!(r.leading_term(), Some((3, [0u16, 0].as_slice())));
+        assert_eq!(lead(&r), Some((3, [0u16, 0].as_slice())));
     }
 
     #[test]
@@ -931,7 +1093,36 @@ mod tests {
         let ring = ring();
         let f = ring.polynomial([(2, [2, 0]), (1, [0, 0])]).expect("fits");
         let g = ring.polynomial([(3, [1, 1])]).expect("fits");
-        let s = f.s_polynomial(&g, 7).expect("the product fits");
+        let s = f.s_polynomial(&g, ring.ops());
         assert!(s.terms.iter().all(|t| t.mono != mono(&[2, 1])));
+    }
+
+    /// The memory meters of the crate size a polynomial with
+    /// [`Polynomial::heap_bytes`], so every one of them counts the heap
+    /// bytes of a coefficient. Over a prime field a coefficient holds
+    /// none, and over the rationals it holds the numerator and the
+    /// denominator.
+    #[test]
+    fn the_memory_meter_counts_the_coefficient_bytes() {
+        let rationals: PolynomialRing<Rationals> =
+            PolynomialRing::rationals(["x"]).expect("the name holds");
+        let small = rationals
+            .parse_polynomial("x + 1")
+            .expect("the syntax holds");
+        let large = rationals
+            .parse_polynomial("340282366920938463463374607431768211457/3*x + 1")
+            .expect("the syntax holds");
+        assert!(small.coefficient_bytes() > 0);
+        assert!(
+            large.coefficient_bytes() > small.coefficient_bytes(),
+            "a wider numerator costs more"
+        );
+
+        let terms = large.terms.len() * size_of::<Term<Rationals>>();
+        assert_eq!(large.heap_bytes(), terms + large.coefficient_bytes());
+
+        let prime = ring().parse_polynomial("x + 1").expect("the syntax holds");
+        assert_eq!(prime.coefficient_bytes(), 0, "a Felt is one u64");
+        assert_eq!(prime.heap_bytes(), prime.terms.len() * size_of::<Term>());
     }
 }

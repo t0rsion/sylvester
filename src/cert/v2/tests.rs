@@ -1,12 +1,12 @@
 use super::*;
-use crate::compute::ComputeOptions;
-use crate::compute::f4::{Limits, solve_recorded};
+use crate::compute::ComputeLimits;
+use crate::compute::f4::solve_recorded;
 
-/// The four certificates that section 11 pins byte for byte.
-#[path = "../../../tests/support/cert_v2.rs"]
-mod fixtures;
-
-use fixtures::{EMPTY, SQUARE, TINY, UNIT, ZERO};
+/// The four certificates section 11 pins byte for byte.
+const SQUARE: &[u8] = include_bytes!("../../../tests/fixtures/cert-v2/square.cert");
+const UNIT: &[u8] = include_bytes!("../../../tests/fixtures/cert-v2/unit.cert");
+const ZERO: &[u8] = include_bytes!("../../../tests/fixtures/cert-v2/zero.cert");
+const EMPTY: &[u8] = include_bytes!("../../../tests/fixtures/cert-v2/empty.cert");
 
 fn ring() -> PolynomialRing {
     PolynomialRing::prime_field(7, ["x", "y"]).expect("7 is prime")
@@ -26,10 +26,9 @@ fn certificate(ring: &PolynomialRing, input: &[Polynomial]) -> Vec<u8> {
 }
 
 fn write_certificate(ring: &PolynomialRing, input: &[Polynomial]) -> (Vec<u8>, Vec<Polynomial>) {
-    let mut recorder = Recorder::new(ring, input, None, None);
-    let options = ComputeOptions::new();
-    let (basis, _) = solve_recorded(ring, input, &options, &Limits::of(&options), &mut recorder)
-        .expect("the run finishes");
+    let limits = ComputeLimits::default();
+    let mut recorder = Recorder::new(ring, input, &limits);
+    let (basis, _) = solve_recorded(ring, input, &limits, &mut recorder).expect("the run finishes");
     let (bytes, _) = assemble(ring, input, &basis, recorder).expect("the writer holds");
     (bytes, basis)
 }
@@ -80,7 +79,7 @@ fn the_tiny_system_writes_the_header_of_the_listing() {
     let (bytes, basis) = write_certificate(&ring, &input);
     // The trace depends on how F4 batches the run, so section 11 pins the
     // header and the values, not the bytes.
-    let listing: &[u8] = TINY;
+    let listing: &[u8] = include_bytes!("../../../tests/fixtures/cert-v2/tiny.cert");
     assert_eq!(bytes[..37], listing[..37]);
     assert_eq!(basis.len(), 2);
     assert_eq!(format!("{}", basis[0]), "x");
@@ -196,7 +195,7 @@ fn a_restart_releases_what_the_dropped_nodes_held() {
 
     let ring = ring();
     let input = polys(&ring, &["x^2*y", "x*y^2"]);
-    let mut recorder = Recorder::new(&ring, &input, None, None);
+    let mut recorder = Recorder::new(&ring, &input, &ComputeLimits::default());
     let seeded = recorder.held_bytes();
     assert!(seeded > 0, "the seed writes one node per generator");
 
@@ -252,18 +251,17 @@ fn the_cost_of_recording() {
     println!("| cell | raw s | recorded s | recorded/raw |");
     println!("|---|---|---|---|");
     for (name, ring, system) in &cells {
-        let options = ComputeOptions::new();
+        let limits = ComputeLimits::default();
         let mut raw = f64::MAX;
         let mut recorded = f64::MAX;
         for _ in 0..3 {
             let start = Instant::now();
-            solve(ring, system, &options).expect("a basis");
+            solve(ring, system, &limits).expect("a basis");
             raw = raw.min(start.elapsed().as_secs_f64());
 
-            let mut recorder = Recorder::new(ring, system, None, None);
+            let mut recorder = Recorder::new(ring, system, &limits);
             let start = Instant::now();
-            solve_recorded(ring, system, &options, &Limits::of(&options), &mut recorder)
-                .expect("a basis");
+            solve_recorded(ring, system, &limits, &mut recorder).expect("a basis");
             recorded = recorded.min(start.elapsed().as_secs_f64());
         }
         println!(

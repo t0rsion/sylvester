@@ -1,16 +1,20 @@
-//! Field context for the F4 engine (design section 8).
+//! Field context for the F4 engine (design section 4).
 //!
 //! [`Small31`] implements [`FieldOps`] for a prime below 2^31. It
-//! multiplies with Shoup's method and delays reduction until a sweep or a
-//! read.
+//! multiplies with Shoup's method and delays the additions and one
+//! conditional subtraction.
 //!
-//! A run builds one context and instantiates the kernel with it. A multiply
-//! therefore carries no runtime method choice.
+//! M2 chunk F1 measured this kernel against a raw-product kernel that
+//! accumulated `factor * w` and swept the accumulator every 15
+//! applications. Shoup won on six of the eight measured cells and by
+//! 2.25x on katsura-10, so the raw kernel is gone (design open decision
+//! 6). The run builds one context and instantiates the kernel with it,
+//! so a multiply carries no branch.
 
 /// The exclusive upper bound on a modulus, 2^31.
 ///
 /// `PolynomialRing::prime_field` accepts `2 <= p <= 2^31 - 1`, so every
-/// prime the crate supports fits the kernel.
+/// prime the crate supports fits both kernels.
 pub(crate) const MODULUS_LIMIT: u64 = 1 << 31;
 
 /// The number of `axpy` applications one accumulator lane absorbs.
@@ -33,15 +37,10 @@ pub(crate) const fn applications_before_sweep(capacity: u64, start: u64, addend:
 /// [`FieldOps::sweep`] at [`FieldOps::applications_between_sweeps`]. That
 /// count is what keeps a lane inside `u64`.
 pub(crate) trait FieldOps {
-    /// Every stored value is below `p`.
+    /// The stored coefficient. Every value is below `p`.
     type Coeff: Copy;
 
     /// Add two coefficients.
-    ///
-    /// `tests/f4_field.rs` includes this module by path. The library test
-    /// target compiles the method without that caller.
-    #[cfg(test)]
-    #[allow(dead_code)]
     fn add(&self, a: Self::Coeff, b: Self::Coeff) -> Self::Coeff;
 
     /// Subtract `b` from `a`.
@@ -97,7 +96,7 @@ pub(crate) trait FieldOps {
 /// The high 64 bits of a 64-by-64 bit product.
 ///
 /// The `u128` multiply is one widening machine multiply. Nothing else in
-/// the kernel widens past `u64`.
+/// either kernel widens past `u64`.
 #[inline]
 const fn mulhi(a: u64, b: u64) -> u64 {
     (((a as u128) * (b as u128)) >> 64) as u64
@@ -123,12 +122,13 @@ fn inverse(a: u32, p: u32) -> u32 {
 
 /// The Shoup kernel for a prime below 2^31.
 ///
-/// Shoup's method leaves a product below `2p` and the kernel does not
-/// correct it. The accumulator is reduced when it is read, so the
-/// correction buys nothing and costs a compare per nonzero. One
-/// application therefore adds at most `2p - 1` to a lane, and a lane that
-/// starts below `p` absorbs `(u64::MAX - (p - 1)) / (2p - 1)`
-/// applications, which is above 2^32 for every prime the ring accepts.
+/// A product reaches the accumulator below `2p`, not below `p`: Shoup's
+/// method leaves a value below `2p` and the kernel does not correct it.
+/// The accumulator is reduced when it is read, so the correction buys
+/// nothing and costs a compare per nonzero. One application therefore
+/// adds at most `2p - 1` to a lane, and a lane that starts below `p`
+/// absorbs `(u64::MAX - (p - 1)) / (2p - 1)` applications, which is above
+/// 2^32 for every prime the ring accepts.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Small31 {
     p: u32,
@@ -153,6 +153,11 @@ impl Small31 {
             per_sweep: applications_before_sweep(u64::MAX, p64 - 1, 2 * p64 - 1),
             lane_limit: u64::MAX - (2 * p64 - 1),
         }
+    }
+
+    /// The modulus.
+    pub(crate) fn modulus(&self) -> u32 {
+        self.p
     }
 
     /// Shoup's precomputation for one coefficient, `floor(w * 2^32 / p)`.
@@ -187,12 +192,12 @@ impl Small31 {
 impl FieldOps for Small31 {
     type Coeff = u32;
 
-    #[cfg(test)]
     #[inline]
     fn add(&self, a: u32, b: u32) -> u32 {
         debug_assert!(a < self.p && b < self.p, "both terms are below p");
-        let sum = a + b;
-        if sum >= self.p { sum - self.p } else { sum }
+        // p < 2^31 keeps the sum inside u32.
+        let s = a + b;
+        if s >= self.p { s - self.p } else { s }
     }
 
     #[inline]

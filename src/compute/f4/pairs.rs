@@ -1,4 +1,8 @@
-//! Critical pairs and the Gebauer-Moller update (design section 5).
+//! Critical pairs and the Gebauer-Moller update (design section 3.4).
+//!
+//! [`PairSet`] holds every queued pair in one flat vector.
+//! [`PairSet::update`] runs when a basis element arrives, and
+//! [`PairSet::take_lowest_degree`] hands the run loop one batch.
 //!
 //! This module names basis elements by index and reads their leading
 //! monomials from a slice, so it does not depend on the basis
@@ -18,26 +22,32 @@ const NO_SLOT: u32 = u32::MAX;
 pub(crate) struct Pair {
     /// The lcm of the two leading monomials, in the basis table.
     pub(crate) lcm: MonomialId,
+    /// The total degree of `lcm`.
     pub(crate) deg: u32,
+    /// The smaller basis index.
     pub(crate) i: u32,
+    /// The larger basis index.
     pub(crate) j: u32,
 }
 
 /// How many pairs each step of the update made or dropped.
 ///
 /// `generated` counts every candidate the update forms, one per live
-/// element. `product`, `criterion_m`, and `criterion_f` count candidates
-/// those tests drop. `criterion_b` counts queued pairs B deletes. The
-/// number of pairs the update queues is
+/// element. The four discard counters count candidates the product
+/// criterion, criterion M, and criterion F drop, and queued pairs
+/// criterion B deletes. So the number of pairs the update queues is
 /// `generated - product - criterion_m - criterion_f`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct PairCounters {
+    /// Candidate pairs formed.
     pub(crate) generated: u64,
     /// Candidates dropped because the two leading monomials are coprime.
     pub(crate) product: u64,
     /// Queued pairs deleted by criterion B.
     pub(crate) criterion_b: u64,
+    /// Candidates dropped by criterion M.
     pub(crate) criterion_m: u64,
+    /// Candidates dropped by criterion F.
     pub(crate) criterion_f: u64,
 }
 
@@ -57,9 +67,11 @@ pub(crate) struct SelectOptions {
 struct Candidate {
     /// `lcm(lm_i, lm_t)`, in the update workspace table.
     lcm: MonomialId,
+    /// The other basis index.
     i: u32,
     /// Whether the two leading monomials share no variable.
     coprime: bool,
+    /// Whether a criterion has dropped this candidate.
     dropped: bool,
 }
 
@@ -91,19 +103,16 @@ impl PairSet {
     }
 
     /// The number of queued pairs.
-    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.pairs.len()
     }
 
     /// Report whether the queue is empty.
-    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.pairs.is_empty()
     }
 
     /// The queued pairs, in queue order.
-    #[cfg(test)]
     pub(crate) fn pairs(&self) -> &[Pair] {
         &self.pairs
     }
@@ -125,7 +134,7 @@ impl PairSet {
     /// Put a batch's deferred pairs back in the queue.
     ///
     /// The run loop calls this when the projected batch passes the memory
-    /// budget and it retries with half the pairs (design section 11). The
+    /// budget and it retries with half the pairs (design section 3.9). The
     /// returned pairs keep their lcm ids, which belong to the basis table
     /// and stay valid.
     pub(crate) fn requeue(&mut self, deferred: Vec<Pair>) -> Result<(), F4Error> {
@@ -155,7 +164,7 @@ impl PairSet {
     /// including `t`, in `table`. `live` holds the live element indices as
     /// they were before `t` arrived, ascending, and none of them is `t`.
     /// Retirement runs after this call, so an element this update names is
-    /// still live here (design section 4).
+    /// still live here (design section 3.3).
     ///
     /// Candidate lcms go into `ws`, which this call clears when it
     /// finishes. The lcm of a surviving pair moves into `table`.

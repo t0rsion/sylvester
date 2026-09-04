@@ -1,4 +1,4 @@
-//! The recording hook of the F4 engine (contract section 9.4).
+//! The recording hook of the F4 engine (design sections 3.2 and 6.3).
 //!
 //! The run is generic over [`Trace`], so the raw path carries no trace
 //! branch and no trace allocation. [`NoTrace`] is the raw path's
@@ -10,7 +10,7 @@
 //! section 9.4: [`Trace::rows`], [`Trace::pivots_sorted`],
 //! [`Trace::inserted`], and [`Trace::returned`]. The other four report one
 //! row as the kernel reduces it. The engine builds a report only when
-//! [`Trace::RECORDS`] holds.
+//! [`Trace::RECORDS`] holds, so the raw path builds none.
 
 /// A row of one batch, for the trace.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -26,6 +26,7 @@ pub(crate) enum RowId {
 /// The multiplier is in [`BatchRows::mults`], at the row's own position.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct BatchRow {
+    /// The row's place in the batch.
     pub(crate) place: RowId,
     /// The global basis index the row multiplies.
     pub(crate) source: u32,
@@ -38,6 +39,7 @@ pub(crate) struct BatchRow {
 /// exactly once. `mults` holds `nvars` exponents per row, in the order of
 /// `rows`.
 pub(crate) struct BatchRows<'a> {
+    /// One entry per row of the batch.
     pub(crate) rows: &'a [BatchRow],
     /// The multipliers, `nvars` exponents per row.
     pub(crate) mults: &'a [u32],
@@ -81,14 +83,15 @@ pub(crate) enum Returned {
 /// recorder builds one node per row. The run loop calls the other four
 /// methods at the points contract section 9.4 fixes.
 pub(crate) trait Trace {
-    /// Whether the engine builds reports and stays sequential.
+    /// Whether the recorder keeps what it is told.
     ///
-    /// The parallel phase of [`super::kernel::reduce`] reports no
-    /// operation, so a run that records stays on one thread. The engine
+    /// The parallel phase of [`super::kernel::reduce`] reduces rows
+    /// against the frozen pivot set on several threads, and it reports no
+    /// operation, so a run that records stays sequential. The engine also
     /// skips building a report when this is false.
     const RECORDS: bool;
 
-    /// The run starts again at a wider lane width (design section 3.2).
+    /// The run starts again at a wider lane width (design section 2.3).
     ///
     /// The recorder drops every node and every map of the failed attempt
     /// (contract section 9.2).

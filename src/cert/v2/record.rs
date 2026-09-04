@@ -9,16 +9,14 @@
 //! meets and records nothing after it, and [`Recorder::finish`] reports
 //! the fault to the writer, which then writes no bytes.
 
-use std::time::Instant;
-
 use crate::certificate::{CertifyError, TraceFault};
-use crate::compute::ComputeError;
 use crate::compute::f4::trace::{BatchRows, Insertion, Returned, RowId, Trace};
+use crate::compute::{ComputeError, ComputeLimits};
 use crate::poly::{Exps, Monomial, Polynomial};
-use crate::ring::PolynomialRing;
-use crate::ring::field::Felt;
+use crate::ring::field::{Felt, mul_residue};
+use crate::ring::{PolynomialRing, PrimeOps};
 
-use super::Budget;
+use super::WriterBudget;
 
 /// One node of the operation DAG (contract section 4.6).
 ///
@@ -32,12 +30,14 @@ pub(super) enum Node {
     },
     /// The monomial multiple of one node.
     Mul {
+        /// The node the monomial multiplies.
         src: u32,
         /// The multiplier, which is not the identity monomial.
         mono: Monomial,
     },
     /// The scalar multiple of one node.
     Scale {
+        /// The node the scalar multiplies.
         src: u32,
         /// The scalar, which is at least 2.
         scalar: u64,
@@ -50,7 +50,7 @@ pub(super) enum Node {
 }
 
 impl Node {
-    /// Call `f` on every source of this node.
+    /// Call `f` on every node this node reads.
     pub(super) fn sources(&self, mut f: impl FnMut(u32)) {
         match self {
             Node::Input { .. } => {}
@@ -68,7 +68,8 @@ impl Node {
 pub(super) struct Recording {
     /// The nodes, in recording order.
     pub(super) nodes: Vec<Node>,
-    /// The node of each basis element the run returned, in return order.
+    /// The node of each element of the basis the run returned, in return
+    /// order.
     pub(super) basis: Vec<u32>,
 }
 
@@ -88,17 +89,17 @@ struct Normalization {
 }
 
 impl Normalization {
-    fn of(input: &[Polynomial], modulus: u64) -> Self {
+    fn of(input: &[Polynomial], ops: &PrimeOps) -> Self {
         let mut scales = vec![None; input.len()];
         let mut kept: Vec<(u32, Polynomial)> = Vec::new();
         for (index, poly) in input.iter().enumerate() {
             let Some(lc) = poly.lc() else { continue };
-            let monic = poly.make_monic(modulus);
+            let monic = poly.make_monic(ops);
             if kept.iter().any(|(_, seen)| *seen == monic) {
                 continue;
             }
-            if lc != Felt::one() {
-                scales[index] = Some(lc.inv(modulus).value());
+            if *lc != Felt::one() {
+                scales[index] = Some(lc.inv(ops.modulus()).value());
             }
             kept.push((index as u32, monic));
         }
@@ -112,7 +113,7 @@ impl Normalization {
 
 /// The recorder of one F4 run.
 ///
-/// The caller builds it before the run, hands it to the engine, and calls
+/// Build it before the run, hand it to the engine, and call
 /// [`Recorder::finish`] after the run.
 pub(crate) struct Recorder {
     modulus: u64,
@@ -130,11 +131,13 @@ pub(crate) struct Recorder {
     lower: Vec<Option<u32>>,
     /// The summands of the row the kernel is reducing.
     summands: Vec<(u32, u64)>,
+    /// The row the kernel is reducing.
     row: Option<RowId>,
+    /// The normalization scalar of that row.
     normalizer: u64,
     returned: Vec<u32>,
     fault: Option<CertifyError>,
-    budget: Budget,
+    budget: WriterBudget,
     /// The bytes the nodes of the current attempt hold.
     charged: usize,
 }
@@ -150,19 +153,15 @@ const STEP_BYTES: usize = size_of::<(u32, u64)>();
 impl Recorder {
     /// A recorder for one run over `input`.
     ///
-    /// The deadline and the memory limit are the ones the run holds to.
-    /// They cover the nodes the recorder keeps, as they cover the engine.
-    pub(crate) fn new(
-        ring: &PolynomialRing,
-        input: &[Polynomial],
-        deadline: Option<Instant>,
-        memory_limit: Option<usize>,
-    ) -> Self {
+    /// `limits` is what the run holds to. The deadline, the memory limit,
+    /// and the cancellation flag cover the nodes the recorder keeps, as
+    /// they cover the engine.
+    pub(crate) fn new(ring: &PolynomialRing, input: &[Polynomial], limits: &ComputeLimits) -> Self {
         let modulus = ring.modulus();
         let mut recorder = Recorder {
             modulus,
             nvars: ring.nvars(),
-            normalization: Normalization::of(input, modulus),
+            normalization: Normalization::of(input, ring.ops()),
             inputs: input.len(),
             nodes: Vec::new(),
             monic: Vec::new(),
@@ -174,7 +173,7 @@ impl Recorder {
             normalizer: 1,
             returned: Vec::new(),
             fault: None,
-            budget: Budget::new(deadline, memory_limit, ring.nvars()),
+            budget: WriterBudget::new(limits, ring.nvars()),
             charged: 0,
         };
         recorder.seed();
@@ -185,7 +184,7 @@ impl Recorder {
     ///
     /// The budget comes back with it, because the writer charges the rest
     /// of its work to the same budget.
-    pub(super) fn finish(self) -> Result<(Recording, Budget), CertifyError> {
+    pub(super) fn finish(self) -> Result<(Recording, WriterBudget), CertifyError> {
         if let Some(fault) = self.fault {
             return Err(fault);
         }
@@ -251,7 +250,7 @@ impl Recorder {
         };
         let bytes = NODE_BYTES + steps * STEP_BYTES;
         if let Err(error) = self.budget.hold_bytes(bytes) {
-            self.stop(error.into());
+            self.stop(error);
         }
         self.charged += bytes;
         let index = self.nodes.len() as u32;
@@ -270,6 +269,7 @@ impl Recorder {
         self.fault.is_some()
     }
 
+    /// The node bound to `slot` of `map`.
     fn bound(map: &[Option<u32>], slot: u32) -> Option<u32> {
         map.get(slot as usize).copied().flatten()
     }
@@ -322,9 +322,7 @@ impl Recorder {
         }
         if self.normalizer != 1 {
             for step in &mut merged {
-                step.1 = Felt::from_residue(step.1)
-                    .mul(Felt::from_residue(self.normalizer), self.modulus)
-                    .value();
+                step.1 = mul_residue(step.1, self.normalizer, self.modulus);
             }
         }
         merged
@@ -349,8 +347,8 @@ impl Trace for Recorder {
         if self.stopped() {
             return;
         }
-        if let Err(error) = self.budget.check_deadline() {
-            self.stop(error.into());
+        if let Err(error) = self.budget.check_stop() {
+            self.stop(error);
             return;
         }
         debug_assert_eq!(

@@ -7,4 +7,4 @@ target/
 /benchmarks/gb-comparison/runner/bin/
 /benchmarks/gb-comparison/runner/target-*/
 /benchmarks/gb-comparison/results.json
-/benchmarks/gb-comparison/records/2026-08-19-v0.2/results.json
+/benchmarks/gb-comparison/records/2026-08-19-f4/results.json

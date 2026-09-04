@@ -511,18 +511,16 @@ fn check_spair(
 ) -> Result<(), VerifyError> {
     let (i, j) = pair;
     let target = algebra::spoly(left, right, modulus, budget, 0)?;
+    let bound = SpairBound {
+        pair,
+        target: &target,
+        modulus,
+    };
     let mut sum = Poly::zero();
     for (summand, (cofactor, element)) in cofactors.iter().zip(basis).enumerate() {
-        if let Some(product) = checked_spair_product(
-            (i, j),
-            summand,
-            cofactor,
-            element,
-            &target,
-            &sum,
-            modulus,
-            budget,
-        )? {
+        if let Some(product) =
+            checked_spair_product(&bound, summand, cofactor, element, &sum, budget)?
+        {
             sum = algebra::add(sum, product, modulus, budget, target.terms().len())?;
         }
     }
@@ -532,27 +530,33 @@ fn check_spair(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn checked_spair_product(
+struct SpairBound<'a> {
     pair: (usize, usize),
+    target: &'a Poly,
+    modulus: u64,
+}
+
+fn checked_spair_product(
+    bound: &SpairBound<'_>,
     summand: usize,
     cofactor: &Poly,
     element: &Poly,
-    target: &Poly,
     sum: &Poly,
-    modulus: u64,
     budget: &mut Budget,
 ) -> Result<Option<Poly>, VerifyError> {
     budget.step()?;
     if cofactor.is_zero() || element.is_zero() {
         return Ok(None);
     }
-    let live = target.terms().len() + sum.terms().len();
-    let product = algebra::mul(cofactor, element, modulus, budget, live)?;
-    if product.lm().is_some_and(|lm| above_bound(lm, target.lm())) {
+    let live = bound.target.terms().len() + sum.terms().len();
+    let product = algebra::mul(cofactor, element, bound.modulus, budget, live)?;
+    if product
+        .lm()
+        .is_some_and(|lm| above_bound(lm, bound.target.lm()))
+    {
         return Err(VerifyError::SpairBound {
-            i: pair.0,
-            j: pair.1,
+            i: bound.pair.0,
+            j: bound.pair.1,
             summand,
         });
     }

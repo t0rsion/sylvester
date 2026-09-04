@@ -66,6 +66,9 @@ parts that would make text stiff.
 - Numbers carry their scope ("katsura-8, median of 3 runs, one thread,
   F_1073741827"). Say median and maximum, not "within". Never type a
   measured number by hand; copy it from the record it comes from.
+- Release numbers belong in `CHANGELOG.md`, not README files or maintained
+  narrative documentation. Manifests and benchmark provenance keep exact
+  machine versions.
 
 ## Structure of an explanation
 

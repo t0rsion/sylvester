@@ -1,8 +1,10 @@
-//! The working basis, redundancy, and lead-divisor index (design sections 4
-//! and 5).
+//! The working basis, redundancy, and the lead-divisor index (design
+//! sections 3.1, 3.3, and 3.5).
 //!
-//! [`Basis`] owns the basis table of design section 3.4, so every
-//! [`MonomialId`] a basis element holds belongs to that table.
+//! [`Basis`] owns the basis table of design section 2.7, so every
+//! [`MonomialId`] a basis element holds belongs to that table. A run
+//! interns its generators into the table, moves the table into
+//! [`Basis::new`], and seeds the basis with [`Basis::seed`].
 
 use rustc_hash::FxHashSet;
 
@@ -28,7 +30,7 @@ pub(crate) struct InputPoly {
 /// One polynomial of the basis.
 ///
 /// The polynomial is monic and its monomials are strictly descending, so
-/// `monos[0]` is the leading monomial.
+/// `monos[0]` is the leading monomial and `coeffs[0]` is 1.
 pub(crate) struct BasisPoly {
     /// The monomials, strictly descending, in the basis table.
     pub(crate) monos: Vec<MonomialId>,
@@ -69,12 +71,15 @@ struct BasisElem {
 /// One entry of the lead-divisor index.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct LeadEntry {
+    /// The leading monomial.
     lm: MonomialId,
     /// The divisor mask of `lm`, in the table `lm` belongs to.
     mask: u32,
+    /// The total degree of `lm`.
     deg: u32,
-    #[cfg(test)]
+    /// The number of terms of the basis element.
     nterms: u32,
+    /// The basis index of the element.
     basis: u32,
 }
 
@@ -161,7 +166,6 @@ impl LeadIndex {
                     lm,
                     mask: query.mask(lm),
                     deg: *deg,
-                    #[cfg(test)]
                     nterms: entry.nterms,
                     basis: entry.basis,
                 });
@@ -187,6 +191,7 @@ impl LeadIndex {
 /// A reducer found for one monomial.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Divisor {
+    /// The basis index of the reducer.
     pub(crate) basis: u32,
     /// The multiplier `m / lm(basis)`, in the asking table.
     pub(crate) mult: MonomialId,
@@ -203,7 +208,6 @@ pub(crate) struct LeadView {
 
 impl LeadView {
     /// The number of entries.
-    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
     }
@@ -236,7 +240,6 @@ impl LeadView {
                     best = Some(*entry);
                     break;
                 }
-                #[cfg(test)]
                 Reducer::Shortest => {
                     let better = best
                         .is_none_or(|old| (entry.nterms, entry.basis) < (old.nterms, old.basis));
@@ -258,6 +261,13 @@ impl LeadView {
                 }))
             }
         }
+    }
+
+    /// The bytes the view holds, counting capacities.
+    pub(crate) fn memory_bytes(&self) -> usize {
+        self.entries
+            .capacity()
+            .saturating_mul(size_of::<LeadEntry>())
     }
 }
 
@@ -295,9 +305,13 @@ impl<L: Lanes> Basis<L> {
     }
 
     /// The number of elements, live and retired.
-    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.elems.len()
+    }
+
+    /// Report whether the basis holds no element.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.elems.is_empty()
     }
 
     /// The polynomial of element `index`.
@@ -314,7 +328,6 @@ impl<L: Lanes> Basis<L> {
     ///
     /// A retired element is never a reducer and never takes part in a new
     /// pair. Its queued pairs stay in the queue.
-    #[cfg(test)]
     pub(crate) fn is_redundant(&self, index: u32) -> bool {
         self.elems[index as usize].redundant
     }
@@ -338,12 +351,12 @@ impl<L: Lanes> Basis<L> {
     /// Report whether the basis is the unit ideal.
     ///
     /// The run stops as soon as this holds. The live set is then the one
-    /// constant element (design section 4).
+    /// constant element (design section 3.2).
     pub(crate) fn is_unit(&self) -> bool {
         self.unit
     }
 
-    /// Seed the basis from the generators (design section 10).
+    /// Seed the basis from the generators (design section 3.1).
     ///
     /// The index of a generator in `inputs` is its public input index.
     /// Zero generators and exact duplicates are dropped, each survivor is
@@ -388,7 +401,7 @@ impl<L: Lanes> Basis<L> {
         Ok(())
     }
 
-    /// Insert one element and generate its pairs (design sections 4 and 5).
+    /// Insert one element and generate its pairs (design section 3.3).
     ///
     /// `poly` is monic and strictly descending. Pair generation runs
     /// before any retirement, so the pair that justifies retiring an
@@ -514,6 +527,20 @@ impl<L: Lanes> Basis<L> {
         })
     }
 
+    /// Replace the polynomial of element `index`, keeping its lead.
+    ///
+    /// Final interreduction reduces a tail and leaves the leading term
+    /// alone (design section 3.8). The leading monomial decides
+    /// redundancy and the lead-divisor index, so it must not change here.
+    pub(crate) fn replace_tail(&mut self, index: u32, poly: BasisPoly) {
+        debug_assert_eq!(
+            poly.lead(),
+            self.leads[index as usize],
+            "interreduction keeps the leading monomial"
+        );
+        self.elems[index as usize].poly = poly;
+    }
+
     /// The bytes the basis holds, counting capacities.
     pub(crate) fn memory_bytes(&self) -> usize {
         let elems = self
@@ -567,7 +594,6 @@ impl<L: Lanes> Basis<L> {
             lm,
             mask: self.table.mask(lm),
             deg: self.table.degree(lm),
-            #[cfg(test)]
             nterms: self.elems[index as usize].poly.len() as u32,
             basis: index,
         })
@@ -591,7 +617,6 @@ impl<L: Lanes> Basis<L> {
             lm: MonomialId::ONE,
             mask: self.table.mask(MonomialId::ONE),
             deg: 0,
-            #[cfg(test)]
             nterms: 1,
             basis: index,
         })
@@ -622,7 +647,7 @@ fn monic<F: FieldOps<Coeff = u32>>(field: &F, input: InputPoly) -> BasisPoly {
 ///
 /// Every growth of an engine structure goes through this, so a failed
 /// allocation is a typed budget report and not a panic (design section
-/// 11).
+/// 3.9).
 pub(crate) fn reserve<T>(vec: &mut Vec<T>, extra: usize) -> Result<(), F4Error> {
     vec.try_reserve(extra)
         .map_err(|_| F4Error::MemoryLimitExceeded)
@@ -643,6 +668,7 @@ mod tests {
         pairs: PairSet,
         ws: MonomialTable<Lanes8>,
         field: Small31,
+        nvars: usize,
     }
 
     impl Fixture {
@@ -652,6 +678,7 @@ mod tests {
                 pairs: PairSet::new(),
                 ws: MonomialTable::new(nvars),
                 field: Small31::new(P),
+                nvars,
             }
         }
 

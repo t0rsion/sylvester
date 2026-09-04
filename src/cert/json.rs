@@ -1,15 +1,13 @@
 //! Writer for the canonical certificate encoding.
 //!
-//! The writer emits the `sylv-gb-cert-v1` object: the nine keys in the
-//! contract order, no insignificant whitespace, and decimal integers.
-//! Engine terms run ascending under the order and certificate terms run
-//! descending, so the writer reverses every term list. The same values
-//! always give the same bytes.
+//! The writer emits the object of `docs/certificate-v1.md`: the nine keys
+//! in the order the contract lists them, no insignificant whitespace, and
+//! decimal integers. Engine terms run ascending under the order and
+//! certificate terms run descending, so the writer reverses every term
+//! list. The same values always give the same bytes.
 
-use crate::compute::ComputeError;
 use crate::poly::Polynomial;
 
-use super::Budget;
 use super::represent::SpairEntry;
 
 const SCHEMA: &str = "sylv-gb-cert-v1";
@@ -26,13 +24,8 @@ pub(crate) struct Parts<'a> {
     pub spairs: &'a [SpairEntry],
 }
 
-/// Write the canonical bytes, or stop when the buffer would pass the limit.
-///
-/// The writer charges the growing buffer against `budget` once per
-/// polynomial. A certificate too large for the memory limit stops within
-/// one polynomial of the limit instead of after the whole buffer is built.
-/// The budget stops a write; it never changes the bytes.
-pub(crate) fn write(parts: &Parts<'_>, budget: &Budget) -> Result<Vec<u8>, ComputeError> {
+/// Write the canonical bytes.
+pub(crate) fn write(parts: &Parts<'_>) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(br#"{"schema":""#);
     out.extend_from_slice(SCHEMA.as_bytes());
@@ -43,29 +36,28 @@ pub(crate) fn write(parts: &Parts<'_>, budget: &Budget) -> Result<Vec<u8>, Compu
     out.extend_from_slice(br#","nvars":"#);
     uint(&mut out, parts.nvars as u64);
     out.extend_from_slice(br#","input":"#);
-    poly_array(&mut out, parts.input, parts.modulus, budget)?;
+    poly_array(&mut out, parts.input, parts.modulus);
     out.extend_from_slice(br#","basis":"#);
-    poly_array(&mut out, parts.basis, parts.modulus, budget)?;
+    poly_array(&mut out, parts.basis, parts.modulus);
     out.extend_from_slice(br#","origin":"#);
-    entry_array(&mut out, parts.origin, parts.modulus, budget)?;
+    entry_array(&mut out, parts.origin, parts.modulus);
     out.extend_from_slice(br#","membership":"#);
-    entry_array(&mut out, parts.membership, parts.modulus, budget)?;
+    entry_array(&mut out, parts.membership, parts.modulus);
     out.extend_from_slice(br#","spairs":["#);
     for (index, entry) in parts.spairs.iter().enumerate() {
         if index > 0 {
             out.push(b',');
         }
-        budget.check_deadline()?;
         out.push(b'[');
         uint(&mut out, entry.i as u64);
         out.push(b',');
         uint(&mut out, entry.j as u64);
         out.push(b',');
-        poly_array(&mut out, &entry.cofactors, parts.modulus, budget)?;
+        poly_array(&mut out, &entry.cofactors, parts.modulus);
         out.push(b']');
     }
     out.extend_from_slice(b"]}");
-    Ok(out)
+    out
 }
 
 fn uint(out: &mut Vec<u8>, value: u64) {
@@ -83,40 +75,26 @@ fn uint(out: &mut Vec<u8>, value: u64) {
     out.extend_from_slice(&digits[index..]);
 }
 
-fn entry_array(
-    out: &mut Vec<u8>,
-    entries: &[Vec<Polynomial>],
-    modulus: u64,
-    budget: &Budget,
-) -> Result<(), ComputeError> {
+fn entry_array(out: &mut Vec<u8>, entries: &[Vec<Polynomial>], modulus: u64) {
     out.push(b'[');
     for (index, entry) in entries.iter().enumerate() {
         if index > 0 {
             out.push(b',');
         }
-        budget.check_deadline()?;
-        poly_array(out, entry, modulus, budget)?;
+        poly_array(out, entry, modulus);
     }
     out.push(b']');
-    Ok(())
 }
 
-fn poly_array(
-    out: &mut Vec<u8>,
-    polys: &[Polynomial],
-    modulus: u64,
-    budget: &Budget,
-) -> Result<(), ComputeError> {
+fn poly_array(out: &mut Vec<u8>, polys: &[Polynomial], modulus: u64) {
     out.push(b'[');
     for (index, poly) in polys.iter().enumerate() {
         if index > 0 {
             out.push(b',');
         }
         polynomial(out, poly, modulus);
-        budget.check_bytes(out.len())?;
     }
     out.push(b']');
-    Ok(())
 }
 
 /// Write one polynomial, terms strictly descending.

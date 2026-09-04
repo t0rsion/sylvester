@@ -165,11 +165,11 @@ fn inverse_is_correct_at_the_benchmark_modulus() {
     }
 }
 
-/// Applies `rows` through the kernel and through a per-element model.
+/// Apply `rows` through the kernel and through a per-element model.
 ///
-/// The sweep rule is the one section 3.7 states: count the applications
-/// since the scatter or the last sweep, and sweep when the count reaches
-/// `applications_between_sweeps`.
+/// The caller's sweep rule is the one section 3.7 states: count the
+/// applications since the scatter or the last sweep, and sweep when the
+/// count reaches `applications_between_sweeps`.
 fn check_axpy<F: FieldOps<Coeff = u32>>(
     ctx: &F,
     p: u32,

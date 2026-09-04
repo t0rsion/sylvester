@@ -2,8 +2,9 @@
 
 use crate::certificate::{CertifyError, EmitterFault};
 use crate::poly::Polynomial;
+use crate::ring::PrimeOps;
 
-use super::Budget;
+use super::WriterBudget;
 use super::divide::divide;
 
 /// One S-pair entry: the pair and one cofactor per basis element.
@@ -17,21 +18,22 @@ pub(crate) struct SpairEntry {
 /// Divide every input polynomial by the basis and keep the quotients.
 ///
 /// Entry i holds one cofactor per basis element, so that
-/// f_i = sum_j q_ij * g_j. A nonzero remainder is a defect of the claimed
-/// basis: it reports [`EmitterFault::InputHasRemainder`].
+/// f_i = sum_j q_ij * g_j. A nonzero remainder is a defect of the
+/// candidate: it reports [`EmitterFault::InputHasRemainder`] and writes
+/// nothing.
 ///
 /// The work holds to `budget`, which also carries the quotients of the
 /// entries already built.
 pub(crate) fn membership_representations(
     input: &[Polynomial],
     basis: &[Polynomial],
-    modulus: u64,
-    budget: &mut Budget,
+    ops: &PrimeOps,
+    budget: &mut WriterBudget,
 ) -> Result<Vec<Vec<Polynomial>>, CertifyError> {
     let mut out = Vec::with_capacity(input.len());
     for (index, f) in input.iter().enumerate() {
-        budget.check_deadline()?;
-        let (quotients, remainder) = divide(f, basis, modulus, budget)?;
+        budget.check_stop()?;
+        let (quotients, remainder) = divide(f, basis, ops, budget)?;
         if !remainder.is_zero() {
             return Err(CertifyError::Emitter(EmitterFault::InputHasRemainder {
                 input: index,
@@ -46,20 +48,20 @@ pub(crate) fn membership_representations(
 /// Build one entry per pair whose leading monomials share a variable.
 ///
 /// A pair with coprime leading monomials carries no entry. The product
-/// criterion justifies the omission, and the verifier re-enumerates the
-/// pairs. A nonzero remainder proves the basis is not a Gröbner basis: it
-/// reports [`EmitterFault::NotAGroebnerBasis`] with the pair.
+/// criterion justifies the omission and the verifier re-enumerates the
+/// pairs itself. A nonzero remainder proves the basis is not a Gröbner
+/// basis: it reports [`EmitterFault::NotAGroebnerBasis`] with the pair.
 ///
 /// The work is quadratic in the size of the basis, and each entry holds one
 /// cofactor per basis element. It holds to `budget` at every pair.
 pub(crate) fn spair_representations(
     basis: &[Polynomial],
-    modulus: u64,
-    budget: &mut Budget,
+    ops: &PrimeOps,
+    budget: &mut WriterBudget,
 ) -> Result<Vec<SpairEntry>, CertifyError> {
     let mut out = Vec::new();
     for i in 0..basis.len() {
-        budget.check_deadline()?;
+        budget.check_stop()?;
         for j in (i + 1)..basis.len() {
             let (Some(lm_i), Some(lm_j)) = (basis[i].lm(), basis[j].lm()) else {
                 continue;
@@ -67,8 +69,8 @@ pub(crate) fn spair_representations(
             if lm_i.nvars() != lm_j.nvars() || lm_i.is_coprime(lm_j) {
                 continue;
             }
-            let spoly = basis[i].s_polynomial(&basis[j], modulus)?;
-            let (cofactors, remainder) = divide(&spoly, basis, modulus, budget)?;
+            let spoly = basis[i].s_polynomial(&basis[j], ops);
+            let (cofactors, remainder) = divide(&spoly, basis, ops, budget)?;
             if !remainder.is_zero() {
                 return Err(CertifyError::Emitter(EmitterFault::NotAGroebnerBasis {
                     i,
@@ -93,10 +95,7 @@ fn bounded_by(cofactors: &[Polynomial], basis: &[Polynomial], target: &Polynomia
         .iter()
         .zip(basis)
         .all(|(cofactor, element)| match (cofactor.lm(), element.lm()) {
-            (Some(lm_q), Some(lm_g)) => match (lm_q.checked_mul(lm_g), target.lm()) {
-                (Ok(product), Some(bound)) => product <= *bound,
-                _ => false,
-            },
+            (Some(lm_q), Some(lm_g)) => target.lm().is_some_and(|bound| lm_q.mul(lm_g) <= *bound),
             _ => true,
         })
 }

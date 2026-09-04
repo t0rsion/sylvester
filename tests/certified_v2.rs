@@ -10,6 +10,7 @@
 //! of `docs/certificate-v2.md` section 11.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use sylvester::verify::verify;
@@ -17,9 +18,6 @@ use sylvester::{
     Backend, CertifyError, ComputeError, ComputeOptions, GroebnerBasis, Ideal, PolynomialRing,
     RingError,
 };
-
-#[path = "support/cert_v2.rs"]
-mod fixtures;
 
 /// The benchmark modulus, so the tests run the arithmetic the gate runs.
 const P: u64 = 1073741827;
@@ -51,15 +49,11 @@ fn canonical(basis: &GroebnerBasis) -> Vec<String> {
 
 /// The bytes of one fixture.
 fn fixture(name: &str) -> Vec<u8> {
-    match name {
-        "tiny" => fixtures::TINY,
-        "square" => fixtures::SQUARE,
-        "unit" => fixtures::UNIT,
-        "zero" => fixtures::ZERO,
-        "empty" => fixtures::EMPTY,
-        other => panic!("unknown v2 fixture {other}"),
-    }
-    .to_vec()
+    let path: PathBuf = [env!("CARGO_MANIFEST_DIR"), "tests", "fixtures", "cert-v2"]
+        .iter()
+        .collect::<PathBuf>()
+        .join(format!("{name}.cert"));
+    std::fs::read(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
 }
 
 /// The certificate of a system over `F_7[x, y]`, written from its terms.
@@ -87,7 +81,7 @@ fn hex(bytes: &[u8]) -> String {
         .join(" ")
 }
 
-/// Certifies one system and compares the basis against the raw F4 run.
+/// Certify one system and compare the basis against the raw F4 run.
 fn certify(label: &str, ideal: &Ideal) -> Vec<u8> {
     let raw = ideal
         .groebner_basis(ComputeOptions::new())
@@ -109,7 +103,9 @@ fn certify(label: &str, ideal: &Ideal) -> Vec<u8> {
     certified.into_parts().1
 }
 
-/// One polynomial under construction, keyed by exponent vector.
+/// One benchmark-family polynomial under construction.
+///
+/// The family definitions match `benchmarks/gb-comparison/gen.py`.
 type Build = BTreeMap<Vec<u16>, i64>;
 
 fn add(poly: &mut Build, exps: Vec<u16>, coeff: i64) {
@@ -231,7 +227,7 @@ fn noon(n: usize) -> Vec<Terms> {
     system
 }
 
-/// The two systems of KNOWN_ISSUES.md, which the v0.1 engines got wrong.
+/// The two systems of KNOWN_ISSUES.md, which the extracted engines got wrong.
 fn counterexamples() -> [(u64, usize, Vec<Terms>); 2] {
     let f2 = vec![
         vec![(1, vec![3, 0]), (1, vec![0, 3])],
@@ -289,8 +285,8 @@ fn two_runs_write_the_same_bytes() {
 
 #[test]
 fn the_thread_count_changes_no_byte() {
-    // The recorder reduces every row on the calling thread, so the trace
-    // is the same whatever the pool holds.
+    // A run that records reduces every row on the calling thread, so the
+    // trace is the same whatever the pool holds.
     let ideal = ideal_of(&ring(P, 5), &katsura(4));
     let one = ideal
         .groebner_basis_certified(ComputeOptions::new().threads(1))
@@ -498,35 +494,24 @@ fn a_tampered_fixture_is_rejected_or_still_true() {
     // panic, and the cases below require rejection.
     for name in ["tiny", "square", "unit", "zero", "empty"] {
         let bytes = fixture(name);
-        tamper_each_byte(&bytes);
-        reject_prefixes(name, &bytes);
-        reject_trailing_byte(name, &bytes);
-        reject_fixed_header(name, &bytes);
-        reject_section_lengths(name, &bytes);
-        reject_composite_modulus(name, &bytes);
+        check_each_byte(name, &bytes);
+        check_header(name, &bytes);
+        check_composite_modulus(name, &bytes);
     }
 }
 
-fn tamper_each_byte(bytes: &[u8]) {
+fn check_each_byte(name: &str, bytes: &[u8]) {
     for offset in 0..bytes.len() {
         for mask in [0x01u8, 0x80, 0xff] {
             let mut broken = bytes.to_vec();
             broken[offset] ^= mask;
             std::hint::black_box(verify(&broken).is_err());
         }
-    }
-}
-
-fn reject_prefixes(name: &str, bytes: &[u8]) {
-    for offset in 0..bytes.len() {
         assert!(
             verify(&bytes[..offset]).is_err(),
             "{name}: the first {offset} bytes were accepted"
         );
     }
-}
-
-fn reject_trailing_byte(name: &str, bytes: &[u8]) {
     let mut longer = bytes.to_vec();
     longer.push(0);
     assert!(
@@ -535,11 +520,8 @@ fn reject_trailing_byte(name: &str, bytes: &[u8]) {
     );
 }
 
-fn reject_fixed_header(name: &str, bytes: &[u8]) {
-    for offset in 0..37 {
-        if offset == 35 || offset == 36 {
-            continue;
-        }
+fn check_header(name: &str, bytes: &[u8]) {
+    for offset in (0..37).filter(|&offset| offset != 35 && offset != 36) {
         let mut broken = bytes.to_vec();
         broken[offset] ^= 0x01;
         assert!(
@@ -547,9 +529,6 @@ fn reject_fixed_header(name: &str, bytes: &[u8]) {
             "{name}: the header byte {offset} was accepted"
         );
     }
-}
-
-fn reject_section_lengths(name: &str, bytes: &[u8]) {
     for offset in 37..43 {
         let mut broken = bytes.to_vec();
         broken[offset] = broken[offset].wrapping_add(1);
@@ -560,7 +539,7 @@ fn reject_section_lengths(name: &str, bytes: &[u8]) {
     }
 }
 
-fn reject_composite_modulus(name: &str, bytes: &[u8]) {
+fn check_composite_modulus(name: &str, bytes: &[u8]) {
     let mut composite = bytes.to_vec();
     composite[35] = 9;
     assert!(
@@ -571,10 +550,11 @@ fn reject_composite_modulus(name: &str, bytes: &[u8]) {
 
 /// The cost of certification, as a table.
 ///
-/// `cargo test --release --test certified_v2 -- --ignored --nocapture`
-/// prints the table. The numbers are the minimum of three runs, so they
-/// belong to one machine and one build, and the release note quotes the
-/// record they come from.
+/// Run it with
+/// `cargo test --release --test certified_v2 -- --ignored --nocapture`.
+/// The numbers are the minimum of three runs, so they belong to one
+/// machine and one build, and the release note quotes the record they
+/// come from.
 #[test]
 #[ignore = "a measurement, not a check"]
 fn the_cost_of_certification() {
@@ -669,6 +649,9 @@ fn a_limit_the_engine_fits_but_the_certificate_does_not_stops_typed() {
         matches!(
             stopped,
             Err(CertifyError::Engine(ComputeError::MemoryLimitExceeded))
+                | Err(CertifyError::WriterExhausted(
+                    ComputeError::MemoryLimitExceeded
+                ))
         ),
         "the writer needs more than the engine: {stopped:?}"
     );

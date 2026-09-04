@@ -256,6 +256,104 @@ end
         f.write(s)
 
 
+def render_sylvester_q(name, nv, polys):
+    """The `.sylq` format: the same shape as `.syl` (see render_sylvester),
+    under its own extension rather than a characteristic line, because the
+    domain here comes from sylv-runner's own `rational` mode argument, not
+    from the file. See runner/src/main.rs for the reader."""
+    lines = [str(nv)]
+    for poly in polys:
+        terms = []
+        for exps, coeff in sorted(poly.items()):
+            if coeff == 0:
+                continue
+            terms.append(",".join([str(coeff)] + [str(e) for e in exps]))
+        lines.append(";".join(terms))
+    with open(os.path.join(INP, f"{name}.sylq"), "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def render_singular_q(name, nv, polys):
+    """Like render_singular, over the rationals. `option(redSB)` alone
+    content-clears rather than normalizing to monic over Q (unlike over
+    F_p, where the leading coefficient is already 1 after reduction), so
+    this adds `simplify(std(I), 1)`, confirmed against the installed
+    Singular 4.4.1 (`system(--ticks-per-sec) ... option(redSB); ideal G =
+    simplify(std(I), 1);` prints a monic reduced basis; plain
+    `option(redSB); std(I)` does not)."""
+    vars_ = ",".join(f"x{i + 1}" for i in range(nv))
+    body = ",\n  ".join(poly_str(p) for p in polys)
+    s = f"""system("--ticks-per-sec",1000);
+ring r = 0,({vars_}),dp;
+ideal I = {body};
+option(redSB);
+int t0 = rtimer;
+ideal G = simplify(std(I), 1);
+int t1 = rtimer;
+print("TIME_MS "+string(t1-t0));
+print("SIZE "+string(size(G)));
+int i;
+for (i=1; i<=size(G); i++) {{ print("LM "+string(leadmonom(G[i]))); }}
+for (i=1; i<=size(G); i++) {{ print("POLY "+string(G[i])); }}
+exit;
+"""
+    with open(os.path.join(INP, f"{name}.sing"), "w") as f:
+        f.write(s)
+
+
+def render_msolve_q(name, nv, polys):
+    """Like render_msolve, with the characteristic line `0`. The installed
+    msolve 0.10.1 then emits a rational basis with `-g 2`: content-cleared
+    (the gcd of the cleared-denominator integer coefficients divided out),
+    not normalized to monic. canon.py divides by the leading coefficient to
+    compare it against the other three tools."""
+    vars_ = ",".join(f"x{i + 1}" for i in range(nv))
+    body = ",\n".join(poly_str(p) for p in polys)
+    with open(os.path.join(INP, f"{name}.ms"), "w") as f:
+        f.write(f"{vars_}\n0\n{body}\n")
+
+
+def render_julia_q(name, nv, polys):
+    """Like render_julia, over `QQ` in place of `GF(P)`. The warm-up system
+    is over `QQ` too, so the rational specialization of Groebner.jl and
+    AbstractAlgebra.jl compiles before the first timed run, the same
+    reason the prime-field warm-up runs over `GF(P)`."""
+    vars_list = ", ".join(f"x{i + 1}" for i in range(nv))
+    vars_strs = ", ".join(f'"x{i + 1}"' for i in range(nv))
+    body = ",\n  ".join(poly_str(p) for p in polys)
+    s = f"""using Groebner, AbstractAlgebra
+# warm-up on a tiny system (cyclic-3) so compilation is excluded from timing
+let
+    Rw, (a, b, c) = polynomial_ring(QQ, ["a", "b", "c"], internal_ordering=:degrevlex)
+    groebner([a + b + c, a*b + b*c + c*a, a*b*c - 1], ordering=DegRevLex())
+end
+R, ({vars_list}) = polynomial_ring(QQ, [{vars_strs}], internal_ordering=:degrevlex)
+sys = [
+  {body}
+];
+G = nothing
+for r in 1:3
+    local t = @elapsed Gr = groebner(sys, ordering=DegRevLex())
+    global G = Gr
+    println("RUN ", t)
+    flush(stdout)
+    if t > 120.0
+        println("TIMEOUT")
+        exit(0)
+    end
+end
+println("SIZE ", length(G))
+for f in G
+    println("LM ", leading_monomial(f))
+end
+for f in G
+    println("POLY ", f)
+end
+"""
+    with open(os.path.join(INP, f"{name}.jl"), "w") as f:
+        f.write(s)
+
+
 def main():
     os.makedirs(INP, exist_ok=True)
     instances = []
@@ -278,6 +376,33 @@ def main():
         print(f"{name}: {nv} vars, {len(polys)} polys")
     with open(os.path.join(INP, "instances.txt"), "w") as f:
         f.write("\n".join(names) + "\n")
+
+    # The rational cells: the same families, at sizes small enough that
+    # Singular, msolve, and Groebner.jl finish in seconds over Q, where
+    # coefficient growth, not monomial count, drives cost. Every name
+    # carries a "-q" suffix so its four files (.ms, .sing, .jl, .sylq)
+    # never collide with the prime-field files of the same family and
+    # size, which already use the unsuffixed name under four of those five
+    # extensions.
+    q_instances = []
+    for n in (4, 5, 6):
+        q_instances.append((f"cyclic-{n}-q", *cyclic(n)))
+    for n in (4, 5, 6, 7):
+        q_instances.append((f"katsura-{n}-q", *katsura(n)))
+    for n in (8, 9):
+        q_instances.append((f"eco-{n}-q", *eco(n)))
+    for n in (3, 4, 5):
+        q_instances.append((f"noon-{n}-q", *noon(n)))
+    q_names = []
+    for name, nv, polys in q_instances:
+        render_sylvester_q(name, nv, polys)
+        render_singular_q(name, nv, polys)
+        render_msolve_q(name, nv, polys)
+        render_julia_q(name, nv, polys)
+        q_names.append(name)
+        print(f"{name}: {nv} vars, {len(polys)} polys (Q)")
+    with open(os.path.join(INP, "instances-q.txt"), "w") as f:
+        f.write("\n".join(q_names) + "\n")
 
 
 if __name__ == "__main__":

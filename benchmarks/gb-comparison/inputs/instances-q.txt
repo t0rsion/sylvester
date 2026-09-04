@@ -1,0 +1,12 @@
+cyclic-4-q
+cyclic-5-q
+cyclic-6-q
+katsura-4-q
+katsura-5-q
+katsura-6-q
+katsura-7-q
+eco-8-q
+eco-9-q
+noon-3-q
+noon-4-q
+noon-5-q

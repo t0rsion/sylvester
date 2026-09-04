@@ -219,28 +219,49 @@ pub(super) fn pairs(
             offset: reader.offset(),
         });
     }
-    let witnesses = decode_witnesses(reader, basis, pool, steps, count, len, ctx)?;
+    let witnesses = decode_witnesses(
+        count,
+        len,
+        &mut WitnessDecoder {
+            reader,
+            basis,
+            pool,
+            steps,
+            ctx,
+        },
+    )?;
     reader.finish()?;
 
     let order = topological_order(&witnesses, len, ctx)?;
     validate_witnesses(&witnesses, &order, basis, len, ctx)
 }
 
-#[allow(clippy::too_many_arguments)]
+struct WitnessDecoder<'a, 'data, 'ctx> {
+    reader: &'a mut Reader<'data>,
+    basis: &'a [Poly],
+    pool: &'a mut Pool,
+    steps: &'a mut Steps,
+    ctx: &'a mut Ctx<'ctx>,
+}
+
 fn decode_witnesses(
-    reader: &mut Reader<'_>,
-    basis: &[Poly],
-    pool: &mut Pool,
-    steps: &mut Steps,
     count: u64,
     len: u64,
-    ctx: &mut Ctx<'_>,
+    decoder: &mut WitnessDecoder<'_, '_, '_>,
 ) -> Result<Vec<Witness>, VerifyError> {
     let mut witnesses: Vec<Witness> = Vec::with_capacity(count as usize);
     for t in 0..count {
-        ctx.meter.charge(1)?;
+        decoder.ctx.meter.charge(1)?;
         let (i, j) = pair_of(t, len);
-        witnesses.push(decode_witness(reader, basis, pool, steps, i, j, ctx)?);
+        witnesses.push(decode_witness(
+            decoder.reader,
+            decoder.basis,
+            decoder.pool,
+            decoder.steps,
+            i,
+            j,
+            decoder.ctx,
+        )?);
     }
     Ok(witnesses)
 }

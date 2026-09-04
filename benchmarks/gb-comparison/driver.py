@@ -19,10 +19,26 @@ core_msolve's `print_gb` path returns without cleanup. Measured directly
 close to a megabyte of heap per call. The runner forks one child per
 repetition. See runner/msolve/msolve_inproc.c.
 
-On success the driver runs twice more and takes the median of 3. msolve
-takes the median of its in-process repetitions instead. A timeout (>120 s)
-marks DNF and skips larger members of that family for the same tool and
-config.
+Run policy: run once; on success run twice more and take the median of 3
+(msolve instead takes the median over its own in-process repetitions; see
+above). On timeout (>120 s) mark DNF and skip larger instances of the
+same family for that tool/config (documented deviation; timeouts in these
+families are monotone in n).
+
+Rational cells (docs/rational-design.md section 11.4): the same four families,
+at the smaller sizes RATIONAL_FAMILIES names, over Q instead of F_p, with
+four tools instead of nine configs (no M2, no certified or multi-thread
+sylvester configs; there is no certified path over Q and the protocol
+runs every tool, sylvester included, at one thread). Every rational tool
+runs at one thread: README.md's "Rational protocol" section says why
+sylvester's own rational run is `ComputeOptions::threads(1)`, not only
+`-t 1`/`RAYON_NUM_THREADS=1` as the prime-field cells already use.
+Correctness is the gate here (docs/rational-design.md section 1.2); timing is
+recorded, not gated, and msolve's rational timing is a CLI wall clock
+around `msolve -g 2` (there is no rational counterpart of
+runner/msolve/msolve_inproc.c, so the per-process startup cost this file
+documents above for the prime-field msolve cells is not subtracted here
+either).
 """
 
 import json
@@ -31,6 +47,7 @@ import re
 import statistics
 import subprocess
 import time
+from fractions import Fraction
 
 import canon
 
@@ -54,8 +71,26 @@ FAMILIES = {
     "noon": [f"noon-{n}" for n in range(3, 7)],
 }
 
-# Comma-separated instance allowlist, e.g. GBBENCH_INSTANCES=cyclic-4,katsura-5.
-# Unset runs every instance.
+# The rational cells (docs/rational-design.md section 11.4): the same four
+# families, at sizes small enough that Singular, msolve, and Groebner.jl
+# finish in seconds over Q, where coefficient growth drives cost more than
+# monomial count does. See gen.py for the instance list and the reasoning
+# behind each family's cutoff. Every name carries a "-q" suffix, which
+# gen.py's rational input files (.ms, .sing, .jl, .sylq) also carry, so a
+# rational cell key never collides with a prime-field one of the same
+# family and size.
+RATIONAL_FAMILIES = {
+    "cyclic": [f"cyclic-{n}-q" for n in (4, 5, 6)],
+    "katsura": [f"katsura-{n}-q" for n in (4, 5, 6, 7)],
+    "eco": [f"eco-{n}-q" for n in (8, 9)],
+    "noon": [f"noon-{n}-q" for n in (3, 4, 5)],
+}
+
+# For a smoke run against a couple of small cells: a comma-separated
+# instance allowlist, e.g. GBBENCH_INSTANCES=cyclic-4,katsura-5. The same
+# variable restricts the rational families too, by the "-q" names, e.g.
+# GBBENCH_INSTANCES=cyclic-4-q,katsura-4-q. Unset runs every instance, the
+# normal full-harness behavior.
 _only = os.environ.get("GBBENCH_INSTANCES")
 if _only:
     _allow = set(_only.split(","))
@@ -63,6 +98,13 @@ if _only:
         fam: [n for n in members if n in _allow] for fam, members in FAMILIES.items()
     }
     FAMILIES = {fam: members for fam, members in FAMILIES.items() if members}
+    RATIONAL_FAMILIES = {
+        fam: [n for n in members if n in _allow]
+        for fam, members in RATIONAL_FAMILIES.items()
+    }
+    RATIONAL_FAMILIES = {
+        fam: members for fam, members in RATIONAL_FAMILIES.items() if members
+    }
 
 INSTANCES = [i for fam in FAMILIES.values() for i in fam]
 NVARS = {}
@@ -70,8 +112,17 @@ for name in INSTANCES:
     with open(os.path.join(INP, name + ".syl")) as f:
         NVARS[name] = int(f.readline())
 
-# (results label, config label, runner mode, thread count).
-# A certified config is its own results row, not a variant of default.
+RATIONAL_INSTANCES = [i for fam in RATIONAL_FAMILIES.values() for i in fam]
+NVARS_Q = {}
+for name in RATIONAL_INSTANCES:
+    with open(os.path.join(INP, name + ".sylq")) as f:
+        NVARS_Q[name] = int(f.readline())
+
+# (results label, config label, runner mode, thread count). One runner
+# binary serves every config; the thread count goes to the runner's third
+# argument and to RAYON_NUM_THREADS. A certified config runs
+# `groebner_basis_certified` on its own backend and is its own row in the
+# results, not a variant of "default".
 SYLV_CONFIGS = [
     ("sylvester-f4", "default", "f4", 1),
     ("sylvester-f4", "threads8", "f4", 8),
@@ -201,6 +252,10 @@ def text_polys_to_dicts(poly_exprs, nvars):
     return [canon.parse_full_poly(expr, nvars, P) for expr in poly_exprs]
 
 
+def text_polys_to_dicts_q(poly_exprs, nvars):
+    return [canon.parse_full_poly_q(expr, nvars) for expr in poly_exprs]
+
+
 def missing_basis(cmd, out, err):
     """An ERROR cell for a finisher whose full basis did not parse.
 
@@ -215,6 +270,18 @@ def basis_json(poly_dicts):
     """canon.canon_basis(...) as plain nested lists, for JSON storage."""
     canonical = canon.canon_basis(poly_dicts, P)
     return [[[list(e), c] for e, c in poly] for poly in canonical]
+
+
+def basis_json_q(poly_dicts):
+    """canon.canon_basis_q(...) as plain nested lists, for JSON storage.
+
+    A Fraction coefficient serializes as its [numerator, denominator]
+    pair, since JSON has no exact rational number of its own.
+    """
+    canonical = canon.canon_basis_q(poly_dicts)
+    return [
+        [[list(e), [c.numerator, c.denominator]] for e, c in poly] for poly in canonical
+    ]
 
 
 def lms_from_dicts(poly_dicts):
@@ -427,8 +494,197 @@ def run_sylvester(name, mode, threads):
     return result
 
 
-# Field names of `sylvester::F4Counters`, plus `ComputeReport::threads_used`.
-# A key stays null when the engine does not report it.
+def run_singular_q(name):
+    """Like run_singular, over Q. gen.py's rational .sing script runs
+    `simplify(std(I), 1)`, not `option(redSB)` alone: see canon.py's
+    module docstring for why that step is needed over Q and not over
+    F_p."""
+    cmd = ["Singular", "-q", os.path.join(INP, name + ".sing")]
+    _rc, out, err, _wall, killed = run_proc(cmd, PROC_TIMEOUT)
+    if killed:
+        return {"status": "DNF", "cmd": cmd}
+    parsed = parse_marked_output(out, "TIME_MS")
+    if parsed["t"] is None or parsed["size"] is None:
+        return {"status": "ERROR", "detail": (out + err)[-500:], "cmd": cmd}
+    t = parsed["t"] / 1000.0
+    if t > TIMEOUT:
+        return {"status": "DNF", "cmd": cmd}
+    nvars = NVARS_Q[name]
+    poly_dicts = text_polys_to_dicts_q(parsed["polys"], nvars)
+    if not poly_dicts:
+        return missing_basis(cmd, out, err)
+    return {
+        "status": "OK",
+        "seconds": t,
+        "size": parsed["size"],
+        "lms": [parse_mono(s, nvars) for s in parsed["lms"]],
+        "basis": basis_json_q(poly_dicts),
+        "cmd": cmd,
+    }
+
+
+def run_msolve_q(name):
+    """One `msolve -g 2` call over Q, both for correctness and for the
+    timing recorded in the main table. There is no rational counterpart
+    of runner/msolve/msolve_inproc.c (it calls core_msolve for the
+    prime-field ABI), so this times the CLI process directly: the
+    per-process startup cost documented at the top of this file for the
+    prime-field msolve cells is not subtracted here. Rational timings are
+    reported, not gated (docs/rational-design.md section 1.2), which is what
+    makes that acceptable.
+    """
+    outfile = os.path.join(OUT, name + ".msout")
+    cmd = [
+        "msolve",
+        "-t",
+        "1",
+        "-g",
+        "2",
+        "-f",
+        os.path.join(INP, name + ".ms"),
+        "-o",
+        outfile,
+    ]
+    rc, out, err, wall, killed = run_proc(cmd, TIMEOUT + 10)
+    if killed:
+        return {"status": "DNF", "cmd": cmd}
+    if rc != 0:
+        return {"status": "ERROR", "detail": (out + err)[-500:], "cmd": cmd}
+    if wall > TIMEOUT:
+        return {"status": "DNF", "cmd": cmd}
+    with open(outfile) as f:
+        text = f.read()
+    body = "".join(line for line in text.splitlines() if not line.startswith("#"))
+    body = body.strip().rstrip(":").strip()
+    body = body.removeprefix("[").removesuffix("]")
+    poly_exprs = [p for p in body.split(",") if p.strip()]
+    nvars = NVARS_Q[name]
+    poly_dicts = text_polys_to_dicts_q(poly_exprs, nvars)
+    if not poly_dicts:
+        return {"status": "ERROR", "detail": "empty basis parse", "cmd": cmd}
+    return {
+        "status": "OK",
+        "seconds": wall,
+        "size": len(poly_dicts),
+        "lms": lms_from_dicts(poly_dicts),
+        "basis": basis_json_q(poly_dicts),
+        "cmd": cmd,
+    }
+
+
+def run_julia_q(name):
+    """Like run_julia_all, over Q: the same warmup-plus-3-timed-runs
+    protocol, against gen.py's `QQ`-ring `.jl` script."""
+    cmd = ["julia", "-t", "1", os.path.join(INP, name + ".jl")]
+    _rc, out, err, _wall, killed = run_proc(cmd, JULIA_PROC_TIMEOUT)
+    runs = [
+        float(line.split()[1]) for line in out.splitlines() if line.startswith("RUN ")
+    ]
+    if killed or "TIMEOUT" in out or (runs and max(runs) > TIMEOUT):
+        return {"status": "DNF", "cmd": cmd}
+    if not runs:
+        return {"status": "ERROR", "detail": (out + err)[-500:], "cmd": cmd}
+    parsed = parse_marked_output(out, "TIME_S")
+    if parsed["size"] is None:
+        return {"status": "ERROR", "detail": (out + err)[-500:], "cmd": cmd}
+    nvars = NVARS_Q[name]
+    poly_dicts = text_polys_to_dicts_q(parsed["polys"], nvars)
+    if not poly_dicts:
+        return missing_basis(cmd, out, err)
+    return {
+        "status": "OK",
+        "seconds": statistics.median(runs),
+        "runs": len(runs),
+        "size": parsed["size"],
+        "lms": [parse_mono(s, nvars) for s in parsed["lms"]],
+        "basis": basis_json_q(poly_dicts),
+        "cmd": cmd,
+    }
+
+
+def parse_sylv_polys_q(stdout):
+    """sylv-runner's rational "POLY <n>" blocks: n lines of
+    "numerator/denominator e1 ... en" each, an integer numerator alone
+    when the denominator is 1. Returns a list of poly dicts (exponent
+    tuple -> Fraction), the rational counterpart of parse_sylv_polys.
+    """
+    lines = stdout.splitlines()
+    polys = []
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        if line.startswith("POLY "):
+            n = int(line.split()[1])
+            terms = []
+            for j in range(1, n + 1):
+                parts = lines[i + j].split()
+                numerator, _, denominator = parts[0].partition("/")
+                coeff = Fraction(int(numerator), int(denominator) if denominator else 1)
+                exps = tuple(int(e) for e in parts[1:])
+                terms.append((coeff, exps))
+            polys.append(canon.poly_from_terms_q(terms))
+            i += n + 1
+        else:
+            i += 1
+    return polys
+
+
+def parse_lift(stdout):
+    """The runner's "LIFT <key>=<value> ..." line as a dict: the fields of
+    `sylvester::ModularLift`, `established` as the string `sylv-runner`
+    prints (`unchanged` or `contains_input`) and every other field as an
+    int. `None` when the run printed no such line (an error or a
+    timeout).
+    """
+    for line in stdout.splitlines():
+        if line.startswith("LIFT "):
+            lift = {}
+            for field in line.split()[1:]:
+                key, _, value = field.partition("=")
+                lift[key] = int(value) if re.match(r"^\d+$", value) else value
+            return lift
+    return None
+
+
+def run_sylvester_q(name, threads):
+    """The rational sylv-runner config: `f4` over Q through
+    `RationalOptions::new()`, at one thread (README.md's "Rational
+    protocol" section says why the rational cells run sylvester's own
+    computation at one thread rather than the prime-field default of the
+    calling machine's pool)."""
+    binpath = os.path.join(HERE, "runner", "bin", "sylv-runner")
+    cmd = [binpath, os.path.join(INP, name + ".sylq"), "rational", str(threads), "0"]
+    _rc, out, err, _wall, killed = run_proc(
+        cmd, PROC_TIMEOUT, extra_env={"RAYON_NUM_THREADS": str(threads)}
+    )
+    if killed or "STATUS TIMEOUT" in out:
+        return {"status": "DNF", "cmd": cmd}
+    parsed = parse_marked_output(out, "TIME_S")
+    if parsed["t"] is None or parsed["size"] is None:
+        return {"status": "ERROR", "detail": (out + err)[-500:], "cmd": cmd}
+    if parsed["t"] > TIMEOUT:
+        return {"status": "DNF", "cmd": cmd}
+    poly_dicts = parse_sylv_polys_q(out)
+    if not poly_dicts:
+        return missing_basis(cmd, out, err)
+    return {
+        "status": "OK",
+        "seconds": parsed["t"],
+        "size": parsed["size"],
+        "lms": [[int(e) for e in s.split()] for s in parsed["lms"]],
+        "basis": basis_json_q(poly_dicts),
+        "peak_rss_kb": parsed["peak_rss_kb"],
+        "lift": parse_lift(out),
+        "cmd": cmd,
+    }
+
+
+#: The engine counters section 8.6 of docs/f4-design.md asks for. The
+#: keys are the field names of `sylvester::F4Counters`, plus the
+#: `threads_used` field of `sylvester::ComputeReport`, which the runner
+#: prints on its COUNTERS line. A key stays null for a cell whose engine
+#: does not report it: the classic backend reports no counter, and no
+#: external tool reports any.
 RESERVED_COUNTERS = [
     "pairs_generated",
     "pairs_discarded_product",
@@ -596,7 +852,7 @@ def msolve_cell(name):
 
 
 def portable_command(command):
-    """Remove machine-specific directory names from a stored command."""
+    """Remove machine-specific directories from a stored command."""
     portable = []
     for argument in command:
         if not isinstance(argument, str) or not os.path.isabs(argument):
@@ -614,7 +870,7 @@ def portable_command(command):
 
 
 def save_results(results):
-    """Write the resumable record."""
+    """Write the resumable record without machine-specific paths."""
     for cell in results.values():
         if isinstance(cell, dict) and isinstance(cell.get("cmd"), list):
             cell["cmd"] = portable_command(cell["cmd"])
@@ -622,17 +878,73 @@ def save_results(results):
         json.dump(results, file, indent=1)
 
 
-def load_results():
-    """Load an existing record, or start an empty one."""
+def run_family_tools(results, families, tools):
+    """Run every (instance, tool) cell of `families` x `tools` not already
+    in `results`, writing `results` after each one. Shared by the
+    prime-field cells and the rational cells: only the family and tool
+    lists differ between the two calls in main().
+    """
+    for members in families.values():
+        for toolname, cfg, fn in tools:
+            key_dead = False
+            for name in members:
+                cell_key = f"{name}|{toolname}|{cfg}"
+                if cell_key in results:
+                    if results[cell_key]["status"] in ("DNF", "SKIP"):
+                        key_dead = True
+                    continue
+                if key_dead:
+                    results[cell_key] = {
+                        "status": "SKIP",
+                        "detail": "smaller instance in family DNF",
+                    }
+                else:
+                    print(f"RUNNING {cell_key}", flush=True)
+                    t0 = time.monotonic()
+                    res = fn(name)
+                    if res.get("status") == "DNF" and LAST_OOM[0]:
+                        res["status"] = "OOM"
+                        res["detail"] = f"killed by the kernel at MemoryMax={MEMMAX}"
+                    res["cell_wall_s"] = round(time.monotonic() - t0, 3)
+                    res["cores"] = CORES
+                    if "lms" in res and res["lms"] is not None:
+                        res["lms"] = [list(t) for t in canon_lms(res["lms"])]
+                    results[cell_key] = res
+                    print(
+                        f"  -> {res['status']} "
+                        f"{res.get('seconds', '')} size={res.get('size', '')}",
+                        flush=True,
+                    )
+                    if res["status"] in ("DNF", "OOM"):
+                        key_dead = True
+                save_results(results)
+
+
+def tools_with_a_rational_cell(results, instances, tools):
+    """The tools of `tools` that produced at least one rational cell.
+
+    `tools` is one (tool, config) pair per cell column, and `instances`
+    the rational instance names. A tool produced a cell when one of its
+    cells finished with status OK. A tool that is on PATH and ran nothing
+    leaves no such cell, and a version string alone does not make one.
+    """
+    return [
+        tool
+        for tool, cfg in tools
+        if any(
+            (results.get(f"{name}|{tool}|{cfg}") or {}).get("status") == "OK"
+            for name in instances
+        )
+    ]
+
+
+def main():
     os.makedirs(OUT, exist_ok=True)
-    if not os.path.exists(RESULTS_PATH):
-        return {}
-    with open(RESULTS_PATH) as file:
-        return json.load(file)
+    results = {}
+    if os.path.exists(RESULTS_PATH):
+        with open(RESULTS_PATH) as f:
+            results = json.load(f)
 
-
-def update_metadata(results):
-    """Record the tools and limits used by this run."""
     meta = results.setdefault("_meta", {})
     meta["versions"] = collect_versions()
     meta["cores"] = CORES
@@ -640,77 +952,45 @@ def update_metadata(results):
     meta["p"] = P
     save_results(results)
 
-
-def configured_tools():
-    """Return every tool and configuration in record order."""
-    tools = [
-        ("singular", "-", lambda name: median_cell(run_singular, name)),
-        ("msolve", "-", msolve_cell),
-        ("m2", "-", lambda name: median_cell(run_m2, name)),
-        ("groebner.jl", "-", run_julia_all),
-    ]
+    tools = []
+    tools.append(("singular", "-", lambda n: median_cell(run_singular, n)))
+    tools.append(("msolve", "-", msolve_cell))
+    tools.append(("m2", "-", lambda n: median_cell(run_m2, n)))
+    tools.append(("groebner.jl", "-", run_julia_all))
     for tool, cfg, mode, threads in SYLV_CONFIGS:
         tools.append(
             (
                 tool,
                 cfg,
-                lambda name, selected_mode=mode, selected_threads=threads: median_cell(
-                    lambda instance: run_sylvester(
-                        instance, selected_mode, selected_threads
-                    ),
-                    name,
+                lambda n, m=mode, t=threads: median_cell(
+                    lambda nn: run_sylvester(nn, m, t), n
                 ),
             )
         )
-    return tools
+    run_family_tools(results, FAMILIES, tools)
 
+    rational_tools = [
+        ("singular", "-", lambda n: median_cell(run_singular_q, n)),
+        ("msolve", "-", lambda n: median_cell(run_msolve_q, n)),
+        ("groebner.jl", "-", run_julia_q),
+        (
+            "sylvester",
+            "rational",
+            lambda n: median_cell(lambda nn: run_sylvester_q(nn, 1), n),
+        ),
+    ]
+    run_family_tools(results, RATIONAL_FAMILIES, rational_tools)
 
-def run_cell(name, fn):
-    """Run and normalize one new result cell."""
-    print(f"RUNNING {name}", flush=True)
-    started = time.monotonic()
-    cell = fn(name.split("|", 1)[0])
-    if cell.get("status") == "DNF" and LAST_OOM[0]:
-        cell["status"] = "OOM"
-        cell["detail"] = f"killed by the kernel at MemoryMax={MEMMAX}"
-    cell["cell_wall_s"] = round(time.monotonic() - started, 3)
-    cell["cores"] = CORES
-    leading = cell.get("lms")
-    if leading is not None:
-        cell["lms"] = [list(term) for term in canon_lms(leading)]
-    print(
-        f"  -> {cell['status']} {cell.get('seconds', '')} size={cell.get('size', '')}",
-        flush=True,
+    # Which reference tools produced a rational cell, for report.py's
+    # _meta note (docs/rational-design.md section 11.4 asks the record to say
+    # rather than assume this). The list reads the recorded cells: a
+    # version string says the tool is on PATH, not that it ran a cell
+    # here.
+    meta["rational_tools"] = tools_with_a_rational_cell(
+        results, RATIONAL_INSTANCES, [(tool, cfg) for tool, cfg, _ in rational_tools]
     )
-    return cell
+    save_results(results)
 
-
-def run_family(results, members, tool, config, fn):
-    """Run one tool through one monotone instance family."""
-    stopped = False
-    for name in members:
-        key = f"{name}|{tool}|{config}"
-        if key in results:
-            stopped = stopped or results[key]["status"] in ("DNF", "OOM", "SKIP")
-            continue
-        if stopped:
-            results[key] = {
-                "status": "SKIP",
-                "detail": "a smaller family member did not finish",
-            }
-        else:
-            results[key] = run_cell(key, fn)
-            stopped = results[key]["status"] in ("DNF", "OOM")
-        save_results(results)
-
-
-def main():
-    """Run or resume the complete benchmark matrix."""
-    results = load_results()
-    update_metadata(results)
-    for members in FAMILIES.values():
-        for tool, config, fn in configured_tools():
-            run_family(results, members, tool, config, fn)
     print("ALL DONE", flush=True)
 
 

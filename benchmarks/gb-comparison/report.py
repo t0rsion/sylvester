@@ -7,7 +7,16 @@ import os
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 RESULTS_PATH = os.environ.get("GBBENCH_RESULTS", os.path.join(HERE, "results.json"))
-RESULTS_CSV = os.environ.get("GBBENCH_RESULTS_CSV", os.path.join(HERE, "results.csv"))
+
+
+def results_csv_path(results_path, override=None):
+    """Return the CSV path paired with one JSON record."""
+    if override is not None:
+        return override
+    return os.path.splitext(results_path)[0] + ".csv"
+
+
+RESULTS_CSV = results_csv_path(RESULTS_PATH, os.environ.get("GBBENCH_RESULTS_CSV"))
 
 FAMILIES = {
     "cyclic": [f"cyclic-{n}" for n in range(4, 9)],
@@ -16,6 +25,22 @@ FAMILIES = {
     "noon": [f"noon-{n}" for n in range(3, 7)],
 }
 INSTANCES = [instance for family in FAMILIES.values() for instance in family]
+
+# The rational cells (docs/rational-design.md section 11.4): the same families
+# gen.py's rational sizes, matching driver.py's RATIONAL_FAMILIES.
+RATIONAL_FAMILIES = {
+    "cyclic": [f"cyclic-{n}-q" for n in (4, 5, 6)],
+    "katsura": [f"katsura-{n}-q" for n in (4, 5, 6, 7)],
+    "eco": [f"eco-{n}-q" for n in (8, 9)],
+    "noon": [f"noon-{n}-q" for n in (3, 4, 5)],
+}
+RATIONAL_INSTANCES = [i for fam in RATIONAL_FAMILIES.values() for i in fam]
+RATIONAL_TOOLS = [
+    ("singular", "-"),
+    ("msolve", "-"),
+    ("groebner.jl", "-"),
+    ("sylvester", "rational"),
+]
 
 TOOLS = [
     ("singular", "-"),
@@ -68,6 +93,27 @@ def markdown_table(header, rows):
         print("| " + " | ".join(map(str, row)) + " |")
 
 
+def rational_agreement(cells):
+    """The full basis agreement of one rational instance.
+
+    `cells` is one (label, basis) pair per tool that finished, with
+    `basis` None when the harness parsed no full output from it. A
+    comparison takes two parsed full outputs, so fewer is
+    "NO COMPARISON" and never agreement.
+
+    Returns the status and the (reference, other) label pairs that
+    disagree.
+    """
+    with_basis = [(label, basis) for label, basis in cells if basis is not None]
+    if len(with_basis) < 2:
+        return "NO COMPARISON", []
+    ref_label, ref_basis = with_basis[0]
+    mismatched = [
+        (ref_label, label) for label, basis in with_basis[1:] if basis != ref_basis
+    ]
+    return ("MISMATCH" if mismatched else "AGREE"), mismatched
+
+
 def csv_row(name, tool, config, cell):
     """Flatten one result cell."""
     spread = cell.get("spread_s") or [None, None]
@@ -107,11 +153,15 @@ def write_csv(results):
     with open(RESULTS_CSV, "w", newline="") as file:
         writer = csv.writer(file)
         writer.writerow(header)
-        for name in INSTANCES:
-            for tool, config in TOOLS:
-                cell = result(results, name, tool, config)
-                if cell is not None:
-                    writer.writerow(csv_row(name, tool, config, cell))
+        for instances, tools in (
+            (INSTANCES, TOOLS),
+            (RATIONAL_INSTANCES, RATIONAL_TOOLS),
+        ):
+            for name in instances:
+                for tool, config in tools:
+                    cell = result(results, name, tool, config)
+                    if cell is not None:
+                        writer.writerow(csv_row(name, tool, config, cell))
 
 
 def finishers(results, name):
@@ -340,7 +390,7 @@ def report_gate(results):
         rows.append(row)
         if ratio is not None:
             ratios.append(ratio)
-    print("\n== GATE (docs/v0.2-design.md section 14): sylvester F4 vs msolve ==")
+    print("\n== GATE (docs/f4-design.md section 14): sylvester F4 vs msolve ==")
     markdown_table(
         ["cell", "sylvester raw", "sylvester (s)", "msolve (s)", "ratio"], rows
     )
@@ -355,6 +405,76 @@ def report_gate(results):
     print(f"gate: {'PASS' if passed else 'FAIL'}")
 
 
+def report_rational_tools(meta):
+    """Print which rational reference tools produced a cell."""
+    print("\n== RATIONAL: WHICH TOOLS PRODUCED A CELL ==")
+    ran = meta.get("rational_tools")
+    if not ran:
+        print("no rational cell finished; run driver.py to fill this in")
+        return
+    print("produced a rational cell: " + ", ".join(ran))
+    missing = [
+        tool for tool in ("singular", "msolve", "groebner.jl") if tool not in ran
+    ]
+    if missing:
+        print("produced no rational cell: " + ", ".join(missing))
+
+
+def report_rational_table(results):
+    """Print rational timings."""
+    print("\n== RATIONAL MAIN TABLE ==")
+    rows = []
+    for name in RATIONAL_INSTANCES:
+        rows.append(
+            [name] + [fmt_time(result(results, name, *tool)) for tool in RATIONAL_TOOLS]
+        )
+    markdown_table(["instance", "Singular", "msolve", "Groebner.jl", "sylvester"], rows)
+
+
+def rational_finishers(results, name):
+    """Return labels and full outputs for completed rational cells."""
+    finished = []
+    for tool, config in RATIONAL_TOOLS:
+        cell = result(results, name, tool, config)
+        if cell and cell["status"] == "OK":
+            label = f"{tool}[{config}]" if config != "-" else tool
+            finished.append((label, cell.get("basis")))
+    return finished
+
+
+def report_rational_correctness(results):
+    """Check and print exact rational-basis agreement."""
+    print("\n== RATIONAL CORRECTNESS TABLE ==")
+    print("Full canonical basis agreement only (docs/rational-design.md 1.2):")
+    print("exact fractions, monic, coefficients included, not only leading")
+    print("monomials or basis size. canon.py's `_q` functions build this")
+    print("form once, the same way for every tool.\n")
+    q_full_mismatches = []
+    q_rows = []
+    compared = 0
+    for name in RATIONAL_INSTANCES:
+        finished = rational_finishers(results, name)
+        outputs = len([basis for _, basis in finished if basis is not None])
+        status, mismatched = rational_agreement(finished)
+        if status != "NO COMPARISON":
+            compared += 1
+        q_full_mismatches += [(name, ref, other) for ref, other in mismatched]
+        print(f"{name}: {len(finished)} finishers, {outputs} full outputs, {status}")
+        q_rows.append((name, len(finished), status))
+    if q_full_mismatches:
+        print("\nRATIONAL FULL BASIS MISMATCH DETAILS:")
+        for m in q_full_mismatches:
+            print(m)
+    elif compared:
+        print(f"\nThe {compared} rational cells with two or more full outputs agree")
+        print("on the full canonical basis, coefficients included.")
+    elif RATIONAL_INSTANCES:
+        print("\nNo comparison: no rational cell holds two full outputs.")
+
+    print("\n== RATIONAL CORRECTNESS TABLE (markdown) ==")
+    markdown_table(["instance", "finishers", "full basis agreement"], q_rows)
+
+
 def main():
     """Generate every report view."""
     with open(RESULTS_PATH) as file:
@@ -367,6 +487,9 @@ def main():
     report_basis_sizes(results)
     report_versions(results.get("_meta", {}))
     report_gate(results)
+    report_rational_tools(results.get("_meta", {}))
+    report_rational_table(results)
+    report_rational_correctness(results)
 
 
 if __name__ == "__main__":

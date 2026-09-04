@@ -1,0 +1,5 @@
+# vars: x, y, z
+# modulus: 32003
+z^3 + 32002
+y^2 + y*z + z^2
+x + y + z

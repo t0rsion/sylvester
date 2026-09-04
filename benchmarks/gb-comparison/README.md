@@ -1,8 +1,11 @@
 # Gröbner basis comparison
 
-This harness compares sylvester with Singular, msolve, Macaulay2, and
-Groebner.jl. It records timings and complete reduced bases over
-\(\mathbb F_{1073741827}\) under grevlex.
+Timings and full-output cross-checks for sylvester against Singular, msolve,
+Macaulay2, and Groebner.jl, on cyclic-4..8, katsura-4..10, eco-8..11, and
+noon-3..6 over F_1073741827 under grevlex. A smaller rational cell set,
+against Singular, msolve, and Groebner.jl (no Macaulay2) over `Q`, checks
+sylvester's multimodular engine the same way; see "Rational protocol"
+below.
 
 The families are:
 
@@ -40,8 +43,13 @@ zstd -19 --long=27 -T8 results.json -o results.json.zst
 restart it without losing completed work. Stored commands use paths relative to
 this directory. They contain no machine-specific directory names.
 
-Required commands are `Singular`, `msolve`, `M2`, and `julia`. Groebner.jl must
-exist in the Julia environment. A missing tool fails only its own cells.
+- `GBBENCH_INSTANCES=cyclic-4,katsura-5` restricts `driver.py` to that
+  comma-separated instance list.
+- `GBBENCH_RESULTS=/path/to/file.json` points `driver.py` (and `report.py`,
+  which reads the same variable) at a results file other than
+  `results.json`. `report.py` writes the CSV next to that file. A smoke
+  run therefore does not touch the real record.
+- `GBBENCH_RESULTS_CSV=/path/to/file.csv` overrides the CSV path alone.
 
 Use these variables for a smoke run:
 
@@ -98,8 +106,104 @@ One untimed `msolve -t 1 -g 2` call supplies the complete basis. Its process
 wall time is not a timing cell.
 
 `runner/bin/msolve-inproc` supplies timing. It links against `libmsolve` and
-calls `core_msolve`. It performs at least 3 and at most 5,000 repetitions until
-the timing window is full.
+calls `core_msolve`. It repeats the call until a 0.5 s time budget is met,
+with at least 3 repetitions and at most 5000.
+
+## Rational protocol
+
+The rational cells (docs/rational-design.md sections 1.2 and 11.4) compare
+sylvester's multimodular engine against Singular, msolve, and Groebner.jl
+over `Q`, on the same four families at smaller sizes: cyclic-4..6,
+katsura-4..7, noon-3..5, eco-8..9. Coefficient growth, not monomial count,
+drives cost over `Q`, so these sizes are the ones where the reference
+tools return in seconds; `gen.py` builds only these instances into
+rational input files, distinct from the prime-field ones of the same
+family and size. M2 is not part of the rational cells: `gen.py` writes no
+`.m2` file for a rational instance, because Macaulay2 is not one of the
+three reference implementations `docs/rational-design.md` section 1.4 names
+for the rational design.
+
+There is no gate on the rational cells. What is checked is that every
+tool that ran agrees on the full canonical rational basis: exact
+fractions, monic, sorted grevlex descending, sorted basis, the rational
+counterpart of the prime-field full-output comparison above. Timing is
+recorded for the main table, not gated (docs/rational-design.md 1.2), because
+the per-prime cost the record shows is not the pipeline the design
+intends: the learn-and-apply cross-prime trace of section 3.9 is later
+work.
+
+**Input files.** Four formats per rational instance, all under `inputs/`,
+named `<instance>-q.<ext>`: `.ms` (msolve, characteristic line `0`),
+`.sing` (Singular, `ring r = 0,(...),dp;`), `.jl` (Groebner.jl over `QQ`),
+and `.sylq` (sylvester). `.sylq` is a separate extension from the
+prime-field `.syl` format rather than a characteristic line added to
+`.syl` itself, because `.syl` carries no ring at all (the domain comes
+from `sylv-runner`'s own mode argument) and every existing `.syl` file
+and its parsing in `runner/src/main.rs` stay untouched. `.sylq` is
+otherwise identical to `.syl`, line for line and term for term, with the
+coefficient field of a term also accepting `numerator/denominator`. The
+family generators in `gen.py` write integers only. `sylv-runner` reads
+the wider grammar (`docs/rational-design.md` section 8.3).
+
+**Reference tool invocations, confirmed against the installed versions.**
+msolve 0.10.1 emits a lifted rational basis with `-g 2` when the
+characteristic line of the `.ms` file is `0`: content-cleared (every
+denominator cleared, then the integer coefficients divided by their gcd),
+not normalized to monic. Singular 4.4.1's `option(redSB)` alone
+content-clears over `Q` too, unlike over `F_p`, where it is already
+monic because every nonzero residue there has an inverse Singular
+applies; reaching a monic basis over `Q` needs
+`simplify(std(I), 1)` after it, which `gen.py`'s rational `.sing` script
+runs. Groebner.jl 0.10.3's `groebner(sys, ordering=DegRevLex())` over
+`QQ` returns a monic basis with no extra step. `canon.py`'s `monic_q`
+divides every basis by its own leading coefficient, so all four tools'
+output is compared under the same normalization.
+
+**sylvester's rational run.** `sylv-runner`'s `rational` mode calls
+`Ideal::<Rationals>::groebner_basis_with_report` with
+`RationalOptions::new()` (the default stopping rule,
+`RationalStop::Unchanged { extra: 2 }`) and prints the basis with exact
+`numerator/denominator` coefficients, already monic and already sorted.
+It also prints a
+`LIFT` line: the fields of `sylvester::ModularLift` (primes consumed,
+skipped, folded, and discarded, the confirming-prime count, the modulus
+bit length, and `established`), which `driver.py` stores under the
+cell's `"lift"` key.
+
+Threads are 1 everywhere in this protocol, sylvester included: msolve
+`-t 1`, Julia `-t 1`, and sylvester `ComputeOptions::threads(1)`. For the
+prime-field cells that setting keeps the F4 kernel's row-reduction pool
+at one worker; for the rational cells it does that and also caps
+`RationalOptions`' outer concurrency, so the multimodular driver runs one
+prime at a time rather than starting several prime runs at once. There is
+no rational counterpart of the `f4/threads8` config: measuring
+concurrent prime runs is future work, not this record.
+
+**msolve's rational timing** is a CLI wall clock around `msolve -g 2`.
+The prime-field cells use `msolve-inproc`, which calls `core_msolve`
+directly. There is no rational counterpart of `msolve_inproc.c`, so the
+rational msolve column includes process startup.
+
+**Smoke run.** `GBBENCH_INSTANCES` restricts the rational families the
+same way it restricts the prime-field ones, by the `-q` names:
+
+```
+GBBENCH_INSTANCES=cyclic-4-q,katsura-4-q GBBENCH_RESULTS=/tmp/smoke.json \
+    taskset -c 0-3,12-15 python3 driver.py
+```
+
+`report.py`'s `"== RATIONAL: WHICH TOOLS PRODUCED A CELL =="` section
+prints which tools finished at least one rational cell, from
+`results.json`'s `"_meta"` key (`"rational_tools"`), which `driver.py`
+writes after the rational cells run. It reads the cells and not the
+version strings: a tool on `PATH` that ran nothing here is not listed.
+
+The rational correctness table compares full canonical bases, and a
+comparison takes two of them. A cell with fewer than two parsed full
+outputs reads `NO COMPARISON`, and the agreement line at the end counts
+only the cells that were compared.
+
+## Rebaseline support
 
 The installed `core_msolve` print path omits cleanup because the command-line
 program exits after printing. The runner forks one child per repetition. The
@@ -110,7 +214,15 @@ allocations.
 Rebuild it after an msolve update. The `core_msolve` signature changes across
 releases.
 
-## Threads
+Five rows per instance, from one runner binary. The runner takes one mode:
+`f4`, `classic`, `certified`, `f4-certified`, or `rational`
+(see "Rational protocol"), and a thread count.
+`f4/default` and `classic/default` are the raw one-thread configurations,
+and the gate in docs/f4-design.md 1.1 applies to `f4/default`.
+`f4/threads8` is `f4` on 8 threads. `classic/certified` runs
+`groebner_basis_certified` on the classic backend, which writes a
+`sylv-gb-cert-v1` certificate, and `f4/certified` runs the same call on the
+F4 backend, which writes a `sylv-gb-cert-v2` certificate.
 
 The gate uses one thread:
 
@@ -175,7 +287,7 @@ and `noon-6`. It requires:
 \max(t_{\mathrm{F4}}/t_{\mathrm{msolve}})\le10.
 \]
 
-See section 14 of `docs/v0.2-design.md`. `report.py` computes the ratios from
+See section 14 of `docs/f4-design.md`. `report.py` computes the ratios from
 the recorded cells.
 
 ## Files

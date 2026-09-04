@@ -1,21 +1,21 @@
 //! Cofactor vectors over the canonical input.
 //!
-//! An origin holds one cofactor per input polynomial. For a value `g` that
-//! the engines carry, the origin `c` states the identity
+//! An origin holds one cofactor per input polynomial. For a value `g` the
+//! engines carry, the origin `c` states the identity
 //!
 //! ```text
 //! g = sum_i c_i * f_i
 //! ```
 //!
-//! over the canonical input F. The engines keep the identity through every
-//! step they take, so [`super::assemble`] writes origins that the engine
-//! derived, never origins recomputed after the fact. Every function here
-//! updates an origin by the same scalar and monomial the polynomial step
-//! uses.
+//! over the canonicalized input F. The engines keep the identity through
+//! every step they take, so [`super::assemble`] writes origins that the
+//! engine derived, never origins recomputed after the fact. Every function
+//! here updates an origin by the same scalar and monomial the polynomial
+//! step uses.
 
 use crate::poly::{ExponentOverflow, Monomial, Polynomial};
-use crate::ring::PolynomialRing;
 use crate::ring::field::Felt;
+use crate::ring::{PolynomialRing, PrimeOps};
 
 /// One cofactor per input polynomial.
 pub(crate) type Origin = Vec<Polynomial>;
@@ -33,24 +33,18 @@ pub(crate) fn unit(ring: &PolynomialRing, index: usize, count: usize) -> Origin 
 ///
 /// This is the origin step that matches subtracting `coeff * mono * g`
 /// from a work polynomial, where `source` is the origin of `g`.
-///
-/// A cofactor's degree grows with every step and no polynomial lead bounds
-/// it, so a product can leave the width one exponent holds. That is
-/// [`ExponentOverflow`], and the engine reports it as
-/// [`crate::compute::ComputeError::DegreeLimit`]. The origin is left
-/// partly updated, so the caller must drop it.
 pub(crate) fn sub_scaled(
     target: &mut Origin,
     source: &Origin,
     coeff: Felt,
     mono: &Monomial,
-    p: u64,
+    ops: &PrimeOps,
 ) -> Result<(), ExponentOverflow> {
     for (slot, cofactor) in target.iter_mut().zip(source) {
         if cofactor.is_zero() {
             continue;
         }
-        *slot = slot.sub_scaled(cofactor, coeff, mono, p)?;
+        *slot = slot.sub_scaled_checked(cofactor, &coeff, mono, ops)?;
     }
     Ok(())
 }
@@ -58,8 +52,7 @@ pub(crate) fn sub_scaled(
 /// Return `left_coeff * left_mono * left - right_coeff * right_mono * right`.
 ///
 /// This is the origin step that matches forming an S-polynomial from two
-/// term-multiplied parents. A product past the width one exponent holds is
-/// [`ExponentOverflow`], as in [`sub_scaled`].
+/// term-multiplied parents.
 pub(crate) fn combine(
     left: &Origin,
     left_coeff: Felt,
@@ -67,28 +60,28 @@ pub(crate) fn combine(
     right: &Origin,
     right_coeff: Felt,
     right_mono: &Monomial,
-    p: u64,
+    ops: &PrimeOps,
 ) -> Result<Origin, ExponentOverflow> {
-    left.iter()
-        .zip(right)
-        .map(|(a, b)| {
-            let scaled = a.scale_monomial(left_coeff, left_mono, p)?;
-            Ok(scaled.sub(&b.scale_monomial(right_coeff, right_mono, p)?, p))
-        })
-        .collect()
+    let mut out = Vec::with_capacity(left.len());
+    for (a, b) in left.iter().zip(right) {
+        let scaled = a.scale_monomial_checked(&left_coeff, left_mono, ops)?;
+        let other = b.scale_monomial_checked(&right_coeff, right_mono, ops)?;
+        out.push(scaled.sub(&other, ops));
+    }
+    Ok(out)
 }
 
 /// Multiply every cofactor by `coeff`.
 ///
 /// `coeff` must be nonzero, so no term drops out and the term order holds.
-pub(crate) fn scale(target: &mut Origin, coeff: Felt, p: u64) {
+pub(crate) fn scale(target: &mut Origin, coeff: Felt, ops: &PrimeOps) {
     debug_assert!(
         !coeff.is_zero(),
         "scaling an origin by zero loses the identity"
     );
     for cofactor in target.iter_mut() {
         for term in &mut cofactor.terms {
-            term.coeff = term.coeff.mul(coeff, p);
+            term.coeff = term.coeff.mul(coeff, ops.modulus());
         }
     }
 }
@@ -97,28 +90,30 @@ pub(crate) fn scale(target: &mut Origin, coeff: Felt, p: u64) {
 ///
 /// Returns the monic polynomial. The zero polynomial has no leading
 /// coefficient, so it leaves the origin alone.
-pub(crate) fn make_monic(poly: &Polynomial, target: &mut Origin, p: u64) -> Polynomial {
+pub(crate) fn make_monic(poly: &Polynomial, target: &mut Origin, ops: &PrimeOps) -> Polynomial {
     if let Some(lc) = poly.lc() {
-        scale(target, lc.inv(p), p);
+        scale(target, lc.inv(ops.modulus()), ops);
     }
-    poly.make_monic(p)
+    poly.make_monic(ops)
 }
 
 /// Report whether `poly` equals `sum_i c_i * f_i` over the input.
 ///
 /// The engines call this from a `debug_assert`, so the check runs in debug
 /// builds only.
-pub(crate) fn holds(origin: &Origin, input: &[Polynomial], poly: &Polynomial, p: u64) -> bool {
+pub(crate) fn holds(
+    origin: &Origin,
+    input: &[Polynomial],
+    poly: &Polynomial,
+    ops: &PrimeOps,
+) -> bool {
     if origin.len() != input.len() {
         return false;
     }
     let mut sum = poly.zero_like();
     for (cofactor, f) in origin.iter().zip(input) {
         for term in &cofactor.terms {
-            let Ok(scaled) = f.scale_monomial(term.coeff, &term.mono, p) else {
-                return false;
-            };
-            sum = sum.add(&scaled, p);
+            sum = sum.add(&f.scale_monomial(&term.coeff, &term.mono, ops), ops);
         }
     }
     sum == *poly
@@ -145,7 +140,7 @@ mod tests {
         let input = list(&ring, &["x", "y + 3"]);
         for index in 0..input.len() {
             let origin = unit(&ring, index, input.len());
-            assert!(holds(&origin, &input, &input[index], 7));
+            assert!(holds(&origin, &input, &input[index], ring.ops()));
         }
     }
 
@@ -161,12 +156,11 @@ mod tests {
             .clone();
         let coeff = Felt::new(3, 7);
 
-        let expected = input[0]
-            .sub_scaled(&input[1], coeff, &mono, 7)
-            .expect("the product fits");
+        let expected = input[0].sub_scaled(&input[1], &coeff, &mono, ring.ops());
         let mut origin = unit(&ring, 0, 2);
-        sub_scaled(&mut origin, &unit(&ring, 1, 2), coeff, &mono, 7).expect("the product fits");
-        assert!(holds(&origin, &input, &expected, 7));
+        sub_scaled(&mut origin, &unit(&ring, 1, 2), coeff, &mono, ring.ops())
+            .expect("the product fits");
+        assert!(holds(&origin, &input, &expected, ring.ops()));
     }
 
     #[test]
@@ -188,13 +182,10 @@ mod tests {
         let (left_coeff, right_coeff) = (Felt::new(2, 7), Felt::new(5, 7));
 
         let expected = input[0]
-            .scale_monomial(left_coeff, &left_mono, 7)
-            .expect("the product fits")
+            .scale_monomial(&left_coeff, &left_mono, ring.ops())
             .sub(
-                &input[1]
-                    .scale_monomial(right_coeff, &right_mono, 7)
-                    .expect("the product fits"),
-                7,
+                &input[1].scale_monomial(&right_coeff, &right_mono, ring.ops()),
+                ring.ops(),
             );
         let origin = combine(
             &unit(&ring, 0, 2),
@@ -203,10 +194,10 @@ mod tests {
             &unit(&ring, 1, 2),
             right_coeff,
             &right_mono,
-            7,
+            ring.ops(),
         )
-        .expect("the product fits");
-        assert!(holds(&origin, &input, &expected, 7));
+        .expect("the products fit");
+        assert!(holds(&origin, &input, &expected, ring.ops()));
     }
 
     #[test]
@@ -214,15 +205,15 @@ mod tests {
         let ring = ring();
         let input = list(&ring, &["3*x + 2"]);
         let mut origin = unit(&ring, 0, 1);
-        let monic = make_monic(&input[0], &mut origin, 7);
-        assert_eq!(monic.lc(), Some(Felt::one()));
-        assert!(holds(&origin, &input, &monic, 7));
+        let monic = make_monic(&input[0], &mut origin, ring.ops());
+        assert_eq!(monic.lc(), Some(&Felt::one()));
+        assert!(holds(&origin, &input, &monic, ring.ops()));
     }
 
     #[test]
     fn a_wrong_cofactor_fails_the_identity() {
         let ring = ring();
         let input = list(&ring, &["x", "y"]);
-        assert!(!holds(&unit(&ring, 0, 2), &input, &input[1], 7));
+        assert!(!holds(&unit(&ring, 0, 2), &input, &input[1], ring.ops()));
     }
 }

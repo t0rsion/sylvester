@@ -8,12 +8,13 @@
 //! [`crate::compute::groebner_basis_certified`] runs the writer here, then
 //! hands the bytes to the verifier itself.
 //!
-//! [`Recorder`] records one run. [`assemble`] writes one certificate from
-//! the recording, the input, and the basis the run returned.
+//! [`Recorder`] records one run. [`assemble`] then writes one certificate
+//! from the recording, the input, and the basis the run returned. It holds
+//! to the deadline and the memory limit of the run, and it charges the
+//! certificate bytes to that budget before it returns them.
 //!
-//! The engine records the derivation of the basis. The writer generates
-//! the membership traces and the pair witnesses itself, by division over
-//! the final basis.
+//! The writer generates the membership traces and the pair witnesses
+//! itself, by division over the final basis.
 
 mod divide;
 mod encode;
@@ -24,7 +25,7 @@ use crate::certificate::{CertificateCap, CertifyError, EmitterFault, Place, Trac
 use crate::poly::{Monomial, Polynomial};
 use crate::ring::PolynomialRing;
 
-use super::{Budget, check_width};
+use super::{WriterBudget, check_width};
 use divide::{Step, divide};
 use encode::{Parts, Pool};
 use record::{Node, Recording};
@@ -101,8 +102,8 @@ pub(crate) fn assemble(
     validate_parts(input, basis, &recording, nvars)?;
     hold_parts(input, basis, &mut budget)?;
     let trace = prepare_trace(recording, &mut budget)?;
-    let (membership, divisions) = membership_traces(input, basis, modulus, &mut budget)?;
-    let pairs = pair_witnesses(basis, modulus, divisions, &mut budget)?;
+    let (membership, divisions) = membership_traces(input, basis, ring.ops(), &mut budget)?;
+    let pairs = pair_witnesses(basis, ring.ops(), divisions, &mut budget)?;
     write_certificate(
         modulus,
         nvars,
@@ -152,7 +153,7 @@ fn validate_basis(basis: &[Polynomial], nvars: usize) -> Result<(), CertifyError
         if poly.is_zero() {
             return Err(EmitterFault::BasisElementZero { index }.into());
         }
-        if poly.lc() != Some(crate::ring::field::Felt::one()) {
+        if poly.lc() != Some(&crate::ring::field::Felt::one()) {
             return Err(EmitterFault::BasisElementNotMonic { index }.into());
         }
         check_width(poly, Place::Basis(index), nvars)?;
@@ -163,15 +164,18 @@ fn validate_basis(basis: &[Polynomial], nvars: usize) -> Result<(), CertifyError
 fn hold_parts(
     input: &[Polynomial],
     basis: &[Polynomial],
-    budget: &mut Budget,
+    budget: &mut WriterBudget,
 ) -> Result<(), CertifyError> {
-    budget.check_deadline()?;
+    budget.check_stop()?;
     budget.hold_polys(input)?;
     budget.hold_polys(basis)?;
     Ok(())
 }
 
-fn prepare_trace(recording: Recording, budget: &mut Budget) -> Result<PrunedTrace, CertifyError> {
+fn prepare_trace(
+    recording: Recording,
+    budget: &mut WriterBudget,
+) -> Result<PrunedTrace, CertifyError> {
     let keep = reachable(&recording);
     let (kept, steps) = trace_size(&recording.nodes, &keep)?;
     cap(kept, MAX_NODES, CertificateCap::Nodes)?;
@@ -200,14 +204,14 @@ fn trace_size(nodes: &[Node], keep: &[bool]) -> Result<(usize, usize), CertifyEr
 fn membership_traces(
     input: &[Polynomial],
     basis: &[Polynomial],
-    modulus: u64,
-    budget: &mut Budget,
+    ops: &crate::ring::PrimeOps,
+    budget: &mut WriterBudget,
 ) -> Result<(Vec<Vec<Step>>, usize), CertifyError> {
     let mut divisions = 0usize;
     let mut membership = Vec::with_capacity(input.len());
     for (index, poly) in input.iter().enumerate() {
-        budget.check_deadline()?;
-        let Some(trace) = divide(poly, basis, modulus, budget)? else {
+        budget.check_stop()?;
+        let Some(trace) = divide(poly, basis, ops, budget)? else {
             return Err(EmitterFault::InputHasRemainder { input: index }.into());
         };
         divisions = charge_division(&trace, divisions)?;
@@ -219,11 +223,11 @@ fn membership_traces(
 
 fn pair_witnesses(
     basis: &[Polynomial],
-    modulus: u64,
+    ops: &crate::ring::PrimeOps,
     mut divisions: usize,
-    budget: &mut Budget,
+    budget: &mut WriterBudget,
 ) -> Result<Vec<Witness>, CertifyError> {
-    let pairs = witnesses(basis, modulus, budget)?;
+    let pairs = witnesses(basis, ops, budget)?;
     debug_assert_eq!(
         Some(pairs.len()),
         pair_count(basis.len()),
@@ -244,12 +248,12 @@ fn write_certificate(
     trace: &PrunedTrace,
     membership: &[Vec<Step>],
     pairs: &[Witness],
-    budget: &mut Budget,
+    budget: &mut WriterBudget,
 ) -> Result<(Vec<u8>, usize), CertifyError> {
-    budget.check_deadline()?;
+    budget.check_stop()?;
     let pool = Pool::build(monomials(input, &trace.nodes, membership, pairs), budget)?;
 
-    budget.check_deadline()?;
+    budget.check_stop()?;
     let certificate = encode::write(
         &Parts {
             modulus,
@@ -302,8 +306,8 @@ fn reachable(recording: &Recording) -> Vec<bool> {
     keep
 }
 
-/// The byte size of a pruned trace of `kept` nodes, `steps` combination
-/// steps, and `roots` basis roots.
+/// The bytes a pruned trace of `kept` nodes, `steps` combination steps,
+/// and `roots` basis roots holds.
 fn pruned_bytes(kept: usize, steps: usize, roots: usize) -> usize {
     kept.saturating_mul(size_of::<Node>() + size_of::<u32>())
         .saturating_add(steps.saturating_mul(size_of::<(u32, u64)>()))
@@ -313,8 +317,10 @@ fn pruned_bytes(kept: usize, steps: usize, roots: usize) -> usize {
 /// Keep the marked nodes, renumbered from 0.
 ///
 /// `keep` comes from [`reachable`] and `kept` is the number of marks in
-/// it. The use count is the number of references from later nodes and from
-/// the basis section, so every kept node has a count of at least 1.
+/// it. The result holds the nodes in recording order, the node of each
+/// basis element, and the use count of each node. The use count is the
+/// number of references from later nodes and from the basis section, so
+/// every kept node has a count of at least 1.
 fn prune(recording: Recording, keep: &[bool], kept: usize) -> (Vec<Node>, Vec<u32>, Vec<u32>) {
     let Recording { nodes, basis } = recording;
     let mut renamed = vec![0u32; nodes.len()];

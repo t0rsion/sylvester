@@ -1,15 +1,14 @@
-//! The classic backend runs eco-9 in 1 MiB of stack.
+//! The classic backend must run in bounded stack space on every input.
 //!
 //! eco-9 does not finish inside the time limit. The test therefore accepts
 //! `Timeout` as well as a basis: it checks stack use, not completion. The
-//! 1 MiB worker stack is one eighth of the 8 MiB glibc default (`ulimit -s`
-//! on the recorded machine), so a run that grows its stack with the size of
-//! the input fails here first.
+//! 1 MiB worker stack is one eighth of the 8 MiB default, so a run that
+//! grows its stack with the size of the input fails here first.
 
 use std::time::Duration;
 use sylvester::{Backend, ComputeError, ComputeOptions, Ideal, PolynomialRing};
 
-const ECO_9: &str = include_str!("inputs/eco-9.syl");
+const ECO_9: &str = include_str!("fixtures/eco-9.syl");
 
 const MODULUS: u64 = 1_073_741_827;
 
@@ -17,8 +16,8 @@ const WORKER_STACK_BYTES: usize = 1 << 20;
 
 const TIMEOUT: Duration = Duration::from_secs(3);
 
-/// The runner input format: line 1 is the variable count, each further
-/// line is one polynomial as `;`-separated `coeff,e1,...,en` terms.
+/// Parse the runner input format: line 1 is the variable count, each
+/// further line is one polynomial as `;`-separated `coeff,e1,...,en` terms.
 fn parse_syl(text: &str, modulus: u64) -> Ideal {
     let mut lines = text.lines().filter(|line| !line.trim().is_empty());
     let nvars: usize = lines

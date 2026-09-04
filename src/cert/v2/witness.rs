@@ -1,10 +1,10 @@
 //! One witness per pair of the basis (contract sections 6 and 9.5).
 
 use crate::certificate::{CertificateCap, CertifyError, EmitterFault};
-use crate::compute::{ComputeError, DEGREE_LIMIT};
 use crate::poly::Polynomial;
+use crate::ring::PrimeOps;
 
-use super::Budget;
+use super::WriterBudget;
 use super::divide::{Step, divide};
 use super::{MAX_PAIRS, cap};
 
@@ -51,8 +51,8 @@ pub(super) fn pair_count(count: usize) -> Option<usize> {
 /// Every element of `basis` is monic and nonzero, which the caller checks.
 pub(super) fn witnesses(
     basis: &[Polynomial],
-    modulus: u64,
-    budget: &mut Budget,
+    ops: &PrimeOps,
+    budget: &mut WriterBudget,
 ) -> Result<Vec<Witness>, CertifyError> {
     let count = basis.len();
     let Some(pairs) = pair_count(count) else {
@@ -74,9 +74,9 @@ pub(super) fn witnesses(
     };
 
     for i in 0..count {
-        budget.check_deadline()?;
+        budget.check_stop()?;
         for j in i + 1..count {
-            out.push(choose_witness(basis, i, j, modulus, budget, &mut search)?);
+            out.push(choose_witness(basis, i, j, ops, budget, &mut search)?);
         }
     }
     Ok(out)
@@ -86,8 +86,8 @@ fn choose_witness(
     basis: &[Polynomial],
     i: usize,
     j: usize,
-    modulus: u64,
-    budget: &Budget,
+    ops: &PrimeOps,
+    budget: &WriterBudget,
     search: &mut Search,
 ) -> Result<Witness, CertifyError> {
     let left = lead(basis, i);
@@ -100,7 +100,7 @@ fn choose_witness(
         search.deps[target as usize] = Some(edges);
         return Ok(Witness::Chain(k));
     }
-    reduction_witness(basis, i, j, modulus, budget)
+    reduction_witness(basis, i, j, ops, budget)
 }
 
 fn find_chain(
@@ -164,20 +164,17 @@ fn reduction_witness(
     basis: &[Polynomial],
     i: usize,
     j: usize,
-    modulus: u64,
-    budget: &Budget,
+    ops: &PrimeOps,
+    budget: &WriterBudget,
 ) -> Result<Witness, CertifyError> {
-    let spoly = basis[i].s_polynomial(&basis[j], modulus).map_err(|_| {
-        CertifyError::Engine(ComputeError::ExponentLimit {
-            limit: DEGREE_LIMIT,
-        })
-    })?;
-    let Some(steps) = divide(&spoly, basis, modulus, budget)? else {
+    let spoly = basis[i].s_polynomial(&basis[j], ops);
+    let Some(steps) = divide(&spoly, basis, ops, budget)? else {
         return Err(EmitterFault::NotAGroebnerBasis { i, j }.into());
     };
     Ok(Witness::Reduce(steps))
 }
 
+/// The leading monomial of a basis element.
 fn lead(basis: &[Polynomial], index: usize) -> &crate::poly::Monomial {
     basis[index]
         .lm()

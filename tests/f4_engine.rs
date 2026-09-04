@@ -57,11 +57,11 @@ fn canonical(basis: &GroebnerBasis) -> Vec<String> {
 fn assert_monic(label: &str, basis: &GroebnerBasis) {
     for poly in basis {
         let (coeff, _) = poly.leading_term().expect("a basis element is nonzero");
-        assert_eq!(coeff, 1, "{label}: every basis element is monic");
+        assert_eq!(coeff.value(), 1, "{label}: every basis element is monic");
     }
 }
 
-/// Computes one system with both backends and compares the bases.
+/// Compute one system with both backends and compare the bases.
 fn backends_agree(label: &str, ideal: &Ideal) -> GroebnerBasis {
     let f4 = compute(ideal, Backend::F4);
     assert_monic(label, &f4);
@@ -198,7 +198,7 @@ fn noon(n: usize) -> Vec<Terms> {
 
 #[test]
 fn the_backends_agree_on_the_counterexample_systems() {
-    // The two systems of KNOWN_ISSUES.md, which the v0.1 engines got
+    // The two systems of KNOWN_ISSUES.md, which the extracted engines got
     // wrong before the repair.
     let f2 = vec![
         vec![(1, vec![3, 0]), (1, vec![0, 3])],
@@ -244,10 +244,10 @@ fn the_backends_agree_on_eco() {
     }
 }
 
-/// eco-8 costs seconds in a release build and minutes in a debug build.
-/// `cargo test --release --test f4_engine -- --ignored` runs it. The
-/// comparison is against the classic backend: the legacy batch backend did
-/// not finish eco-8 inside 120 s.
+/// eco-8 costs seconds in a release build and minutes in a debug build,
+/// so it runs on request: `cargo test --release --test f4_engine --
+/// --ignored`. The matrix backend does not finish eco-8 inside 120 s, so
+/// the comparison here is against the classic backend.
 #[test]
 #[ignore = "slow; run in release"]
 fn f4_agrees_with_classic_on_eco_8() {
@@ -258,6 +258,7 @@ fn f4_agrees_with_classic_on_eco_8() {
     assert_eq!(canonical(&f4), canonical(&classic), "eco-8");
 }
 
+/// Splitmix64, matching `tests/differential.rs`.
 struct Rng(u64);
 
 impl Rng {
@@ -538,8 +539,8 @@ fn an_exhausted_memory_budget_stops_the_run() {
 #[test]
 fn an_exponent_past_the_width_is_a_typed_limit() {
     // The F4 engine bounds one exponent, not the degree of a pair's lcm.
-    // Here the row `x1^10000 * f` needs the exponent 70000 on x1, which is
-    // past the 65535 an exponent holds.
+    // Here the row `x1^10000 * f` needs the exponent 70000 on x1, which
+    // passes the 65535 an exponent holds.
     let ring = ring(7, 2);
     let system = vec![
         vec![(1, vec![60000, 0]), (1, vec![0, 60000])],
@@ -657,8 +658,8 @@ fn the_report_carries_the_threads_the_run_had() {
 /// A run whose input alone passes the limit stops before its first batch.
 ///
 /// The engine holds the interned generators and seeded basis before its
-/// first batch, so one byte stops every nonempty input. A literally empty
-/// input holds no engine data and succeeds under the hardened budget.
+/// first batch, so one byte stops every nonempty input. An empty input
+/// holds no engine data.
 #[test]
 fn a_limit_the_input_alone_passes_stops_the_run() {
     let ring = ring(P, 2);
@@ -717,7 +718,7 @@ fn smallest_memory_limit(ideal: &Ideal) -> usize {
     high
 }
 
-/// The limit binds where the run peaks.
+/// The limit binds where the run peaks, not somewhere else.
 ///
 /// Self-calibrating: the search finds the smallest limit the run finishes
 /// under. One byte less is a typed stop, and the limit itself gives the
