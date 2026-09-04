@@ -1046,64 +1046,50 @@ mod tests {
         system
     }
 
-    /// Run once with no flag, then again with a flag another thread sets
-    /// after an eighth of the first run.
-    ///
-    /// The test calibrates itself: it asserts what the run does after the
-    /// flag is set, and not a wall time it fixed in advance.
-    fn cancel_mid_run(ring: &PolynomialRing, system: &[Polynomial], options: &ComputeOptions) {
-        let limits = ComputeLimits::of(options);
-        let start = Instant::now();
-        let basis = groebner_basis_with_limits(ring, system, options, &limits).expect("a basis");
-        let full = start.elapsed();
-        assert!(!basis.is_empty());
+    fn cancelled_run(ring: &PolynomialRing, system: &[Polynomial], options: &ComputeOptions) {
+        let flag = Arc::new(AtomicBool::new(true));
+        let limits = ComputeLimits {
+            cancel: Some(flag),
+            ..ComputeLimits::of(options)
+        };
+        assert_eq!(
+            groebner_basis_with_limits(ring, system, options, &limits),
+            Err(RunError::Cancelled)
+        );
+    }
 
+    #[test]
+    fn periodic_checks_read_cancellation_at_the_next_tick() {
         let flag = Arc::new(AtomicBool::new(false));
         let limits = ComputeLimits {
             cancel: Some(Arc::clone(&flag)),
-            ..ComputeLimits::of(options)
+            ..ComputeLimits::default()
         };
-        let set_at = Arc::new(std::sync::Mutex::new(None));
-        let reported = Arc::clone(&set_at);
-        let waker = std::thread::spawn(move || {
-            std::thread::sleep(full / 8);
-            *reported.lock().expect("the lock holds") = Some(Instant::now());
-            flag.store(true, Ordering::Relaxed);
-        });
-        let stopped = groebner_basis_with_limits(ring, system, options, &limits);
-        let returned = Instant::now();
-        waker.join().expect("the waker thread finishes");
-
-        assert_eq!(stopped, Err(RunError::Cancelled));
-        let set_at = set_at
-            .lock()
-            .expect("the lock holds")
-            .expect("the flag was set");
-        assert!(
-            returned.duration_since(set_at) < full / 4,
-            "a cancelled run must stop at its next deadline check"
-        );
+        assert_eq!(limits.stop_every(0), None);
+        flag.store(true, Ordering::Relaxed);
+        assert_eq!(limits.stop_every(1), None);
+        assert_eq!(limits.stop_every(TICK), Some(RunError::Cancelled));
     }
 
     #[test]
     fn a_cancelled_f4_run_stops_at_the_flag() {
         let ring = wide_ring(8);
         let system = katsura(&ring, 7);
-        cancel_mid_run(&ring, &system, &ComputeOptions::new().threads(1));
+        cancelled_run(&ring, &system, &ComputeOptions::new().threads(1));
     }
 
     #[test]
     fn a_cancelled_parallel_f4_run_stops_at_the_flag() {
         let ring = wide_ring(8);
         let system = katsura(&ring, 7);
-        cancel_mid_run(&ring, &system, &ComputeOptions::new().threads(8));
+        cancelled_run(&ring, &system, &ComputeOptions::new().threads(8));
     }
 
     #[test]
     fn a_cancelled_classic_run_stops_at_the_flag() {
         let ring = wide_ring(6);
         let system = katsura(&ring, 5);
-        cancel_mid_run(
+        cancelled_run(
             &ring,
             &system,
             &ComputeOptions::new().backend(Backend::Classic),

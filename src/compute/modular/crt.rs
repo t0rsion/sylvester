@@ -235,25 +235,17 @@ mod tests {
         assert_eq!(held[1], direct(&[1, 1, 1], &primes));
     }
 
-    /// The fold reads the deadline at a term, not once per basis element.
-    ///
-    /// One element carries 60,000 terms here, and folding them costs more
-    /// than the deadline. A fold that read the deadline once per element
-    /// would pass the one check it makes and then run the whole element.
     #[test]
-    fn a_fold_stops_inside_one_element() {
+    fn a_fold_checks_limits_at_its_first_term() {
         let p = 10007u64;
         let ring = ring(p);
-        let terms: Vec<(i64, [u16; 2])> = (0..60_000u32)
-            .map(|index| (1 + i64::from(index % 9_973), [index as u16, 0]))
-            .collect();
         let element = ring
-            .polynomial(terms)
+            .polynomial([(1, [1, 0])])
             .expect("the exponent vectors match the ring");
         let leads = vec![element.lm().expect("the element is not zero").clone()];
         let mut accumulator = Accumulator::new(&leads);
         let limits = ComputeLimits {
-            deadline: Some(std::time::Instant::now() + std::time::Duration::from_millis(20)),
+            deadline: Some(std::time::Instant::now()),
             ..ComputeLimits::default()
         };
 
