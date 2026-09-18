@@ -174,10 +174,10 @@ def test_quotient_keeps_rational_lift_provenance(rational_ring):
     assert quotient.source_basis.lift() == basis.lift()
 
 
-def test_sigint_cancels_and_joins_the_worker():
+def test_keyboard_interrupt_cancels_and_joins_the_worker():
     script = r'''
-import signal
-import os
+import _thread
+import threading
 import sylvester
 
 ring = sylvester.PolynomialRing.prime_field(32003, [f"x{i}" for i in range(1, 9)])
@@ -192,15 +192,17 @@ for degree in range(1, 8):
     generators.append(ring.polynomial(terms))
 exponents = [1] * 8
 generators.append(ring.polynomial([(1, exponents), (-1, [0] * 8)]))
-signal.signal(signal.SIGALRM, lambda *_: os.kill(os.getpid(), signal.SIGINT))
-signal.setitimer(signal.ITIMER_REAL, 0.05)
+timer = threading.Timer(0.05, _thread.interrupt_main)
 try:
+    timer.start()
     ring.ideal(generators).groebner_basis(threads=1)
 except KeyboardInterrupt:
-    signal.setitimer(signal.ITIMER_REAL, 0)
     print("keyboard-interrupt")
 else:
-    raise SystemExit("the computation finished before SIGINT")
+    raise SystemExit("the computation finished before the interrupt")
+finally:
+    timer.cancel()
+    timer.join()
 '''
     completed = subprocess.run(
         [sys.executable, "-c", script],
