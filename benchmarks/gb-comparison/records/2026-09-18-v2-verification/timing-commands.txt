@@ -1,0 +1,2 @@
+before,taskset -c 0-3,12-15 <clean-worktree>/target/release/deps/verifier_raw-1821aa1734c0b85e --ignored --nocapture
+after,taskset -c 0-3,12-15 <patched-worktree>/target/release/deps/verifier_raw-1821aa1734c0b85e --ignored --nocapture

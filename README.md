@@ -1,8 +1,62 @@
 # sylvester
 
-Gröbner bases over prime fields and the rationals: an F4 engine, a
-multimodular rational driver, a classic F5 oracle, and independent
-certificate verifiers, with a command line interface and Python bindings.
+Gröbner bases and finite quotient algebras over prime fields and the
+rationals, available in Rust, Python, and the `sylv` command line tool.
+Compute a basis, reduce polynomials, obtain residue coordinates, and find
+minimal and characteristic polynomials of multiplication maps.
+
+Prime-field results can carry independently checked certificates of the
+basis and input ideal equality. Rational basis computation is heuristic.
+The quotient operations have library tests, not independent certificates.
+
+## Install
+
+```sh
+cargo add sylvester
+cargo install sylvester-cli
+```
+
+Prebuilt CLI archives and Python wheels are attached to the
+[GitHub releases](https://github.com/t0rsion/sylvester/releases/latest).
+Download the wheel for the operating system and architecture. Replace
+`WHEEL_FILE` with its filename:
+
+```sh
+python -m pip install WHEEL_FILE
+```
+
+Python packages are distributed through GitHub releases. They are not on
+PyPI. See the [Python guide](crates/sylvester-py/README.md) for supported
+interpreters and building from source.
+
+## A finite quotient
+
+In `F_7[x,y]/(x²,y²)`, the standard monomials are `1`, `y`, `x`, and `xy`.
+The vector-space dimension is four. Multiplication by `x` is nilpotent:
+its minimal polynomial is `t²`, while its characteristic polynomial is
+`t⁴`. The dimension does not count distinct solutions.
+
+```python
+import sylvester
+
+ring = sylvester.PolynomialRing.prime_field(7, ["x", "y"])
+x, y = ring.gens
+certified = ring.ideal([x**2, y**2]).groebner_basis_certified()
+quotient = certified.basis.finite_quotient()
+
+assert quotient.dimension == 4
+print(quotient.minimal_polynomial(x))
+print(quotient.characteristic_polynomial(x))
+```
+
+The [quotient tutorial](docs/finite-quotient.md) explains coordinates,
+multiplication matrices, budgets, and the limits of the claims. A
+[Rust example](examples/finite_quotient.rs) and an
+[executable notebook](examples/finite-quotient.ipynb)
+accompany it.
+
+## Engines and rings
+
 Every value comes from a `PolynomialRing<D>`, which fixes the coefficient
 domain, the variable names, and the variable order. `D` is `PrimeField`
 (the default) or `Rationals`. The monomial order is grevlex over the
@@ -51,8 +105,11 @@ default outcome, establishes nothing about the ideal: it says the reconstructed
 basis agreed with itself over the confirming primes. `Established::ContainsInput`
 adds two exact tests over `Q` and establishes that the returned basis is
 the reduced Gröbner basis of an ideal that contains the input ideal, not
-that it equals the input ideal, and the basis `{1}` passes both tests. There
-is no path to a stronger claim over `Q` in this release; section 4 of the
+that it equals the input ideal, and the basis `{1}` passes both tests.
+`Ideal::check_basis_equality` provides a separate exact check, with origin
+cofactors and both ideal inclusions. It is intended for small inputs under
+an explicit budget. It does not change `Established` or produce an
+independent certificate. Section 4 of the
 [rational design](docs/rational-design.md) states why a per-prime certificate
 would not close the gap.
 
@@ -133,14 +190,18 @@ sylv normal-form --basis basis.text --poly "x^2*y - 1"
 sylv member --basis basis.text --poly-file f.text
 sylv hilbert system.ms
 sylv dim system.ms --from-basis
+sylv quotient system.text --matrix x --characteristic x --minimal x
+sylv gb system.ms --certified --out-format json --output result.json
+sylv verify result.json
 ```
 
 `hilbert` and `dim` over `Q` write an `# established:` comment above the
 value, because the value is of the ideal the lifted basis generates.
 
 It reads `ms` (msolve's format), `syl` (the benchmark format, `.sylq` for
-a rational instance), and `text` (the crate's own syntax), resolving one
-ring per command over every file it reads. `crates/sylvester-cli/README.md`
+a rational instance), `text` (the crate's own syntax), and `json`
+(a `sylv-result-v1` computation record). It resolves one ring per command
+over every file it reads. `crates/sylvester-cli/README.md`
 documents every subcommand, the ring resolution rules, and the six exit
 codes.
 
@@ -204,9 +265,11 @@ extra }` (the Rust default, `extra` = 2) or `RationalStop::ContainsInput {
 extra }`, the count of further confirming primes each rule needs. The CLI
 and Python binding default to `ContainsInput`.
 
-`Budget` alone, with no backend or thread count, drives `normal_form`,
-`contains`, `hilbert_series`, `krull_dimension`, and `from_polynomials`,
-in both domains.
+`Budget` alone drives polynomial arithmetic, expression expansion,
+division, finite quotient operations, and basis queries in both domains.
+`CancellationToken` lets another thread stop these operations. A cancelled
+computation reports `Timeout`; independent verification reports
+`DeadlineExceeded`.
 
 An exhausted budget is a typed error: `Timeout` or
 `MemoryLimitExceeded`, on every operation that takes one. Nothing
@@ -270,7 +333,7 @@ systems over \(\mathbb F_2\), 1,000 degree-reversal systems over
 The external harness compares complete bases with Singular, msolve,
 Macaulay2, and Groebner.jl. Timings apply only to the recorded machine,
 versions, inputs, and limits. The current one-thread F4 gate passes at a
-1.00x geometric mean and a 1.09x worst cell against msolve. See
+1.06x geometric mean and a 1.19x worst cell against msolve. See
 [the comparison record][comparison-record].
 
 ## Build

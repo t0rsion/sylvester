@@ -1400,7 +1400,7 @@ fn the_live_byte_cap_reports_exhaustion() {
     assert_eq!(
         error,
         VerifyError::CapExceeded {
-            cap: Cap::IntermediateBytes,
+            cap: Cap::LiveBytes,
             limit: term_bytes(2)
         }
     );
@@ -1752,7 +1752,7 @@ fn a_shared_basis_node_costs_one_live_copy_per_basis_entry() {
     assert_eq!(
         error,
         VerifyError::CapExceeded {
-            cap: Cap::IntermediateBytes,
+            cap: Cap::LiveBytes,
             limit
         }
     );
@@ -1861,7 +1861,7 @@ fn input_storage_counts_against_the_live_budget() {
     assert_eq!(
         error,
         VerifyError::CapExceeded {
-            cap: Cap::IntermediateBytes,
+            cap: Cap::LiveBytes,
             limit
         }
     );
@@ -1885,7 +1885,7 @@ fn a_membership_trace_counts_its_steps_against_the_live_budget() {
     assert_eq!(
         error,
         VerifyError::CapExceeded {
-            cap: Cap::IntermediateBytes,
+            cap: Cap::LiveBytes,
             limit
         }
     );

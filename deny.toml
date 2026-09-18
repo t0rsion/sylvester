@@ -1,5 +1,9 @@
 [advisories]
 yanked = "deny"
+ignore = [
+    { id = "RUSTSEC-2025-0020", reason = "The pinned Python binding never calls PyString::from_object; string conversion uses PyString::new." },
+    { id = "RUSTSEC-2026-0177", reason = "The binding never calls PyCFunction::new_closure. PyO3 macros register static PyMethodDef values through internal_new." },
+]
 
 [licenses]
 allow = [
@@ -8,6 +12,14 @@ allow = [
     "Zlib",
 ]
 confidence-threshold = 0.93
+
+[[licenses.exceptions]]
+name = "unicode-ident"
+allow = ["Unicode-3.0"]
+
+[[licenses.exceptions]]
+name = "target-lexicon"
+allow = ["Apache-2.0 WITH LLVM-exception"]
 
 [bans]
 multiple-versions = "warn"

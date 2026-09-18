@@ -1,11 +1,11 @@
 [build-system]
-requires = ["maturin>=1.11,<2"]
+requires = ["maturin>=1.12,<2"]
 build-backend = "maturin"
 
 [project]
 name = "sylvester"
-version = "0.3.0"
-description = "Gröbner bases over prime fields and over the rational numbers, with independent certificate verifiers"
+version = "0.4.0"
+description = "Gröbner bases and finite quotient algebras over prime fields and the rationals, with independent prime-field certificate verifiers"
 requires-python = ">=3.10"
 license = "MIT OR Apache-2.0"
 keywords = ["groebner", "f4", "algebra", "polynomial", "mathematics"]
@@ -20,6 +20,9 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Mathematics",
 ]
 
+[project.optional-dependencies]
+sympy = ["sympy>=1.14,<2"]
+
 [project.urls]
 Homepage = "https://github.com/t0rsion/sylvester"
 Repository = "https://github.com/t0rsion/sylvester"
@@ -27,3 +30,7 @@ Repository = "https://github.com/t0rsion/sylvester"
 [tool.maturin]
 python-source = "python"
 module-name = "sylvester._sylvester"
+
+[tool.maturin.sbom]
+# Generated Rust SBOM identifiers contain absolute path dependencies.
+rust = false

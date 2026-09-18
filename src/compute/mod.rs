@@ -32,11 +32,64 @@ pub enum Backend {
     Classic,
 }
 
+/// A one-way cancellation token shared by one or more computations.
+///
+/// Clones observe the same flag. [`CancellationToken::cancel`] sets the flag
+/// and no operation resets it. Equality compares token identity, so
+/// cancellation does not change it.
+#[derive(Clone, Debug)]
+pub struct CancellationToken(Arc<AtomicBool>);
+
+impl Default for CancellationToken {
+    fn default() -> Self {
+        CancellationToken(Arc::new(AtomicBool::new(false)))
+    }
+}
+
+impl CancellationToken {
+    /// Make an unset cancellation token.
+    pub fn new() -> Self {
+        CancellationToken::default()
+    }
+
+    /// Request cancellation.
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+
+    /// Report whether cancellation was requested.
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    /// Return the atomic flag shared with this token.
+    ///
+    /// Pass the clone to [`crate::verify::Limits::cancellation`] when one
+    /// cancellation request must stop an independent verification. Only set
+    /// the returned flag to `true`; the token never resets it.
+    pub fn shared_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.0)
+    }
+
+    /// Return the flag shared with this token inside the crate.
+    pub(crate) fn flag(&self) -> Arc<AtomicBool> {
+        self.shared_flag()
+    }
+}
+
+impl PartialEq for CancellationToken {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for CancellationToken {}
+
 /// The deadline and the memory limit of one call.
 ///
 /// The default budget stops nothing. A budget holds a duration and not an
-/// instant: the deadline starts when the call that receives it starts.
-/// [`ComputeOptions`] holds one.
+/// instant: the deadline starts when the call that receives it starts. It
+/// can also hold a shared cancellation token. [`ComputeOptions`] holds one.
 ///
 /// ```
 /// use std::time::Duration;
@@ -47,14 +100,16 @@ pub enum Backend {
 ///     .memory_limit(512 << 20);
 /// let options = ComputeOptions::new().budget(budget);
 /// ```
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Budget {
     timeout: Option<Duration>,
     memory_limit: Option<usize>,
+    cancellation: Option<CancellationToken>,
 }
 
 impl Budget {
-    /// The budget that stops nothing: no deadline and no memory limit.
+    /// The budget that stops nothing: no deadline, no memory limit, and no
+    /// cancellation token.
     pub fn new() -> Self {
         Budget::default()
     }
@@ -78,6 +133,15 @@ impl Budget {
         self
     }
 
+    /// Stop the call when `token` is cancelled.
+    ///
+    /// Cloning the token lets another thread request cancellation while the
+    /// call runs. A cancelled call reports [`ComputeError::Timeout`].
+    pub fn cancellation(mut self, token: CancellationToken) -> Self {
+        self.cancellation = Some(token);
+        self
+    }
+
     /// The instant the deadline stands at, taken now.
     fn deadline(&self) -> Option<Instant> {
         self.timeout
@@ -87,9 +151,10 @@ impl Budget {
 
 /// The backend, the budget, and the thread count of one computation.
 ///
-/// The default is the F4 backend, no deadline, no memory limit, and the
-/// thread count of the rayon global pool. Each setter takes the value by
-/// value and returns the options, so a call chain builds them.
+/// The default is the F4 backend, no deadline, no memory limit, no
+/// cancellation token, and the thread count of the rayon global pool. Each
+/// setter takes the value by value and returns the options, so a call chain
+/// builds them.
 ///
 /// ```
 /// use std::time::Duration;
@@ -109,8 +174,8 @@ pub struct ComputeOptions {
 }
 
 impl ComputeOptions {
-    /// The default options: the F4 backend, no deadline, no memory limit,
-    /// and the thread count of the rayon global pool.
+    /// The default options: the F4 backend, no deadline, no memory limit, no
+    /// cancellation token, and the thread count of the rayon global pool.
     pub fn new() -> Self {
         ComputeOptions::default()
     }
@@ -144,7 +209,7 @@ impl ComputeOptions {
         self
     }
 
-    /// Take the deadline and the memory limit from one budget.
+    /// Take the deadline, memory limit, and cancellation token from one budget.
     ///
     /// This overwrites what [`ComputeOptions::timeout`] and
     /// [`ComputeOptions::memory_limit`] wrote, because those two setters
@@ -497,9 +562,15 @@ pub(crate) struct ComputeLimits {
     /// The flag that stops the call where its deadline is read, or `None`
     /// for a call nothing cancels.
     ///
-    /// A flag is never reset. Each wave of work gets a fresh one, so
-    /// cancelling a wave cannot stop the work that follows it.
+    /// A public budget stores its flag here. A modular wave replaces this
+    /// with a fresh private flag and stores the public flag in
+    /// `external_cancel`.
     pub(crate) cancel: Option<Arc<AtomicBool>>,
+    /// The caller's flag when `cancel` belongs to a modular wave.
+    ///
+    /// The two flags are read together. The private wave flag is never
+    /// reset, so it cannot cancel a later wave.
+    pub(crate) external_cancel: Option<Arc<AtomicBool>>,
 }
 
 /// The number of items one loop takes between two reads of the clock.
@@ -508,8 +579,8 @@ pub(crate) struct ComputeLimits {
 pub(crate) const TICK: usize = 64;
 
 impl ComputeLimits {
-    /// The limits `options` names, with the deadline taken now and no
-    /// cancellation flag.
+    /// The limits `options` names, with the deadline and cancellation flag
+    /// taken now.
     pub(crate) fn of(options: &ComputeOptions) -> Self {
         ComputeLimits {
             threads: options.threads,
@@ -517,8 +588,8 @@ impl ComputeLimits {
         }
     }
 
-    /// The limits `budget` names, with the deadline taken now, the thread
-    /// count of the rayon global pool, and no cancellation flag.
+    /// The limits `budget` names, with the deadline and cancellation flag
+    /// taken now, and the thread count of the rayon global pool.
     ///
     /// A call that takes a [`Budget`] and no options, as
     /// [`GroebnerBasis::normal_form`] does, builds its limits here.
@@ -529,7 +600,8 @@ impl ComputeLimits {
             deadline: budget.deadline(),
             memory: budget.memory_limit,
             threads: None,
-            cancel: None,
+            cancel: budget.cancellation.as_ref().map(CancellationToken::flag),
+            external_cancel: None,
         }
     }
 
@@ -548,12 +620,18 @@ impl ComputeLimits {
 
     /// Report why the call stops now, or `None` to carry on.
     ///
-    /// The cancellation flag is read before the clock, because reading the
+    /// Cancellation flags are read before the clock, because reading the
     /// clock costs more.
     pub(crate) fn stop(&self) -> Option<RunError> {
-        if let Some(flag) = &self.cancel
-            && flag.load(Ordering::Relaxed)
-        {
+        let cancelled = self
+            .cancel
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+            || self
+                .external_cancel
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::Relaxed));
+        if cancelled {
             return Some(RunError::Cancelled);
         }
         match self.deadline {
@@ -568,10 +646,8 @@ impl ComputeLimits {
 ///
 /// [`ComputeError`] is public and exhaustive, so it gains no cancellation
 /// variant: a caller who never asked for cancellation would have to match
-/// one. The crate keeps the difference here. A caller that sets a flag
-/// consumes [`RunError::Cancelled`] itself, and no public entry point sets
-/// one, so a public call does not reach that arm of
-/// [`RunError::reported`].
+/// one. The crate keeps the difference here. A caller that sets a token
+/// consumes [`RunError::Cancelled`] through [`RunError::reported`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RunError {
     /// The run stopped for a reason the public error names.
@@ -821,13 +897,17 @@ fn f4_certificate(
 /// length bounds every count the caps name. The work cap stays open on
 /// both paths: it guards against hostile bytes, and here the deadline
 /// bounds the time.
-fn verifier_limits(
+pub(crate) fn verifier_limits(
     certificate_len: usize,
     held: usize,
     nvars: usize,
     limits: &ComputeLimits,
 ) -> VerifyLimits {
     let deadline = limits.deadline;
+    let cancellation = limits
+        .external_cancel
+        .clone()
+        .or_else(|| limits.cancel.clone());
     let defaults = VerifyLimits::default();
     let Some(limit) = limits.memory else {
         let len = certificate_len;
@@ -853,6 +933,7 @@ fn verifier_limits(
             // come from this process, and the deadline bounds the time.
             max_work_units: u64::MAX,
             deadline,
+            cancellation,
         };
     };
 
@@ -881,6 +962,7 @@ fn verifier_limits(
         max_live_bytes: left.max(term_bytes),
         max_work_units: u64::MAX,
         deadline,
+        cancellation,
     }
 }
 

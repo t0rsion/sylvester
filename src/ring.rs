@@ -1,6 +1,7 @@
 //! The polynomial ring and every construction that goes through it.
 
 pub(crate) mod field;
+mod parser;
 pub(crate) mod rational;
 
 use std::fmt;
@@ -16,6 +17,7 @@ use crate::ideal::Ideal;
 use crate::poly::{Monomial, Polynomial, Term};
 use field::is_prime;
 pub use field::{Felt, PrimeOps};
+pub use parser::ExpressionError;
 pub use rational::{Established, ModularLift, RationalMeta, RationalOps};
 
 pub(crate) mod sealed {
@@ -368,6 +370,38 @@ impl<D: Domain> PolynomialRing<D> {
         self.inner.variables.iter().position(|held| held == name)
     }
 
+    /// Return the variables as degree-one polynomials in ring order.
+    ///
+    /// The first item is the polynomial for `variables()[0]`. An empty ring
+    /// has no generators. Each call builds a fresh vector of polynomials.
+    pub fn generators(&self) -> Vec<Polynomial<D>> {
+        (0..self.nvars())
+            .map(|index| {
+                self.generator(index)
+                    .expect("a generated index is inside the ring")
+            })
+            .collect()
+    }
+
+    /// Return the degree-one polynomial for one variable.
+    ///
+    /// `index` follows [`PolynomialRing::variables`]. An index past the ring
+    /// width returns `None`.
+    pub fn generator(&self, index: usize) -> Option<Polynomial<D>> {
+        if index >= self.nvars() {
+            return None;
+        }
+        let mut exps = vec![0u16; self.nvars()];
+        exps[index] = 1;
+        Some(Polynomial::from_sorted_terms(
+            self.clone(),
+            vec![Term {
+                coeff: self.ops().one(),
+                mono: Monomial::from_exps(exps.into_iter().collect()),
+            }],
+        ))
+    }
+
     /// The domain arithmetic every polynomial operation of this ring
     /// takes.
     pub(crate) fn ops(&self) -> &D::Ops {
@@ -429,6 +463,32 @@ impl<D: Domain> PolynomialRing<D> {
     /// ```
     pub fn parse_polynomial(&self, text: &str) -> Result<Polynomial<D>, RingError> {
         Parser::new(self, text).polynomial()
+    }
+
+    /// Read an expression under one time and memory budget.
+    ///
+    /// The expression grammar accepts `+`, `-`, `*`, parentheses, unary
+    /// signs, fractions of decimal integers, and nonnegative powers with
+    /// `^` or `**`. Division applies only inside a numeric fraction.
+    ///
+    /// The budget covers the whole parse, including every intermediate
+    /// polynomial. An exhausted budget returns [`ExpressionError`].
+    pub fn parse_polynomial_with_budget(
+        &self,
+        text: &str,
+        budget: crate::Budget,
+    ) -> Result<Polynomial<D>, ExpressionError> {
+        let limits = crate::compute::ComputeLimits::of_budget(&budget);
+        self.parse_polynomial_with_limits(text, &limits)
+    }
+
+    /// Read an expression under limits already shared by a caller.
+    pub(crate) fn parse_polynomial_with_limits(
+        &self,
+        text: &str,
+        limits: &crate::compute::ComputeLimits,
+    ) -> Result<Polynomial<D>, ExpressionError> {
+        parser::parse_with_limits(self, text, limits)
     }
 
     /// Build a polynomial from coefficient and exponent pairs.

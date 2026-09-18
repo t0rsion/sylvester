@@ -5,7 +5,8 @@ from typing import Literal, overload
 __version__: str
 
 Coefficient = int | Fraction
-TermInput = tuple[int | Fraction | tuple[int, int], Sequence[int]]
+CoefficientInput = Coefficient | tuple[int, int]
+TermInput = tuple[CoefficientInput, Sequence[int]]
 Backend = Literal["f4", "classic"]
 Stop = Literal["unchanged", "contains_input"]
 
@@ -45,7 +46,19 @@ class PolynomialRing:
     def modulus(self) -> int | None: ...
     @property
     def variables(self) -> list[str]: ...
-    def parse(self, text: str) -> Polynomial: ...
+    @property
+    def gens(self) -> list[Polynomial]: ...
+    @property
+    def zero(self) -> Polynomial: ...
+    @property
+    def one(self) -> Polynomial: ...
+    def parse(
+        self,
+        text: str,
+        *,
+        timeout: float | None = None,
+        memory_limit: int | None = None,
+    ) -> Polynomial: ...
     def polynomial(self, terms: Sequence[TermInput]) -> Polynomial: ...
     def ideal(self, generators: Sequence[Polynomial]) -> Ideal: ...
     def __eq__(self, other: object) -> bool: ...
@@ -60,6 +73,48 @@ class Polynomial:
     def __str__(self) -> str: ...
     def __eq__(self, other: object) -> bool: ...
     def __hash__(self) -> int: ...
+    def add(
+        self,
+        other: Polynomial | CoefficientInput,
+        *,
+        timeout: float | None = None,
+        memory_limit: int | None = None,
+    ) -> Polynomial: ...
+    def sub(
+        self,
+        other: Polynomial | CoefficientInput,
+        *,
+        timeout: float | None = None,
+        memory_limit: int | None = None,
+    ) -> Polynomial: ...
+    def mul(
+        self,
+        other: Polynomial | CoefficientInput,
+        *,
+        timeout: float | None = None,
+        memory_limit: int | None = None,
+    ) -> Polynomial: ...
+    def neg(
+        self,
+        *,
+        timeout: float | None = None,
+        memory_limit: int | None = None,
+    ) -> Polynomial: ...
+    def pow(
+        self,
+        exponent: int,
+        *,
+        timeout: float | None = None,
+        memory_limit: int | None = None,
+    ) -> Polynomial: ...
+    def __add__(self, other: Polynomial | CoefficientInput) -> Polynomial: ...
+    def __radd__(self, other: CoefficientInput) -> Polynomial: ...
+    def __sub__(self, other: Polynomial | CoefficientInput) -> Polynomial: ...
+    def __rsub__(self, other: CoefficientInput) -> Polynomial: ...
+    def __mul__(self, other: Polynomial | CoefficientInput) -> Polynomial: ...
+    def __rmul__(self, other: CoefficientInput) -> Polynomial: ...
+    def __neg__(self) -> Polynomial: ...
+    def __pow__(self, exponent: int, modulo: object = None) -> Polynomial: ...
 
 class Ideal:
     @property
@@ -95,6 +150,13 @@ class Ideal:
         memory_limit: int | None = None,
         threads: int | None = None,
     ) -> CertifiedGroebnerBasis: ...
+    def check_basis_equality(
+        self,
+        basis: GroebnerBasis,
+        *,
+        timeout: float | None = None,
+        memory_limit: int | None = None,
+    ) -> RationalEqualityCheck: ...
 
 class GroebnerBasis:
     """A reduced Gröbner basis under grevlex.
@@ -122,6 +184,24 @@ class GroebnerBasis:
         timeout: float | None = None,
         memory_limit: int | None = None,
     ) -> Polynomial: ...
+    def is_zero_dimensional(self) -> bool: ...
+    def finite_quotient(
+        self, *, timeout: float | None = None, memory_limit: int | None = None
+    ) -> FiniteQuotient: ...
+    def divide(
+        self,
+        f: Polynomial,
+        *,
+        timeout: float | None = None,
+        memory_limit: int | None = None,
+    ) -> tuple[list[Polynomial], Polynomial]: ...
+    def divmod(
+        self,
+        f: Polynomial,
+        *,
+        timeout: float | None = None,
+        memory_limit: int | None = None,
+    ) -> tuple[list[Polynomial], Polynomial]: ...
     def contains(
         self,
         f: Polynomial,
@@ -198,6 +278,182 @@ class ComputeReport:
     @property
     def modular_concurrency(self) -> int | None: ...
 
+class FiniteQuotient:
+    @property
+    def ring(self) -> PolynomialRing: ...
+    @property
+    def source_basis(self) -> GroebnerBasis: ...
+    @property
+    def basis(self) -> list[list[int]]: ...
+    @property
+    def standard_monomials(self) -> list[list[int]]: ...
+    @property
+    def dimension(self) -> int: ...
+    def vector_space_dimension(self) -> int: ...
+    def reduce(
+        self,
+        polynomial: Polynomial,
+        *,
+        timeout: float | None = None,
+        memory_limit: int | None = None,
+    ) -> Polynomial: ...
+    def coordinates(
+        self,
+        polynomial: Polynomial,
+        *,
+        timeout: float | None = None,
+        memory_limit: int | None = None,
+    ) -> list[Coefficient]: ...
+    def add(
+        self,
+        left: Polynomial,
+        right: Polynomial,
+        *,
+        timeout: float | None = None,
+        memory_limit: int | None = None,
+    ) -> Polynomial: ...
+    def multiply(
+        self,
+        left: Polynomial,
+        right: Polynomial,
+        *,
+        timeout: float | None = None,
+        memory_limit: int | None = None,
+    ) -> Polynomial: ...
+    def pow(
+        self,
+        polynomial: Polynomial,
+        exponent: int,
+        *,
+        timeout: float | None = None,
+        memory_limit: int | None = None,
+    ) -> Polynomial: ...
+    def multiplication_matrix(
+        self,
+        polynomial: Polynomial,
+        *,
+        timeout: float | None = None,
+        memory_limit: int | None = None,
+    ) -> MultiplicationMatrix: ...
+    def characteristic_polynomial(
+        self,
+        polynomial: Polynomial,
+        *,
+        timeout: float | None = None,
+        memory_limit: int | None = None,
+    ) -> UnivariatePolynomial: ...
+    def minimal_polynomial(
+        self,
+        polynomial: Polynomial,
+        *,
+        timeout: float | None = None,
+        memory_limit: int | None = None,
+    ) -> UnivariatePolynomial: ...
+
+class MultiplicationMatrix:
+    @property
+    def ring(self) -> PolynomialRing: ...
+    @property
+    def dimension(self) -> int: ...
+    @property
+    def entries(self) -> list[list[Coefficient]]: ...
+    @property
+    def flat_entries(self) -> list[Coefficient]: ...
+    def entry(self, row: int, column: int) -> int | Fraction | None: ...
+
+class UnivariatePolynomial:
+    @property
+    def ring(self) -> PolynomialRing: ...
+    @property
+    def coefficients(self) -> list[Coefficient]: ...
+    def coefficient(self, degree: int) -> int | Fraction | None: ...
+    @property
+    def degree(self) -> int | None: ...
+    @property
+    def is_zero(self) -> bool: ...
+    def __str__(self) -> str: ...
+
+class ResultEnvelope:
+    @staticmethod
+    def from_prime(
+        ideal: Ideal,
+        basis: GroebnerBasis,
+        certificate: bytes | None = None,
+        *,
+        timeout: float | None = None,
+        memory_limit: int | None = None,
+    ) -> ResultEnvelope: ...
+    @staticmethod
+    def from_certified(
+        ideal: Ideal,
+        certified: CertifiedGroebnerBasis,
+        *,
+        timeout: float | None = None,
+        memory_limit: int | None = None,
+    ) -> ResultEnvelope: ...
+    @staticmethod
+    def from_rational(
+        ideal: Ideal,
+        basis: GroebnerBasis,
+        *,
+        timeout: float | None = None,
+        memory_limit: int | None = None,
+    ) -> ResultEnvelope: ...
+    @staticmethod
+    def from_checked_rational(
+        checked: RationalEqualityCheck,
+        *,
+        timeout: float | None = None,
+        memory_limit: int | None = None,
+    ) -> ResultEnvelope: ...
+    def check_rational(
+        self,
+        *,
+        timeout: float | None = None,
+        memory_limit: int | None = None,
+    ) -> RationalEqualityCheck: ...
+    @staticmethod
+    def from_json(
+        data: bytes,
+        *,
+        timeout: float | None = None,
+        memory_limit: int | None = None,
+    ) -> ResultEnvelope: ...
+    def to_json(
+        self, *, timeout: float | None = None, memory_limit: int | None = None
+    ) -> bytes: ...
+    @property
+    def domain(self) -> dict[str, int | str]: ...
+    @property
+    def variables(self) -> list[str]: ...
+    @property
+    def input(self) -> list[str]: ...
+    @property
+    def basis(self) -> list[str]: ...
+    @property
+    def claimed_provenance(self) -> str: ...
+    @property
+    def certificate(self) -> bytes | None: ...
+    def verify_prime(
+        self,
+        *,
+        timeout: float | None = None,
+        max_bytes: int | None = None,
+        max_work_units: int | None = None,
+        max_intermediate_bytes: int | None = None,
+        max_live_bytes: int | None = None,
+    ) -> VerifiedGroebnerBasis: ...
+
+class RationalEqualityCheck:
+    @property
+    def input(self) -> Ideal: ...
+    @property
+    def basis(self) -> GroebnerBasis: ...
+    @property
+    def origins(self) -> list[list[Polynomial]]: ...
+    @property
+    def metrics(self) -> dict[str, int]: ...
+
 class VerifiedGroebnerBasis:
     @property
     def modulus(self) -> int: ...
@@ -208,4 +464,12 @@ class VerifiedGroebnerBasis:
     @property
     def basis(self) -> list[Polynomial]: ...
 
-def verify(data: bytes) -> VerifiedGroebnerBasis: ...
+def verify(
+    data: bytes,
+    *,
+    timeout: float | None = None,
+    max_bytes: int | None = None,
+    max_work_units: int | None = None,
+    max_intermediate_bytes: int | None = None,
+    max_live_bytes: int | None = None,
+) -> VerifiedGroebnerBasis: ...

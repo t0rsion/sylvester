@@ -1,11 +1,11 @@
 [package]
 name = "sylvester"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/t0rsion/sylvester"
-description = "Gröbner bases over prime fields and the rationals: an F4 engine, a multimodular rational driver, a classic F5 oracle, and independent certificate verifiers"
+description = "Gröbner bases and finite quotient algebras over prime fields and the rationals, with independent prime-field certificate verifiers"
 readme = "README.md"
 exclude = ["/benchmarks"]
 keywords = ["groebner", "f4", "algebra", "polynomial", "mathematics"]
@@ -30,6 +30,8 @@ num-traits = "0.2"
 rustc-hash = "2.0"
 smallvec = "1.11"
 rayon = "1.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [dev-dependencies]
 criterion = "0.5"

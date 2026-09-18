@@ -1,0 +1,4 @@
+baseline,08f105caf94524acad1ec9481f5a4522204386fd8b4cc1e2bf881a7c7ce0b4b7,<clean-worktree>/target/release/sylv
+baseline-harness,d10cde6878f28fb9a7def209fed0bca154a1b9911c5aa419e2de49d2a9acaca9,<clean-worktree>/target/release/deps/verifier_raw-1821aa1734c0b85e
+patched,760670bf973f5585764327f6003dc43d260eae5eab517fe2a6e184bf35e93e6e,<patched-worktree>/target/release/sylv
+patched-harness,2cce9515a2b3d7fe15b1131561cd5d4de41b406f5542996cf904520515727733,<patched-worktree>/target/release/deps/verifier_raw-1821aa1734c0b85e

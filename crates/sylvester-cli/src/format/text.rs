@@ -87,6 +87,7 @@ pub fn read(origin: &str, text: &str) -> Result<Reading, String> {
         domain,
         nvars,
         body: Body::Expressions(expressions),
+        record: None,
     })
 }
 

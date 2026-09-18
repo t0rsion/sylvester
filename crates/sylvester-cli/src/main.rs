@@ -1,6 +1,6 @@
 //! `sylv`, the command line interface of the sylvester crate.
 //!
-//! The binary reads a polynomial system in one of three formats and
+//! The binary reads a polynomial system in one of four formats and
 //! resolves one ring for the command. The domain is a type parameter in
 //! the library, so every subcommand matches [`AnyRing`] once and branches
 //! no further.
@@ -8,10 +8,15 @@
 //! `docs/rational-design.md` section 8 fixes the subcommands, the formats, the
 //! ring resolution rules, and the exit codes.
 
+#[path = "io.rs"]
+mod bounded_io;
 mod format;
+mod parse;
+mod progress;
+mod quotient;
 
-use std::fs::{self, File};
 use std::io::{self, Read, Write};
+use std::mem::size_of;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -22,8 +27,9 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use format::{DomainClaim, Format, Header, Reading, Rendered};
 use sylvester::{
     Backend, BasisError, Budget, CertifyError, ComputeError, ComputeOptions, ComputeReport, Domain,
-    Established, GroebnerBasis, HilbertError, HilbertSeries, NormalFormError, Polynomial,
-    PolynomialRing, PrimeField, RationalOptions, RationalStop, Rationals, RingError, verify,
+    EnvelopeError, EqualityCheckError, Established, ExpressionError, GroebnerBasis, HilbertError,
+    HilbertSeries, NormalFormError, Polynomial, PolynomialRing, PrimeField, RationalEqualityCheck,
+    RationalOptions, RationalStop, Rationals, ResultEnvelope, RingError, verify,
 };
 
 fn main() -> ExitCode {
@@ -124,10 +130,12 @@ impl Fault {
 #[command(
     name = "sylv",
     version,
-    about = "Gröbner bases over prime fields and the rational numbers",
-    long_about = "Compute, certify, and check Gröbner bases under the grevlex order.\n\n\
-        A system is read from a file or from standard input in one of three formats:\n\
-        ms (msolve), syl (the benchmark format), and text (the crate's own syntax).\n\
+    about = "Gröbner bases and finite quotient algebras over prime fields and rationals",
+    long_about = "Compute Gröbner bases and inspect finite quotient algebras under the grevlex order.\n\
+        Certify prime-field bases and verify certificates.\n\n\
+        A system is read from a file or from standard input in one of four formats:\n\
+        ms (msolve), syl (the benchmark format), text (the crate's own syntax),\n\
+        and json (a sylv-result-v1 computation record).\n\
         The ring comes from the input when the format carries one, and from\n\
         --modulus or --rationals when it does not."
 )]
@@ -153,6 +161,9 @@ enum Command {
     Hilbert(HilbertArgs),
     /// Print the Krull dimension of the quotient by an ideal.
     Dim(HilbertArgs),
+    /// Inspect a finite-dimensional quotient algebra.
+    #[command(alias = "standard-monomials")]
+    Quotient(quotient::QuotientArgs),
     /// Check certificate bytes with the independent verifier.
     Verify(VerifyArgs),
 }
@@ -173,6 +184,8 @@ struct SystemArgs {
     engine: EngineArgs,
     #[command(flatten)]
     limits: LimitArgs,
+    #[command(flatten)]
+    progress: progress::ProgressArgs,
 }
 
 /// Where a polynomial system goes.
@@ -222,7 +235,12 @@ struct LimitArgs {
     #[arg(long, value_name = "SECS")]
     timeout: Option<f64>,
     /// Stop the command once the live data passes this many bytes.
-    #[arg(long, alias = "memory-limit", value_name = "BYTES")]
+    #[arg(
+        long,
+        alias = "memory-limit",
+        value_name = "BYTES",
+        value_parser = parse::bytes
+    )]
     memory: Option<usize>,
 }
 
@@ -243,6 +261,9 @@ struct GbArgs {
     /// Write the counters of the run to standard error.
     #[arg(long)]
     report: bool,
+    /// Run the exact rational ideal equality check after computing a basis.
+    #[arg(long)]
+    check_equality: bool,
 }
 
 #[derive(Args)]
@@ -286,6 +307,8 @@ struct DivideArgs {
     ring: RingArgs,
     #[command(flatten)]
     limits: LimitArgs,
+    #[command(flatten)]
+    progress: progress::ProgressArgs,
 }
 
 #[derive(Args)]
@@ -294,6 +317,9 @@ struct NormalFormArgs {
     divide: DivideArgs,
     #[command(flatten)]
     out: OutputArgs,
+    /// Print each division quotient together with the remainder.
+    #[arg(long)]
+    quotients: bool,
 }
 
 #[derive(Args)]
@@ -326,7 +352,7 @@ struct VerifyArgs {
     certificate: String,
     /// Reject a certificate longer than this many bytes, before reading
     /// it.
-    #[arg(long, value_name = "N")]
+    #[arg(long, value_name = "N", value_parser = parse::bytes)]
     max_bytes: Option<usize>,
     /// Stop the verifier after this many seconds.
     #[arg(long, value_name = "SECS")]
@@ -340,6 +366,8 @@ struct VerifyArgs {
     /// Print nothing. The exit code carries the verdict.
     #[arg(long)]
     quiet: bool,
+    #[command(flatten)]
+    progress: progress::ProgressArgs,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -383,6 +411,7 @@ fn run(started: Instant, cli: Cli) -> Result<(), Fault> {
                 certified,
                 args.certificate,
                 args.report,
+                args.check_equality,
             )
         }
         Command::Certify(args) => basis_command(
@@ -392,13 +421,21 @@ fn run(started: Instant, cli: Cli) -> Result<(), Fault> {
             true,
             args.certificate,
             false,
+            false,
         ),
-        Command::NormalForm(args) => {
-            divide_command(started, args.divide, Divide::Remainder(args.out))
-        }
+        Command::NormalForm(args) => divide_command(
+            started,
+            args.divide,
+            if args.quotients {
+                Divide::Quotients(args.out)
+            } else {
+                Divide::Remainder(args.out)
+            },
+        ),
         Command::Member(args) => divide_command(started, args.divide, Divide::Member(args.output)),
         Command::Hilbert(args) => hilbert_command(started, args, Report::Series),
         Command::Dim(args) => hilbert_command(started, args, Report::Dimension),
+        Command::Quotient(args) => quotient::command(started, args),
         Command::Verify(args) => verify_command(started, args),
     }
 }
@@ -453,6 +490,19 @@ impl Deadline {
             budget = budget.memory_limit(bytes);
         }
         Ok(budget)
+    }
+
+    fn timed_budget(&self) -> Result<Budget, Fault> {
+        let mut budget = Budget::new();
+        if let Some(remaining) = self.remaining()? {
+            budget = budget.timeout(remaining);
+        }
+        Ok(budget)
+    }
+
+    fn absolute(&self) -> Option<Instant> {
+        self.timeout
+            .and_then(|timeout| self.started.checked_add(timeout))
     }
 }
 
@@ -509,7 +559,16 @@ struct Resolved {
 ///
 /// `stdin_taken` holds whether an earlier source already read standard
 /// input. One stream cannot carry two independently parsed inputs.
-fn load(input: &str, declared: Option<Format>, stdin_taken: &mut bool) -> Result<Source, Fault> {
+fn load(
+    input: &str,
+    declared: Option<Format>,
+    stdin_taken: &mut bool,
+    budget: Budget,
+    memory: Option<usize>,
+    deadline: &Deadline,
+    held: usize,
+) -> Result<Source, Fault> {
+    let read_memory = memory.map(|limit| limit.saturating_sub(held));
     let (origin, text, format) = if input == "-" {
         if *stdin_taken {
             return Err(Fault::usage(
@@ -517,10 +576,12 @@ fn load(input: &str, declared: Option<Format>, stdin_taken: &mut bool) -> Result
             ));
         }
         *stdin_taken = true;
-        let mut text = String::new();
-        io::stdin()
-            .read_to_string(&mut text)
-            .map_err(|error| Fault::io(format!("cannot read standard input: {error}")))?;
+        let text = read_source_text(
+            io::stdin(),
+            "standard input",
+            read_memory,
+            deadline.absolute(),
+        )?;
         (
             "standard input".to_string(),
             text,
@@ -536,12 +597,35 @@ fn load(input: &str, declared: Option<Format>, stdin_taken: &mut bool) -> Result
                 ))
             })?,
         };
-        let text = fs::read_to_string(path)
-            .map_err(|error| Fault::io(format!("cannot read {input}: {error}")))?;
+        let text = bounded_io::read_path_text(
+            path,
+            bounded_io::ReadLimits::new(deadline.absolute(), read_memory, None),
+        )
+        .map_err(|error| of_source_read(input, error))?;
         (input.to_string(), text, format)
     };
-    let reading = format::read(format, &origin, &text).map_err(Fault::usage)?;
+    let reading_budget =
+        budget_for_held_source(budget, held.saturating_add(text.capacity()), memory);
+    let reading = format::read_with_budget(format, &origin, &text, reading_budget)
+        .map_err(|error| of_format_read(&origin, error))?;
     Ok(Source { origin, reading })
+}
+
+fn budget_for_held_source(budget: Budget, held: usize, memory: Option<usize>) -> Budget {
+    match memory {
+        Some(limit) => budget.memory_limit(limit.saturating_sub(held)),
+        None => budget,
+    }
+}
+
+fn read_source_text<R: Read>(
+    reader: R,
+    origin: &str,
+    memory: Option<usize>,
+    deadline: Option<Instant>,
+) -> Result<String, Fault> {
+    bounded_io::read_text(reader, bounded_io::ReadLimits::new(deadline, memory, None))
+        .map_err(|error| of_source_read(origin, error))
 }
 
 /// Resolve the one ring of a command.
@@ -684,32 +768,222 @@ fn parse<D: Domain>(
     ring: &PolynomialRing<D>,
     source: &Source,
     names: &[String],
+    input: bool,
+    deadline: &Deadline,
+    limits: &LimitArgs,
 ) -> Result<Vec<Polynomial<D>>, Fault> {
-    let expressions = source
-        .reading
-        .body
-        .expressions(&source.origin, names)
-        .map_err(Fault::usage)?;
-    let mut polynomials = Vec::with_capacity(expressions.len());
-    for (index, expression) in expressions.iter().enumerate() {
-        polynomials.push(ring.parse_polynomial(expression).map_err(|error| {
-            Fault::usage(format!(
-                "{} polynomial {}: {error}",
-                source.origin,
-                index + 1
-            ))
-        })?);
+    parse_with_held(ring, source, names, input, deadline, limits, 0)
+}
+
+fn parse_with_held<D: Domain>(
+    ring: &PolynomialRing<D>,
+    source: &Source,
+    names: &[String],
+    input: bool,
+    deadline: &Deadline,
+    limits: &LimitArgs,
+    extra_held: usize,
+) -> Result<Vec<Polynomial<D>>, Fault> {
+    let count = parse_count(source, input);
+    let mut retained = source_memory_estimate(source).saturating_add(extra_held);
+    retained = retained.saturating_add(count.saturating_mul(size_of::<Polynomial<D>>()));
+    check_parse_memory(limits.memory, retained)?;
+    let mut polynomials = Vec::with_capacity(count);
+    for index in 0..count {
+        let (expression, transient_bytes) = source_expression(source, names, input, index)?;
+        let expression_budget = parse_budget(deadline, limits, retained, transient_bytes)?;
+        let polynomial = ring
+            .parse_polynomial_with_budget(&expression, expression_budget)
+            .map_err(|error| {
+                let fault = of_expression(error);
+                Fault {
+                    message: format!(
+                        "{} polynomial {}: {}",
+                        source.origin,
+                        index + 1,
+                        fault.message
+                    ),
+                    ..fault
+                }
+            })?;
+        retained = retained.saturating_add(polynomial_memory_estimate(&polynomial));
+        check_parse_memory(limits.memory, retained)?;
+        polynomials.push(polynomial);
     }
     Ok(polynomials)
 }
 
-/// The options of one prime-field computation.
-fn compute_options(
+fn parse_count(source: &Source, input: bool) -> usize {
+    if input && let Some(record) = &source.reading.record {
+        return record.input().len();
+    }
+    source.reading.body.len()
+}
+
+fn source_expression<'a>(
+    source: &'a Source,
+    names: &[String],
+    input: bool,
+    index: usize,
+) -> Result<(std::borrow::Cow<'a, str>, usize), Fault> {
+    if input && let Some(record) = &source.reading.record {
+        let expression = record.input().get(index).ok_or_else(|| {
+            Fault::usage(format!("{} has no polynomial {}", source.origin, index + 1))
+        })?;
+        return Ok((std::borrow::Cow::Borrowed(expression.as_str()), 0));
+    }
+    let expression = source
+        .reading
+        .body
+        .expression(&source.origin, index, names)
+        .map_err(Fault::usage)?;
+    let transient_bytes = match &expression {
+        std::borrow::Cow::Borrowed(_) => 0,
+        std::borrow::Cow::Owned(value) => value.len(),
+    };
+    Ok((expression, transient_bytes))
+}
+
+fn parse_budget(
+    deadline: &Deadline,
+    limits: &LimitArgs,
+    retained: usize,
+    expression_bytes: usize,
+) -> Result<Budget, Fault> {
+    let mut budget = deadline.budget(limits)?;
+    if let Some(limit) = limits.memory {
+        let held = retained.saturating_add(expression_bytes);
+        let available = limit.checked_sub(held).ok_or_else(parse_memory_fault)?;
+        budget = budget.memory_limit(available);
+    }
+    Ok(budget)
+}
+
+fn check_parse_memory(limit: Option<usize>, retained: usize) -> Result<(), Fault> {
+    if limit.is_some_and(|limit| retained > limit) {
+        Err(parse_memory_fault())
+    } else {
+        Ok(())
+    }
+}
+
+fn parse_memory_fault() -> Fault {
+    Fault::limit("the parsed input passed its memory limit")
+}
+
+fn source_memory_estimate(source: &Source) -> usize {
+    let mut bytes = size_of::<Source>().saturating_add(source.origin.capacity());
+    if let Some(names) = &source.reading.names {
+        bytes = bytes
+            .saturating_add(names.capacity().saturating_mul(size_of::<String>()))
+            .saturating_add(
+                names
+                    .iter()
+                    .fold(0, |bytes, name| bytes.saturating_add(name.capacity())),
+            );
+    }
+    bytes = match &source.reading.body {
+        format::Body::Expressions(expressions) => bytes
+            .saturating_add(expressions.capacity().saturating_mul(size_of::<String>()))
+            .saturating_add(expressions.iter().fold(0, |bytes, expression| {
+                bytes.saturating_add(expression.capacity())
+            })),
+        format::Body::Terms(polynomials) => bytes
+            .saturating_add(
+                polynomials
+                    .capacity()
+                    .saturating_mul(size_of::<Vec<format::Term>>()),
+            )
+            .saturating_add(polynomials.iter().fold(0, |bytes, terms| {
+                bytes
+                    .saturating_add(terms.capacity().saturating_mul(size_of::<format::Term>()))
+                    .saturating_add(terms.iter().fold(0, |bytes, term| {
+                        bytes
+                            .saturating_add(term.coefficient.capacity())
+                            .saturating_add(
+                                term.exponents.capacity().saturating_mul(size_of::<u16>()),
+                            )
+                    }))
+            })),
+    };
+    if let Some(record) = &source.reading.record {
+        bytes = bytes
+            .saturating_add(size_of::<ResultEnvelope>())
+            .saturating_add(record.variables().len().saturating_mul(size_of::<String>()))
+            .saturating_add(record.input().len().saturating_mul(size_of::<String>()))
+            .saturating_add(record.basis().len().saturating_mul(size_of::<String>()))
+            .saturating_add(
+                record
+                    .variables()
+                    .iter()
+                    .chain(record.input())
+                    .chain(record.basis())
+                    .fold(0, |bytes, value| {
+                        bytes.saturating_add(value.capacity().saturating_add(size_of::<String>()))
+                    }),
+            )
+            .saturating_add(record.certificate().map_or(0, <[u8]>::len));
+    }
+    bytes
+}
+
+fn polynomial_memory_estimate<D: Domain>(polynomial: &Polynomial<D>) -> usize {
+    polynomial.estimated_heap_bytes()
+}
+
+fn polynomials_memory_estimate<D: Domain>(polynomials: &[Polynomial<D>]) -> usize {
+    size_of::<Vec<Polynomial<D>>>()
+        .saturating_add(polynomials.len().saturating_mul(size_of::<Polynomial<D>>()))
+        .saturating_add(polynomials.iter().fold(0, |bytes, polynomial| {
+            bytes.saturating_add(polynomial_memory_estimate(polynomial))
+        }))
+}
+
+fn ideal_memory_estimate<D: Domain>(ideal: &sylvester::Ideal<D>) -> usize {
+    size_of::<sylvester::Ideal<D>>().saturating_add(polynomials_memory_estimate(ideal.generators()))
+}
+
+fn basis_memory_estimate<D: Domain>(basis: &GroebnerBasis<D>) -> usize {
+    size_of::<GroebnerBasis<D>>().saturating_add(polynomials_memory_estimate(basis))
+}
+
+fn budget_after_sources_with_held(
+    deadline: &Deadline,
+    limits: &LimitArgs,
+    sources: &[&Source],
+    extra_held: usize,
+) -> Result<Budget, Fault> {
+    let mut budget = deadline.budget(limits)?;
+    if let Some(limit) = limits.memory {
+        let held = sources
+            .iter()
+            .fold(0usize, |bytes, source| {
+                bytes.saturating_add(source_memory_estimate(source))
+            })
+            .saturating_add(extra_held);
+        budget = budget.memory_limit(limit.checked_sub(held).ok_or_else(parse_memory_fault)?);
+    }
+    Ok(budget)
+}
+
+fn compute_options_after_sources_with_held(
     engine: &EngineArgs,
     limits: &LimitArgs,
     deadline: &Deadline,
+    sources: &[&Source],
+    extra_held: usize,
 ) -> Result<ComputeOptions, Fault> {
-    let mut options = ComputeOptions::new().budget(deadline.budget(limits)?);
+    compute_options_with_budget(
+        engine,
+        budget_after_sources_with_held(deadline, limits, sources, extra_held)?,
+    )
+}
+
+fn compute_options_with_budget(
+    engine: &EngineArgs,
+    budget: Budget,
+) -> Result<ComputeOptions, Fault> {
+    let mut options = ComputeOptions::new().budget(budget);
     if let Some(backend) = engine.backend {
         options = options.backend(backend.into());
     }
@@ -719,11 +993,22 @@ fn compute_options(
     Ok(options)
 }
 
-/// The options of one rational computation.
-fn rational_options(
+fn rational_options_after_sources_with_held(
     engine: &EngineArgs,
     limits: &LimitArgs,
     deadline: &Deadline,
+    sources: &[&Source],
+    extra_held: usize,
+) -> Result<RationalOptions, Fault> {
+    rational_options_with_compute(
+        engine,
+        compute_options_after_sources_with_held(engine, limits, deadline, sources, extra_held)?,
+    )
+}
+
+fn rational_options_with_compute(
+    engine: &EngineArgs,
+    compute: ComputeOptions,
 ) -> Result<RationalOptions, Fault> {
     let extra = engine
         .extra_primes
@@ -732,9 +1017,7 @@ fn rational_options(
         Some(StopArg::Unchanged) => RationalStop::Unchanged { extra },
         None | Some(StopArg::ContainsInput) => RationalStop::ContainsInput { extra },
     };
-    Ok(RationalOptions::new()
-        .compute(compute_options(engine, limits, deadline)?)
-        .stop(stop))
+    Ok(RationalOptions::new().compute(compute).stop(stop))
 }
 
 /// Report the options that describe a computation the command does not run.
@@ -775,10 +1058,22 @@ fn basis_command(
     certified: bool,
     certificate: Option<PathBuf>,
     report: bool,
+    check_equality: bool,
 ) -> Result<(), Fault> {
+    let reporter = system.progress.reporter();
+    reject_output_collision(out.output.as_deref(), certificate.as_deref())?;
+    reporter.phase("read");
     let deadline = Deadline::new(started, system.limits.timeout)?;
     let mut stdin_taken = false;
-    let source = load(&system.input, system.in_format, &mut stdin_taken)?;
+    let source = load(
+        &system.input,
+        system.in_format,
+        &mut stdin_taken,
+        deadline.budget(&system.limits)?,
+        system.limits.memory,
+        &deadline,
+        0,
+    )?;
     let resolved = resolve(&[&source], &system.ring)?;
     let header = Header {
         names: &resolved.names,
@@ -794,6 +1089,8 @@ fn basis_command(
         certified,
         certificate: certificate.as_deref(),
         report,
+        check_equality,
+        reporter,
     };
     match build_ring(&resolved)? {
         AnyRing::Prime(ring) => prime_basis_command(ring, command)?,
@@ -812,110 +1109,177 @@ struct BasisCommand<'a> {
     certified: bool,
     certificate: Option<&'a Path>,
     report: bool,
+    check_equality: bool,
+    reporter: progress::Reporter,
 }
 
 fn prime_basis_command(
     ring: PolynomialRing<PrimeField>,
     command: BasisCommand<'_>,
 ) -> Result<(), Fault> {
+    command.reporter.phase("parse");
+    if command.check_equality {
+        return Err(Fault::usage(
+            "--check-equality applies only to the rational numbers",
+        ));
+    }
     reject_rational_options(&command.system.engine)?;
-    let generators = parse(&ring, command.source, &command.resolved.names)?;
+    let generators = parse(
+        &ring,
+        command.source,
+        &command.resolved.names,
+        true,
+        command.deadline,
+        &command.system.limits,
+    )?;
+    let parsed_held = polynomials_memory_estimate(&generators);
     let ideal = ring.ideal(generators).map_err(of_ring)?;
-    let options = compute_options(
+    let options = compute_options_after_sources_with_held(
         &command.system.engine,
         &command.system.limits,
         command.deadline,
+        &[command.source],
+        parsed_held,
     )?;
     if command.certified {
-        return write_certified_basis(
-            ideal,
-            options,
-            command.out,
-            command.header,
-            command.certificate,
-        );
+        command.reporter.phase("compute");
+        return write_certified_basis(ideal, options, command);
     }
     if command.report {
-        return write_reported_basis(ideal, options, command.out, command.header);
+        command.reporter.phase("compute");
+        return write_reported_basis(ideal, options, command);
     }
+    command.reporter.phase("compute");
     let basis = ideal.groebner_basis(options).map_err(of_compute)?;
-    write_system(command.out, command.header, &render_all(&basis))
+    command.reporter.phase("output");
+    write_prime_result(&ideal, &basis, &command, None)
 }
 
 fn write_certified_basis(
     ideal: sylvester::Ideal<PrimeField>,
     options: ComputeOptions,
-    out: &OutputArgs,
-    header: &Header<'_>,
-    certificate: Option<&Path>,
+    command: BasisCommand<'_>,
 ) -> Result<(), Fault> {
     let accepted = ideal
         .groebner_basis_certified(options)
         .map_err(of_certify)?;
-    if let Some(path) = certificate {
+    command.reporter.phase("output");
+    if let Some(path) = command.certificate {
         write_bytes(path, accepted.certificate())?;
     }
-    write_system(out, header, &render_all(accepted.basis()))
+    write_prime_result(&ideal, accepted.basis(), &command, Some(&accepted))
 }
 
 fn write_reported_basis(
     ideal: sylvester::Ideal<PrimeField>,
     options: ComputeOptions,
-    out: &OutputArgs,
-    header: &Header<'_>,
+    command: BasisCommand<'_>,
 ) -> Result<(), Fault> {
     let (basis, counters) = ideal
         .groebner_basis_with_report(options)
         .map_err(of_compute)?;
-    write_system(out, header, &render_all(&basis))?;
-    write_report(&counters)
+    command.reporter.phase("output");
+    write_prime_result(&ideal, &basis, &command, None)?;
+    write_report(&counters, false)
 }
 
 fn rational_basis_command(
     ring: PolynomialRing<Rationals>,
     command: BasisCommand<'_>,
 ) -> Result<(), Fault> {
+    command.reporter.phase("parse");
     if command.certified {
         return Err(Fault::usage(
             "the rational numbers have no certified path, so --certified and --certificate do not apply",
         ));
     }
-    let generators = parse(&ring, command.source, &command.resolved.names)?;
+    let generators = parse(
+        &ring,
+        command.source,
+        &command.resolved.names,
+        true,
+        command.deadline,
+        &command.system.limits,
+    )?;
+    let parsed_held = polynomials_memory_estimate(&generators);
     let ideal = ring.ideal(generators).map_err(of_ring)?;
-    let options = rational_options(
+    let options = rational_options_after_sources_with_held(
         &command.system.engine,
         &command.system.limits,
         command.deadline,
+        &[command.source],
+        parsed_held,
     )?;
-    if command.report {
-        let (basis, counters) = ideal
+    command.reporter.phase("compute");
+    let (basis, report) = rational_computation(&ideal, options, command.report)?;
+    let equality = rational_equality(&ideal, &basis, &command)?;
+    command.reporter.phase("output");
+    write_rational_result(&ideal, &basis, &command, equality.as_ref())?;
+    if let Some(report) = report {
+        write_report(&report, equality.is_some())
+    } else {
+        Ok(())
+    }
+}
+
+fn rational_computation(
+    ideal: &sylvester::Ideal<Rationals>,
+    options: RationalOptions,
+    report: bool,
+) -> Result<(GroebnerBasis<Rationals>, Option<ComputeReport>), Fault> {
+    if report {
+        let (basis, report) = ideal
             .groebner_basis_with_report(options)
             .map_err(of_compute)?;
-        write_system(command.out, command.header, &render_all(&basis))?;
-        return write_report(&counters);
+        Ok((basis, Some(report)))
+    } else {
+        Ok((ideal.groebner_basis(options).map_err(of_compute)?, None))
     }
-    let basis = ideal.groebner_basis(options).map_err(of_compute)?;
-    write_system(command.out, command.header, &render_all(&basis))
+}
+
+fn rational_equality(
+    ideal: &sylvester::Ideal<Rationals>,
+    basis: &GroebnerBasis<Rationals>,
+    command: &BasisCommand<'_>,
+) -> Result<Option<RationalEqualityCheck>, Fault> {
+    if !command.check_equality {
+        return Ok(None);
+    }
+    command.reporter.phase("equality-check");
+    ideal
+        .check_basis_equality(
+            basis,
+            budget_after_sources_with_held(
+                command.deadline,
+                &command.system.limits,
+                &[command.source],
+                ideal_memory_estimate(ideal).saturating_add(basis_memory_estimate(basis)),
+            )?,
+        )
+        .map(Some)
+        .map_err(of_equality)
 }
 
 /// What a division command prints.
 enum Divide {
     /// The remainder, as a polynomial system.
     Remainder(OutputArgs),
+    /// Every quotient and the remainder, as labeled text lines.
+    Quotients(OutputArgs),
     /// The membership verdict, as `true` or `false`.
     Member(Option<PathBuf>),
 }
 
 fn divide_command(started: Instant, divide: DivideArgs, print: Divide) -> Result<(), Fault> {
-    let deadline = Deadline::new(started, divide.limits.timeout)?;
-    let mut stdin_taken = false;
-    let basis_source = load(&divide.basis, divide.basis_format, &mut stdin_taken)?;
-    let poly_source = load_polynomial_source(&divide, &mut stdin_taken)?;
-    let mut sources = vec![&basis_source];
-    if let Some(source) = &poly_source {
-        sources.push(source);
+    if divide.poly.is_some() && divide.in_format.is_some() {
+        return Err(Fault::usage(
+            "--in-format applies to --poly-file, not to --poly",
+        ));
     }
-    let resolved = resolve(&sources, &divide.ring)?;
+    let reporter = divide.progress.reporter();
+    reporter.phase("read");
+    let deadline = Deadline::new(started, divide.limits.timeout)?;
+    let (basis_source, poly_source, resolved) = divide_sources(&divide, &deadline)?;
     let header = Header {
         names: &resolved.names,
         domain: resolved.domain,
@@ -928,6 +1292,7 @@ fn divide_command(started: Instant, divide: DivideArgs, print: Divide) -> Result
         args: &divide,
         header: &header,
         print,
+        reporter,
     };
     match build_ring(&resolved)? {
         AnyRing::Prime(ring) => divide_in_ring(ring, command),
@@ -935,14 +1300,52 @@ fn divide_command(started: Instant, divide: DivideArgs, print: Divide) -> Result
     }
 }
 
+fn divide_sources(
+    divide: &DivideArgs,
+    deadline: &Deadline,
+) -> Result<(Source, Option<Source>, Resolved), Fault> {
+    let mut stdin_taken = false;
+    let basis_source = load(
+        &divide.basis,
+        divide.basis_format,
+        &mut stdin_taken,
+        deadline.budget(&divide.limits)?,
+        divide.limits.memory,
+        deadline,
+        0,
+    )?;
+    let poly_source = load_polynomial_source(
+        divide,
+        deadline,
+        &mut stdin_taken,
+        source_memory_estimate(&basis_source),
+    )?;
+    let mut sources = vec![&basis_source];
+    if let Some(source) = &poly_source {
+        sources.push(source);
+    }
+    let resolved = resolve(&sources, &divide.ring)?;
+    Ok((basis_source, poly_source, resolved))
+}
+
 fn load_polynomial_source(
     divide: &DivideArgs,
+    deadline: &Deadline,
     stdin_taken: &mut bool,
+    held: usize,
 ) -> Result<Option<Source>, Fault> {
     let Some(path) = &divide.poly_file else {
         return Ok(None);
     };
-    let source = load(path, divide.in_format, stdin_taken)?;
+    let source = load(
+        path,
+        divide.in_format,
+        stdin_taken,
+        deadline.budget(&divide.limits)?,
+        divide.limits.memory,
+        deadline,
+        held,
+    )?;
     if source.reading.body.len() != 1 {
         return Err(Fault::usage(format!(
             "{} holds {} polynomials, --poly-file holds exactly one",
@@ -961,6 +1364,18 @@ struct DivideCommand<'a> {
     args: &'a DivideArgs,
     header: &'a Header<'a>,
     print: Divide,
+    reporter: progress::Reporter,
+}
+
+fn divide_budget_with_held(
+    command: &DivideCommand<'_>,
+    extra_held: usize,
+) -> Result<Budget, Fault> {
+    let mut sources = vec![command.basis_source];
+    if let Some(source) = command.poly_source {
+        sources.push(source);
+    }
+    budget_after_sources_with_held(command.deadline, &command.args.limits, &sources, extra_held)
 }
 
 fn divide_in_ring<D: CliDomain>(
@@ -970,26 +1385,57 @@ fn divide_in_ring<D: CliDomain>(
 where
     D::Coeff: std::fmt::Display,
 {
-    let polynomials = parse(&ring, command.basis_source, &command.resolved.names)?;
+    command.reporter.phase("parse");
+    let basis_extra = command
+        .poly_source
+        .map(source_memory_estimate)
+        .unwrap_or_default();
+    let polynomials = parse_with_held(
+        &ring,
+        command.basis_source,
+        &command.resolved.names,
+        false,
+        command.deadline,
+        &command.args.limits,
+        basis_extra,
+    )?;
+    let parsed_basis_held = polynomials_memory_estimate(&polynomials);
     let basis = D::checked_basis(
         &ring,
         polynomials,
-        command.deadline.budget(&command.args.limits)?,
+        divide_budget_with_held(&command, parsed_basis_held)?,
     )
     .map_err(of_basis)?;
+    command.reporter.phase("compute");
+    let basis_held = basis_memory_estimate(&basis);
+    let direct_text_held = command
+        .args
+        .poly
+        .as_ref()
+        .map(String::len)
+        .unwrap_or_default();
     let polynomial = one_polynomial(
         &ring,
         command.args,
         command.poly_source,
         &command.resolved.names,
+        command.deadline,
+        basis_held,
+        divide_budget_with_held(&command, basis_held.saturating_add(direct_text_held))?,
+    )?;
+    command.reporter.phase("output");
+    let output_budget = divide_budget_with_held(
+        &command,
+        basis_held
+            .saturating_add(polynomial_memory_estimate(&polynomial))
+            .saturating_add(direct_text_held),
     )?;
     divide_output(
         &basis,
         &polynomial,
-        command.deadline,
-        command.args,
         command.header,
         command.print,
+        output_budget,
     )
 }
 
@@ -999,15 +1445,32 @@ fn one_polynomial<D: Domain>(
     divide: &DivideArgs,
     source: Option<&Source>,
     names: &[String],
+    deadline: &Deadline,
+    extra_held: usize,
+    budget: Budget,
 ) -> Result<Polynomial<D>, Fault> {
     match (source, &divide.poly) {
         (Some(source), _) => {
-            let mut polynomials = parse(ring, source, names)?;
+            let mut polynomials = parse_with_held(
+                ring,
+                source,
+                names,
+                false,
+                deadline,
+                &divide.limits,
+                extra_held,
+            )?;
             Ok(polynomials.remove(0))
         }
         (None, Some(text)) => ring
-            .parse_polynomial(text)
-            .map_err(|error| Fault::usage(format!("--poly: {error}"))),
+            .parse_polynomial_with_budget(text, budget)
+            .map_err(|error| {
+                let fault = of_expression(error);
+                Fault {
+                    message: format!("--poly: {}", fault.message),
+                    ..fault
+                }
+            }),
         (None, None) => Err(Fault::usage(
             "name the polynomial with --poly or --poly-file",
         )),
@@ -1018,19 +1481,37 @@ fn one_polynomial<D: Domain>(
 fn divide_output<D: Domain>(
     basis: &GroebnerBasis<D>,
     f: &Polynomial<D>,
-    deadline: &Deadline,
-    divide: &DivideArgs,
     header: &Header<'_>,
     print: Divide,
+    budget: Budget,
 ) -> Result<(), Fault>
 where
     D::Coeff: std::fmt::Display,
 {
-    let budget = deadline.budget(&divide.limits)?;
     match print {
         Divide::Remainder(out) => {
             let remainder = basis.normal_form(f, budget).map_err(of_normal_form)?;
             write_system(&out, header, &[format::render(&remainder)])
+        }
+        Divide::Quotients(out) => {
+            if out.out_format != Format::Text {
+                return Err(Fault::usage(
+                    "--quotients uses the labeled text output, so --out-format text is required",
+                ));
+            }
+            let result = basis.divide(f, budget).map_err(of_normal_form)?;
+            let mut text = String::new();
+            for (index, quotient) in result.quotients().iter().enumerate() {
+                text.push_str(&format!(
+                    "quotient[{index}]: {}\n",
+                    format::expression(&format::render(quotient), header.names)
+                ));
+            }
+            text.push_str(&format!(
+                "remainder: {}\n",
+                format::expression(&format::render(result.remainder()), header.names)
+            ));
+            write_text(out.output.as_deref(), &text)
         }
         Divide::Member(path) => {
             let member = basis.contains(f, budget).map_err(of_normal_form)?;
@@ -1046,7 +1527,11 @@ enum Report {
 }
 
 fn hilbert_command(started: Instant, args: HilbertArgs, report: Report) -> Result<(), Fault> {
+    let reporter = args.system.progress.reporter();
+    reporter.phase("read");
     let (deadline, source, resolved) = prepare_hilbert(started, &args)?;
+    reporter.phase("parse");
+    reporter.phase("compute");
     let (series, established) = match build_ring(&resolved)? {
         AnyRing::Prime(ring) => (
             prime_hilbert(ring, &source, &resolved, &args, &deadline)?,
@@ -1058,6 +1543,7 @@ fn hilbert_command(started: Instant, args: HilbertArgs, report: Report) -> Resul
         Report::Series => hilbert_text(&series),
         Report::Dimension => dimension_line(&series),
     };
+    reporter.phase("output");
     write_text(
         args.output.as_deref(),
         &format!("{}{text}", qualification(established)),
@@ -1070,7 +1556,15 @@ fn prepare_hilbert(
 ) -> Result<(Deadline, Source, Resolved), Fault> {
     let deadline = Deadline::new(started, args.system.limits.timeout)?;
     let mut stdin_taken = false;
-    let source = load(&args.system.input, args.system.in_format, &mut stdin_taken)?;
+    let source = load(
+        &args.system.input,
+        args.system.in_format,
+        &mut stdin_taken,
+        deadline.budget(&args.system.limits)?,
+        args.system.limits.memory,
+        &deadline,
+        0,
+    )?;
     let resolved = resolve(&[&source], &args.system.ring)?;
     if args.from_basis {
         reject_engine_options(
@@ -1089,23 +1583,43 @@ fn prime_hilbert(
     deadline: &Deadline,
 ) -> Result<HilbertSeries, Fault> {
     reject_rational_options(&args.system.engine)?;
-    let polynomials = parse(&ring, source, &resolved.names)?;
+    let polynomials = parse(
+        &ring,
+        source,
+        &resolved.names,
+        !args.from_basis,
+        deadline,
+        &args.system.limits,
+    )?;
+    let parsed_held = polynomials_memory_estimate(&polynomials);
     let basis = if args.from_basis {
         GroebnerBasis::<PrimeField>::from_polynomials(
             &ring,
             polynomials,
-            deadline.budget(&args.system.limits)?,
+            budget_after_sources_with_held(deadline, &args.system.limits, &[source], parsed_held)?,
         )
         .map_err(of_basis)?
     } else {
-        let options = compute_options(&args.system.engine, &args.system.limits, deadline)?;
+        let options = compute_options_after_sources_with_held(
+            &args.system.engine,
+            &args.system.limits,
+            deadline,
+            &[source],
+            parsed_held,
+        )?;
         ring.ideal(polynomials)
             .map_err(of_ring)?
             .groebner_basis(options)
             .map_err(of_compute)?
     };
+    let basis_held = basis_memory_estimate(&basis);
     basis
-        .hilbert_series(deadline.budget(&args.system.limits)?)
+        .hilbert_series(budget_after_sources_with_held(
+            deadline,
+            &args.system.limits,
+            &[source],
+            basis_held,
+        )?)
         .map_err(of_hilbert)
 }
 
@@ -1116,24 +1630,44 @@ fn rational_hilbert(
     args: &HilbertArgs,
     deadline: &Deadline,
 ) -> Result<(HilbertSeries, Option<Established>), Fault> {
-    let polynomials = parse(&ring, source, &resolved.names)?;
+    let polynomials = parse(
+        &ring,
+        source,
+        &resolved.names,
+        !args.from_basis,
+        deadline,
+        &args.system.limits,
+    )?;
+    let parsed_held = polynomials_memory_estimate(&polynomials);
     let basis = if args.from_basis {
         GroebnerBasis::<Rationals>::from_polynomials(
             &ring,
             polynomials,
-            deadline.budget(&args.system.limits)?,
+            budget_after_sources_with_held(deadline, &args.system.limits, &[source], parsed_held)?,
         )
         .map_err(of_basis)?
     } else {
-        let options = rational_options(&args.system.engine, &args.system.limits, deadline)?;
+        let options = rational_options_after_sources_with_held(
+            &args.system.engine,
+            &args.system.limits,
+            deadline,
+            &[source],
+            parsed_held,
+        )?;
         ring.ideal(polynomials)
             .map_err(of_ring)?
             .groebner_basis(options)
             .map_err(of_compute)?
     };
     let established = basis.lift().map(|lift| lift.established);
+    let basis_held = basis_memory_estimate(&basis);
     let series = basis
-        .hilbert_series(deadline.budget(&args.system.limits)?)
+        .hilbert_series(budget_after_sources_with_held(
+            deadline,
+            &args.system.limits,
+            &[source],
+            basis_held,
+        )?)
         .map_err(of_hilbert)?;
     Ok((series, established))
 }
@@ -1191,32 +1725,24 @@ fn dimension_line(series: &HilbertSeries) -> String {
 }
 
 fn verify_command(started: Instant, args: VerifyArgs) -> Result<(), Fault> {
+    let reporter = if args.quiet {
+        progress::ProgressArgs::default().reporter()
+    } else {
+        args.progress.reporter()
+    };
+    reporter.phase("read");
     let deadline = Deadline::new(started, args.timeout)?;
     let mut limits = verify::Limits::default();
     if let Some(max_bytes) = args.max_bytes {
         limits.max_bytes = max_bytes;
     }
-    let bytes = read_capped(&args.certificate, limits.max_bytes)?;
-    if let Some(remaining) = deadline.remaining()? {
-        limits.deadline = Instant::now().checked_add(remaining);
-    }
-    let verified = match verify::verify_with_limits(&bytes, &limits) {
-        Ok(verified) => verified,
-        Err(error) if error.is_exhaustion() => {
-            return Err(Fault::limit(format!("the verifier stopped: {error}")));
-        }
-        Err(error) => {
-            return Err(Fault::rejected(format!(
-                "the verifier rejected the certificate: {error}"
-            )));
-        }
-    };
+    let bytes = read_capped(&args.certificate, limits.max_bytes, &deadline)?;
+    reporter.phase("verify");
+    let (verified, names, synthetic_names) =
+        verify_record_or_certificate(&bytes, &mut limits, &deadline)?;
     if args.quiet {
         return Ok(());
     }
-    let names: Vec<String> = (1..=verified.nvars())
-        .map(|index| format!("x{index}"))
-        .collect();
     let header = Header {
         names: &names,
         domain: DomainClaim::Prime(verified.modulus()),
@@ -1230,36 +1756,58 @@ fn verify_command(started: Instant, args: VerifyArgs) -> Result<(), Fault> {
         out_format: args.out_format,
         output: args.output,
     };
+    reporter.phase("output");
     write_system(&out, &header, &rendered)?;
-    eprintln!(
-        "sylv: the certificate carries no variable names, so the basis prints under the synthetic names x1 to x{}",
-        verified.nvars()
-    );
+    if synthetic_names {
+        eprintln!(
+            "sylv: the certificate carries no variable names, so the basis prints under the synthetic names x1 to x{}",
+            verified.nvars()
+        );
+    }
     Ok(())
 }
 
-/// Read at most `max_bytes + 1` bytes, and reject anything longer.
-fn read_capped(input: &str, max_bytes: usize) -> Result<Vec<u8>, Fault> {
-    let cap = max_bytes.saturating_add(1) as u64;
-    let mut bytes = Vec::new();
-    if input == "-" {
-        io::stdin()
-            .take(cap)
-            .read_to_end(&mut bytes)
-            .map_err(|error| Fault::io(format!("cannot read standard input: {error}")))?;
+fn verify_record_or_certificate(
+    bytes: &[u8],
+    limits: &mut verify::Limits,
+    deadline: &Deadline,
+) -> Result<(verify::VerifiedGb, Vec<String>, bool), Fault> {
+    match ResultEnvelope::from_json(bytes, deadline.timed_budget()?) {
+        Ok(record) => {
+            let verified = record
+                .verify_prime(limits, deadline.timed_budget()?)
+                .map_err(of_record_verification)?;
+            Ok((verified, record.variables().to_vec(), false))
+        }
+        Err(EnvelopeError::Format(_)) => {
+            if let Some(remaining) = deadline.remaining()? {
+                limits.deadline = Instant::now().checked_add(remaining);
+            }
+            let verified = verify::verify_with_limits(bytes, limits).map_err(|error| {
+                if error.is_exhaustion() {
+                    Fault::limit(format!("the verifier stopped: {error}"))
+                } else {
+                    Fault::rejected(format!("the verifier rejected the certificate: {error}"))
+                }
+            })?;
+            let names = (1..=verified.nvars())
+                .map(|index| format!("x{index}"))
+                .collect();
+            Ok((verified, names, true))
+        }
+        Err(error) => Err(of_record_verification(error)),
+    }
+}
+
+/// Read a certificate under its byte cap and command deadline.
+fn read_capped(input: &str, max_bytes: usize, deadline: &Deadline) -> Result<Vec<u8>, Fault> {
+    let limits = bounded_io::ReadLimits::new(deadline.absolute(), None, Some(max_bytes));
+    let result = if input == "-" {
+        bounded_io::read_bytes(io::stdin(), limits)
     } else {
-        let file = File::open(input)
-            .map_err(|error| Fault::io(format!("cannot read {input}: {error}")))?;
-        file.take(cap)
-            .read_to_end(&mut bytes)
-            .map_err(|error| Fault::io(format!("cannot read {input}: {error}")))?;
-    }
-    if bytes.len() > max_bytes {
-        return Err(Fault::limit(format!(
-            "the certificate is longer than {max_bytes} bytes"
-        )));
-    }
-    Ok(bytes)
+        bounded_io::read_path_bytes(Path::new(input), limits)
+    };
+    result.map_err(|error| of_bounded_read(input, error))
 }
 
 fn render_all<D: Domain>(polynomials: &[Polynomial<D>]) -> Vec<Rendered>
@@ -1269,18 +1817,118 @@ where
     polynomials.iter().map(format::render).collect()
 }
 
+fn write_prime_result(
+    ideal: &sylvester::Ideal<PrimeField>,
+    basis: &GroebnerBasis<PrimeField>,
+    command: &BasisCommand<'_>,
+    certified: Option<&sylvester::CertifiedGroebnerBasis>,
+) -> Result<(), Fault> {
+    if command.out.out_format == Format::Json {
+        let certificate_bytes = certified.map_or(0, |value| value.certificate().len());
+        let construction_budget = result_budget(command, ideal, basis, certificate_bytes)?;
+        let record = match certified {
+            Some(certified) => {
+                ResultEnvelope::from_certified(ideal, certified, construction_budget)
+            }
+            None => ResultEnvelope::from_prime(ideal, basis, None, construction_budget),
+        }
+        .map_err(of_envelope)?;
+        return write_result_json(
+            command.out,
+            &record,
+            result_budget(command, ideal, basis, certificate_bytes)?,
+        );
+    }
+    write_system(command.out, command.header, &render_all(basis))
+}
+
+fn write_rational_result(
+    ideal: &sylvester::Ideal<Rationals>,
+    basis: &GroebnerBasis<Rationals>,
+    command: &BasisCommand<'_>,
+    equality: Option<&RationalEqualityCheck>,
+) -> Result<(), Fault> {
+    if command.out.out_format == Format::Json {
+        let equality_bytes = equality.map_or(0, equality_memory_estimate);
+        let construction_budget = result_budget(command, ideal, basis, equality_bytes)?;
+        let record = match equality {
+            Some(equality) => ResultEnvelope::from_checked_rational(equality, construction_budget),
+            None => ResultEnvelope::from_rational(ideal, basis, construction_budget),
+        }
+        .map_err(of_envelope)?;
+        return write_result_json(
+            command.out,
+            &record,
+            result_budget(command, ideal, basis, equality_bytes)?,
+        );
+    }
+    let rendered = render_all(basis);
+    if equality.is_some() && command.out.out_format == Format::Text {
+        let mut bytes = b"# equality_check: passed\n".to_vec();
+        format::write(Format::Text, command.header, &rendered, &mut bytes)
+            .map_err(|error| Fault::of_io("cannot render output", &error))?;
+        return write_output_bytes(command.out.output.as_deref(), &bytes);
+    }
+    write_system(command.out, command.header, &rendered)
+}
+
+fn equality_memory_estimate(check: &RationalEqualityCheck) -> usize {
+    ideal_memory_estimate(check.input())
+        .saturating_add(basis_memory_estimate(check.basis()))
+        .saturating_add(check.origins().iter().fold(0usize, |bytes, row| {
+            bytes
+                .saturating_add(polynomials_memory_estimate(row))
+                .saturating_add(
+                    row.capacity()
+                        .saturating_sub(row.len())
+                        .saturating_mul(size_of::<Polynomial<Rationals>>()),
+                )
+        }))
+}
+
+fn result_budget<D: Domain>(
+    command: &BasisCommand<'_>,
+    ideal: &sylvester::Ideal<D>,
+    basis: &GroebnerBasis<D>,
+    extra_held: usize,
+) -> Result<Budget, Fault> {
+    budget_after_sources_with_held(
+        command.deadline,
+        &command.system.limits,
+        &[command.source],
+        ideal_memory_estimate(ideal)
+            .saturating_add(basis_memory_estimate(basis))
+            .saturating_add(extra_held),
+    )
+}
+
+fn write_result_json(
+    out: &OutputArgs,
+    record: &ResultEnvelope,
+    budget: Budget,
+) -> Result<(), Fault> {
+    let mut bytes = record.to_json(budget).map_err(of_envelope)?;
+    bytes.push(b'\n');
+    write_output_bytes(out.output.as_deref(), &bytes)
+}
+
 /// Write a polynomial system to a file or to standard output.
 fn write_system(
     out: &OutputArgs,
     header: &Header<'_>,
     polynomials: &[Rendered],
 ) -> Result<(), Fault> {
+    if out.out_format == Format::Json {
+        return Err(Fault::usage(
+            "JSON output is available for Gröbner basis results only",
+        ));
+    }
     match &out.output {
         Some(path) => {
-            let mut file = File::create(path)
-                .map_err(|error| Fault::io(format!("cannot write {}: {error}", path.display())))?;
-            format::write(out.out_format, header, polynomials, &mut file)
-                .map_err(|error| Fault::of_io(&format!("cannot write {}", path.display()), &error))
+            let mut bytes = Vec::new();
+            format::write(out.out_format, header, polynomials, &mut bytes)
+                .map_err(|error| Fault::of_io("cannot render output", &error))?;
+            write_output_bytes(Some(path), &bytes)
         }
         None => {
             let stdout = io::stdout();
@@ -1292,10 +1940,25 @@ fn write_system(
     }
 }
 
+fn write_output_bytes(path: Option<&Path>, bytes: &[u8]) -> Result<(), Fault> {
+    match path {
+        Some(path) => write_file_atomic(path, bytes)
+            .map_err(|error| Fault::io(format!("cannot write {}: {error}", path.display()))),
+        None => {
+            let stdout = io::stdout();
+            let mut handle = stdout.lock();
+            handle
+                .write_all(bytes)
+                .and_then(|()| handle.flush())
+                .map_err(|error| Fault::of_io("cannot write standard output", &error))
+        }
+    }
+}
+
 /// Write plain text to a file or to standard output.
 fn write_text(path: Option<&Path>, text: &str) -> Result<(), Fault> {
     match path {
-        Some(path) => fs::write(path, text)
+        Some(path) => write_file_atomic(path, text.as_bytes())
             .map_err(|error| Fault::io(format!("cannot write {}: {error}", path.display()))),
         None => {
             let stdout = io::stdout();
@@ -1309,12 +1972,21 @@ fn write_text(path: Option<&Path>, text: &str) -> Result<(), Fault> {
 }
 
 fn write_bytes(path: &Path, bytes: &[u8]) -> Result<(), Fault> {
-    fs::write(path, bytes)
+    write_file_atomic(path, bytes)
         .map_err(|error| Fault::io(format!("cannot write {}: {error}", path.display())))
 }
 
+fn write_file_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    bounded_io::write_atomic(path, bytes)
+}
+
+fn reject_output_collision(output: Option<&Path>, certificate: Option<&Path>) -> Result<(), Fault> {
+    bounded_io::reject_same_targets(certificate, output)
+        .map_err(|_| Fault::usage("the certificate and result output must use different paths"))
+}
+
 /// Write the counters of a run to standard error, one per line.
-fn write_report(report: &ComputeReport) -> Result<(), Fault> {
+fn write_report(report: &ComputeReport, equality_checked: bool) -> Result<(), Fault> {
     let mut lines = vec![
         format!(
             "backend: {}",
@@ -1367,6 +2039,9 @@ fn write_report(report: &ComputeReport) -> Result<(), Fault> {
             ),
         ]);
     }
+    if equality_checked {
+        lines.push("equality_check: passed".to_string());
+    }
     let stderr = io::stderr();
     let mut handle = stderr.lock();
     for line in lines {
@@ -1374,6 +2049,138 @@ fn write_report(report: &ComputeReport) -> Result<(), Fault> {
             .map_err(|error| Fault::of_io("cannot write standard error", &error))?;
     }
     Ok(())
+}
+
+fn of_expression(error: ExpressionError) -> Fault {
+    match error {
+        ExpressionError::Timeout
+        | ExpressionError::MemoryLimitExceeded
+        | ExpressionError::ExponentLimit { .. }
+        | ExpressionError::Compute(ComputeError::Timeout)
+        | ExpressionError::Compute(ComputeError::MemoryLimitExceeded)
+        | ExpressionError::Compute(ComputeError::DegreeLimit { .. })
+        | ExpressionError::Compute(ComputeError::ExponentLimit { .. })
+        | ExpressionError::Compute(ComputeError::TableFull)
+        | ExpressionError::Compute(ComputeError::PrimesExhausted) => {
+            Fault::limit(error.to_string())
+        }
+        ExpressionError::Parse(_)
+        | ExpressionError::Ring(_)
+        | ExpressionError::NestingLimit { .. }
+        | ExpressionError::Arithmetic(_) => Fault::usage(error.to_string()),
+    }
+}
+
+fn of_format_read(origin: &str, error: format::ReadError) -> Fault {
+    match error {
+        format::ReadError::Format(message) => Fault::usage(message),
+        format::ReadError::Envelope(error) => {
+            let fault = match error {
+                EnvelopeError::Timeout | EnvelopeError::MemoryLimitExceeded => {
+                    Fault::limit(error.to_string())
+                }
+                EnvelopeError::Ring(_) | EnvelopeError::RingMismatch | EnvelopeError::Format(_) => {
+                    Fault::usage(error.to_string())
+                }
+                EnvelopeError::Expression(error) => of_expression(error),
+                EnvelopeError::EqualityCheck(error) => of_equality(error),
+                EnvelopeError::Verification(error) => {
+                    if error.is_exhaustion() {
+                        Fault::limit(error.to_string())
+                    } else {
+                        Fault::rejected(error.to_string())
+                    }
+                }
+                EnvelopeError::CertificateMismatch => Fault::rejected(error.to_string()),
+            };
+            Fault {
+                message: format!("{origin}: {}", fault.message),
+                ..fault
+            }
+        }
+    }
+}
+
+fn of_source_read(origin: &str, error: bounded_io::ReadError) -> Fault {
+    of_bounded_read(origin, error)
+}
+
+fn of_bounded_read(origin: &str, error: bounded_io::ReadError) -> Fault {
+    match error {
+        bounded_io::ReadError::Io(error) => Fault::of_io(&format!("cannot read {origin}"), &error),
+        bounded_io::ReadError::Timeout | bounded_io::ReadError::MemoryLimitExceeded => {
+            Fault::limit(format!("{origin}: {error}"))
+        }
+        bounded_io::ReadError::TooLong { limit } => {
+            Fault::limit(format!("{origin} is longer than {limit} bytes"))
+        }
+        bounded_io::ReadError::InvalidUtf8 => Fault::usage(format!("{origin} is not valid UTF-8")),
+    }
+}
+
+fn of_envelope(error: EnvelopeError) -> Fault {
+    match error {
+        EnvelopeError::Timeout | EnvelopeError::MemoryLimitExceeded => {
+            Fault::limit(error.to_string())
+        }
+        EnvelopeError::Expression(error) => of_expression(error),
+        EnvelopeError::EqualityCheck(error) => of_equality(error),
+        EnvelopeError::Verification(error) => {
+            if error.is_exhaustion() {
+                Fault::limit(error.to_string())
+            } else {
+                Fault::rejected(error.to_string())
+            }
+        }
+        EnvelopeError::CertificateMismatch => Fault::rejected(error.to_string()),
+        EnvelopeError::RingMismatch | EnvelopeError::Format(_) | EnvelopeError::Ring(_) => {
+            Fault::internal(error.to_string())
+        }
+    }
+}
+
+fn of_equality(error: EqualityCheckError) -> Fault {
+    match error {
+        EqualityCheckError::Candidate(error) => {
+            let fault = of_basis(error);
+            Fault {
+                message: format!("the equality check failed: {}", fault.message),
+                ..fault
+            }
+        }
+        EqualityCheckError::RingMismatch
+        | EqualityCheckError::ReverseMembership { .. }
+        | EqualityCheckError::ForwardMembership { .. } => {
+            Fault::usage(format!("the equality check failed: {error}"))
+        }
+        EqualityCheckError::ExponentLimit { .. }
+        | EqualityCheckError::Timeout
+        | EqualityCheckError::MemoryLimitExceeded => {
+            Fault::limit(format!("the equality check stopped: {error}"))
+        }
+    }
+}
+
+fn of_record_verification(error: EnvelopeError) -> Fault {
+    match error {
+        EnvelopeError::Timeout | EnvelopeError::MemoryLimitExceeded => {
+            Fault::limit(error.to_string())
+        }
+        EnvelopeError::Verification(error) if error.is_exhaustion() => {
+            Fault::limit(format!("the verifier stopped: {error}"))
+        }
+        EnvelopeError::Verification(error) => {
+            Fault::rejected(format!("the verifier rejected the certificate: {error}"))
+        }
+        EnvelopeError::CertificateMismatch => Fault::rejected(error.to_string()),
+        EnvelopeError::Expression(_)
+        | EnvelopeError::EqualityCheck(_)
+        | EnvelopeError::Format(_)
+        | EnvelopeError::RingMismatch
+        | EnvelopeError::Ring(_) => {
+            Fault::rejected(format!("the result record is not verified: {error}"))
+        }
+    }
 }
 
 fn of_ring(error: RingError) -> Fault {

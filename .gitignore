@@ -2,7 +2,9 @@ target/
 **/__pycache__/
 **/.pytest_cache/
 **/.ruff_cache/
-/crates/
+/crates/*/dist/
+/crates/sylvester-py/python/sylvester/*.so
+/crates/sylvester-py/python/sylvester/*.pyd
 /benchmarks/gb-comparison/outputs/
 /benchmarks/gb-comparison/runner/bin/
 /benchmarks/gb-comparison/runner/target-*/
