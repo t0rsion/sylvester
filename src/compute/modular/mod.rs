@@ -32,6 +32,31 @@ use crate::ring::{Established, ModularLift, PolynomialRing, PrimeField, Rational
 use crt::Accumulator;
 use primes::{Prime, Sequence};
 
+type PrimeRun = Result<Vec<Polynomial<PrimeField>>, RunError>;
+type PrimeHandle<'scope> = Option<thread::ScopedJoinHandle<'scope, PrimeRun>>;
+
+fn spawn_runs<'scope, 'env>(
+    scope: &'scope thread::Scope<'scope, 'env>,
+    input: &'scope Input<'_>,
+    primes: &[Prime],
+    run_limits: &ComputeLimits,
+    spawned: &mut usize,
+) -> Vec<PrimeHandle<'scope>>
+where
+    'env: 'scope,
+{
+    let mut handles = Vec::with_capacity(primes.len());
+    for prime in primes {
+        let value = prime.value;
+        let limits = run_limits.clone();
+        let started =
+            thread::Builder::new().spawn_scoped(scope, move || run_one(input, value, &limits));
+        *spawned += usize::from(started.is_ok());
+        handles.push(started.ok());
+    }
+    handles
+}
+
 /// The most prime runs the driver starts at once.
 ///
 /// A larger [`ComputeOptions::threads`] is clamped to this. Each
@@ -236,6 +261,7 @@ impl State {
                     let limits = ComputeLimits {
                         memory: self.residual(input).map(|bytes| bytes.saturating_sub(copy)),
                         cancel: Some(Arc::new(AtomicBool::new(false))),
+                        external_cancel: input.limits.cancel.clone(),
                         ..input.limits.clone()
                     };
                     if check::contains_input(&input.generators, &basis, &limits)? {
@@ -275,6 +301,7 @@ impl State {
         let run_limits = ComputeLimits {
             memory: residual.map(|bytes| (bytes / primes.len()).max(1)),
             cancel: Some(flag.clone()),
+            external_cancel: input.limits.cancel.clone(),
             ..input.limits.clone()
         };
         let (outcome, started) = self.run_primes(input, &primes, &run_limits, &flag);
@@ -293,15 +320,7 @@ impl State {
         let mut spawned = 0usize;
         let mut on_this_thread = false;
         thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(primes.len());
-            for prime in primes {
-                let value = prime.value;
-                let limits = run_limits.clone();
-                let started = thread::Builder::new()
-                    .spawn_scoped(scope, move || run_one(input, value, &limits));
-                spawned += usize::from(started.is_ok());
-                handles.push(started.ok());
-            }
+            let handles = spawn_runs(scope, input, primes, run_limits, &mut spawned);
             for (offset, handle) in handles.into_iter().enumerate() {
                 if !matches!(outcome, Ok(Progress::Continue)) {
                     flag.store(true, Ordering::Relaxed);
@@ -314,11 +333,20 @@ impl State {
                     run_limits,
                     &mut on_this_thread,
                 );
-                outcome = self.advance_prime(input, primes[offset], result);
+                outcome = match input.limits.stop() {
+                    Some(stop) => Err(stop),
+                    None => self.advance_prime(input, primes[offset], result),
+                };
                 if matches!(outcome, Ok(Progress::Continue)) {
                     self.retry_alone = false;
                 }
             }
+            if matches!(outcome, Ok(Progress::Continue))
+                && let Some(stop) = input.limits.stop()
+            {
+                outcome = Err(stop);
+            }
+            flag.store(true, Ordering::Relaxed);
         });
         let started = spawned.saturating_add(usize::from(on_this_thread));
         (outcome, started)

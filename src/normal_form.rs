@@ -12,11 +12,12 @@
 use std::fmt;
 use std::mem::size_of;
 
-use crate::compute::{ComputeError, ComputeLimits, DEGREE_LIMIT, RunError};
+use crate::compute::{Budget, ComputeError, ComputeLimits, DEGREE_LIMIT, RunError};
+use crate::ideal::GroebnerBasis;
 use crate::poly::{ExponentOverflow, Polynomial, Term, divide_coefficients, heap_exps_bytes};
-use crate::ring::{Domain, DomainOps, PolynomialRing};
+use crate::ring::{Domain, DomainOps, PolynomialRing, PrimeField};
 
-/// Why a normal form is not computed.
+/// Why division does not return a result.
 ///
 /// [`NormalFormError::Timeout`] and
 /// [`NormalFormError::MemoryLimitExceeded`] report an exhausted budget.
@@ -60,6 +61,63 @@ impl fmt::Display for NormalFormError {
 }
 
 impl std::error::Error for NormalFormError {}
+
+/// The quotients and remainder of division by a Gröbner basis.
+///
+/// If the basis is `G = [g_0, ..., g_k]`, the result holds one quotient
+/// `q_i` for every element of `G` and a remainder `r` such that
+/// `f = sum_i q_i * g_i + r`. The identity is against the supplied basis
+/// `G`, not an original input list `F`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DivisionResult<D: Domain = PrimeField> {
+    /// Quotients in the order of the basis elements.
+    pub quotients: Vec<Polynomial<D>>,
+    /// The remainder, with no monomial divisible by a basis leading
+    /// monomial.
+    pub remainder: Polynomial<D>,
+}
+
+impl<D: Domain> DivisionResult<D> {
+    /// Borrow the quotients in basis order.
+    pub fn quotients(&self) -> &[Polynomial<D>] {
+        &self.quotients
+    }
+
+    /// Borrow the remainder.
+    pub fn remainder(&self) -> &Polynomial<D> {
+        &self.remainder
+    }
+
+    /// Take the quotients and remainder.
+    pub fn into_parts(self) -> (Vec<Polynomial<D>>, Polynomial<D>) {
+        (self.quotients, self.remainder)
+    }
+}
+
+impl<D: Domain> GroebnerBasis<D> {
+    /// Divide `f` by the basis and return every quotient and the remainder.
+    ///
+    /// If the basis is `G = [g_0, ..., g_k]`, the result holds one quotient
+    /// per basis element and satisfies `f = sum_i q_i * g_i + r`. The
+    /// identity is against this basis `G`, not an original input list `F`.
+    /// The basis is a Gröbner basis, so `r` is the unique normal form.
+    ///
+    /// The budget stops division between reduction steps. It also charges
+    /// the input, working polynomial, quotients, remainder, and temporary
+    /// reduction data before each allocation. A polynomial from another
+    /// ring returns [`NormalFormError::RingMismatch`].
+    pub fn divide(
+        &self,
+        f: &Polynomial<D>,
+        budget: Budget,
+    ) -> Result<DivisionResult<D>, NormalFormError> {
+        if f.ring() != self.ring() {
+            return Err(NormalFormError::RingMismatch);
+        }
+        let limits = ComputeLimits::of_budget(&budget);
+        divide_with_limits(self, f, &limits).map_err(NormalFormError::from)
+    }
+}
 
 /// Why a list of polynomials is not accepted as a reduced Gröbner basis.
 ///
@@ -235,58 +293,540 @@ pub(crate) fn normal_form<D: Domain>(
     f: &Polynomial<D>,
     limits: &ComputeLimits,
 ) -> Result<Polynomial<D>, DivisionStop> {
+    normal_form_with_extra(basis, f, limits, 0)
+}
+
+struct NormalFormState<'a, D: Domain> {
+    basis: &'a [Polynomial<D>],
+    ring: &'a PolynomialRing<D>,
+    limits: &'a ComputeLimits,
+    extra_bytes: usize,
+    input_bytes: usize,
+    ops: &'a D::Ops,
+}
+
+fn normal_form_with_extra<D: Domain>(
+    basis: &[Polynomial<D>],
+    f: &Polynomial<D>,
+    limits: &ComputeLimits,
+    extra_bytes: usize,
+) -> Result<Polynomial<D>, DivisionStop> {
     let ring = f.ring();
-    let ops = ring.ops();
-    let mut working = f.clone();
+    let state = NormalFormState {
+        basis,
+        ring,
+        limits,
+        extra_bytes,
+        input_bytes: f.retained_bytes(),
+        ops: ring.ops(),
+    };
+    let mut working = normal_form_working(&state, f)?;
     // The remainder grows by the largest term left, so it is built
     // descending and turned around once.
     let mut remainder: Vec<Term<D>> = Vec::new();
-    let mut remainder_bytes = 0usize;
+    while working.lt().is_some() {
+        normal_form_step(&state, &mut working, &mut remainder)?;
+    }
+    finish_normal_form(&state, working, remainder)
+}
 
-    while let Some(lead) = working.lt().cloned() {
-        let held = working.heap_bytes().saturating_add(remainder_bytes);
-        check(limits, held)?;
+fn normal_form_working<D: Domain>(
+    state: &NormalFormState<'_, D>,
+    f: &Polynomial<D>,
+) -> Result<Polynomial<D>, DivisionStop> {
+    check(
+        state.limits,
+        state.extra_bytes.saturating_add(state.input_bytes),
+    )?;
+    check(
+        state.limits,
+        state
+            .extra_bytes
+            .saturating_add(state.input_bytes.saturating_add(state.input_bytes)),
+    )?;
+    let working = f.clone();
+    check(
+        state.limits,
+        state
+            .extra_bytes
+            .saturating_add(state.input_bytes)
+            .saturating_add(working.retained_bytes()),
+    )?;
+    Ok(working)
+}
 
-        let mut reducer = None;
-        for g in basis {
-            let Some(lead_g) = g.lt() else { continue };
-            if lead_g.mono.divides(&lead.mono) {
-                reducer = Some((g, lead_g));
-                break;
-            }
+fn normal_form_held<D: Domain>(
+    state: &NormalFormState<'_, D>,
+    working: &Polynomial<D>,
+    remainder: &Vec<Term<D>>,
+) -> usize {
+    state
+        .extra_bytes
+        .saturating_add(state.input_bytes)
+        .saturating_add(working.retained_bytes())
+        .saturating_add(retained_terms_bytes(
+            remainder,
+            remainder.capacity(),
+            working.ring().nvars(),
+            state.ops,
+        ))
+}
+
+fn normal_form_step<D: Domain>(
+    state: &NormalFormState<'_, D>,
+    working: &mut Polynomial<D>,
+    remainder: &mut Vec<Term<D>>,
+) -> Result<(), DivisionStop> {
+    let held = normal_form_held(state, working, remainder);
+    check(state.limits, held)?;
+    let lead = working
+        .lt()
+        .expect("the loop condition found a leading term");
+    match find_reducer(state.basis, lead, state.limits)? {
+        Some(reducer) => {
+            let lead_bytes = term_bytes(lead, state.ops, working.ring().nvars());
+            check(state.limits, held.saturating_add(lead_bytes))?;
+            let lead = lead.clone();
+            reduce_normal_form(
+                state,
+                working,
+                lead,
+                reducer,
+                held.saturating_add(lead_bytes),
+            )
         }
+        None => move_to_remainder(working, remainder, held, state.limits),
+    }
+}
 
-        match reducer {
-            Some((g, lead_g)) => {
-                let multiple = lead
-                    .mono
-                    .quotient(&lead_g.mono)
-                    // divides() implies a quotient exists.
-                    .expect("divides() implies quotient()");
-                let scale = divide_coefficients::<D>(ops, &lead.coeff, &lead_g.coeff);
-                // The step builds a whole new polynomial while the working
-                // one is still live, so the replacement is charged before
-                // it is allocated.
-                check(
-                    limits,
-                    held.saturating_add(working.sub_scaled_bytes(g, &scale, ops)),
-                )?;
-                working = working.sub_scaled_checked(g, &scale, &multiple, ops)?;
-            }
-            None => {
-                let term = working
-                    .pop_lt()
-                    // The loop condition read the leading term.
-                    .expect("the working polynomial holds a leading term");
-                remainder_bytes =
-                    remainder_bytes.saturating_add(term_bytes::<D>(&term, ops, ring.nvars()));
-                remainder.push(term);
-            }
+fn reduce_normal_form<D: Domain>(
+    state: &NormalFormState<'_, D>,
+    working: &mut Polynomial<D>,
+    lead: Term<D>,
+    reducer: Reducer<'_, D>,
+    held: usize,
+) -> Result<(), DivisionStop> {
+    let ring = working.ring();
+    let lead_bytes = term_bytes(&lead, state.ops, ring.nvars());
+    let multiple_bytes = monomial_bytes(ring.nvars());
+    check(state.limits, held.saturating_add(multiple_bytes))?;
+    let multiple = lead
+        .mono
+        .quotient(&reducer.leading.mono)
+        // divides() implies a quotient exists.
+        .expect("divides() implies quotient()");
+    let scale_bound =
+        coefficient_division_bound::<D>(state.ops, &lead.coeff, &reducer.leading.coeff);
+    check(
+        state.limits,
+        held.saturating_add(lead_bytes)
+            .saturating_add(multiple_bytes)
+            .saturating_add(scale_bound),
+    )?;
+    let scale = divide_coefficients::<D>(state.ops, &lead.coeff, &reducer.leading.coeff);
+    let scale_bytes = state.ops.heap_bytes(&scale);
+    check(
+        state.limits,
+        held.saturating_add(lead_bytes)
+            .saturating_add(multiple_bytes)
+            .saturating_add(scale_bytes),
+    )?;
+    // The replacement is built while the working value is still live.
+    check(
+        state.limits,
+        held.saturating_add(lead_bytes)
+            .saturating_add(multiple_bytes)
+            .saturating_add(scale_bytes)
+            .saturating_add(working.sub_scaled_bytes(reducer.polynomial, &scale, state.ops)),
+    )?;
+    *working = working.sub_scaled_checked(reducer.polynomial, &scale, &multiple, state.ops)?;
+    Ok(())
+}
+
+fn finish_normal_form<D: Domain>(
+    state: &NormalFormState<'_, D>,
+    working: Polynomial<D>,
+    mut remainder: Vec<Term<D>>,
+) -> Result<Polynomial<D>, DivisionStop> {
+    check(state.limits, normal_form_held(state, &working, &remainder))?;
+    drop(working);
+    let held = state
+        .extra_bytes
+        .saturating_add(state.input_bytes)
+        .saturating_add(retained_terms_bytes(
+            &remainder,
+            remainder.capacity(),
+            state.ring.nvars(),
+            state.ops,
+        ));
+    check(state.limits, held)?;
+    remainder.reverse();
+    check(state.limits, held)?;
+    Ok(Polynomial::from_sorted_terms(state.ring.clone(), remainder))
+}
+
+/// Divide `f` by `basis` under absolute limits and retain the quotients.
+///
+/// The helper returns the same identity as [`GroebnerBasis::divide`]. Its
+/// absolute limits let one caller cover a sequence of divisions with one
+/// deadline and cancellation flag.
+pub(crate) fn divide_with_limits<D: Domain>(
+    basis: &[Polynomial<D>],
+    f: &Polynomial<D>,
+    limits: &ComputeLimits,
+) -> Result<DivisionResult<D>, DivisionStop> {
+    let ring = f.ring();
+    let mut state = DivideState {
+        basis,
+        ring,
+        limits,
+        ops: ring.ops(),
+        input_bytes: f.retained_bytes(),
+        quotient_slots: size_of::<Polynomial<D>>().saturating_mul(basis.len()),
+    };
+    let mut parts = initialize_division(&mut state, f)?;
+    divide_steps(
+        &state,
+        &mut parts.working,
+        &mut parts.quotients,
+        &mut parts.remainder,
+    )?;
+    finish_division(&state, parts.quotients, parts.working, &mut parts.remainder)
+}
+
+struct DivideState<'a, D: Domain> {
+    basis: &'a [Polynomial<D>],
+    ring: &'a PolynomialRing<D>,
+    limits: &'a ComputeLimits,
+    ops: &'a D::Ops,
+    input_bytes: usize,
+    quotient_slots: usize,
+}
+
+struct DivisionParts<D: Domain> {
+    quotients: Vec<Polynomial<D>>,
+    working: Polynomial<D>,
+    remainder: Vec<Term<D>>,
+}
+
+fn initialize_division<D: Domain>(
+    state: &mut DivideState<'_, D>,
+    f: &Polynomial<D>,
+) -> Result<DivisionParts<D>, DivisionStop> {
+    check(state.limits, state.input_bytes)?;
+    check(
+        state.limits,
+        state.input_bytes.saturating_add(state.quotient_slots),
+    )?;
+    let quotients = empty_quotients(state.basis.len(), f, state.limits)?;
+    let quotient_slots = size_of::<Polynomial<D>>().saturating_mul(quotients.capacity());
+    state.quotient_slots = quotient_slots;
+    check(
+        state.limits,
+        state.input_bytes.saturating_add(quotient_slots),
+    )?;
+    check(
+        state.limits,
+        state
+            .input_bytes
+            .saturating_add(quotient_slots)
+            .saturating_add(state.input_bytes),
+    )?;
+    let working = f.clone();
+    check(
+        state.limits,
+        state
+            .input_bytes
+            .saturating_add(quotient_slots)
+            .saturating_add(working.retained_bytes()),
+    )?;
+    Ok(DivisionParts {
+        quotients,
+        working,
+        remainder: Vec::new(),
+    })
+}
+
+fn finish_division<D: Domain>(
+    state: &DivideState<'_, D>,
+    quotients: Vec<Polynomial<D>>,
+    working: Polynomial<D>,
+    remainder: &mut Vec<Term<D>>,
+) -> Result<DivisionResult<D>, DivisionStop> {
+    reverse_remainder(remainder, state.limits)?;
+    check(
+        state.limits,
+        live_bytes(
+            state.input_bytes,
+            state.quotient_slots,
+            &quotients,
+            &working,
+            remainder,
+            state.ops,
+        ),
+    )?;
+    drop(working);
+    check(
+        state.limits,
+        state
+            .input_bytes
+            .saturating_add(state.quotient_slots)
+            .saturating_add(quotients.iter().fold(0usize, |bytes, quotient| {
+                bytes.saturating_add(quotient.retained_bytes())
+            }))
+            .saturating_add(retained_terms_bytes(
+                remainder,
+                remainder.capacity(),
+                state.ring.nvars(),
+                state.ops,
+            )),
+    )?;
+    Ok(DivisionResult {
+        quotients,
+        remainder: Polynomial::from_sorted_terms(state.ring.clone(), std::mem::take(remainder)),
+    })
+}
+
+fn divide_steps<D: Domain>(
+    state: &DivideState<'_, D>,
+    working: &mut Polynomial<D>,
+    quotients: &mut [Polynomial<D>],
+    remainder: &mut Vec<Term<D>>,
+) -> Result<(), DivisionStop> {
+    while working.lt().is_some() {
+        divide_step(state, working, quotients, remainder)?;
+    }
+    Ok(())
+}
+
+fn divide_step<D: Domain>(
+    state: &DivideState<'_, D>,
+    working: &mut Polynomial<D>,
+    quotients: &mut [Polynomial<D>],
+    remainder: &mut Vec<Term<D>>,
+) -> Result<(), DivisionStop> {
+    let held = live_bytes(
+        state.input_bytes,
+        state.quotient_slots,
+        quotients,
+        working,
+        remainder,
+        state.ops,
+    );
+    check(state.limits, held)?;
+    let lead = working
+        .lt()
+        .expect("the loop condition found a leading term");
+    let reducer = find_reducer(state.basis, lead, state.limits)?;
+    if let Some(reducer) = reducer {
+        let lead_bytes = term_bytes(lead, state.ops, working.ring().nvars());
+        check(state.limits, held.saturating_add(lead_bytes))?;
+        let lead = lead.clone();
+        reduce_with_quotient(
+            state,
+            working,
+            quotients,
+            reducer,
+            &lead,
+            held.saturating_add(lead_bytes),
+        )?;
+    } else {
+        move_to_remainder(working, remainder, held, state.limits)?;
+    }
+    Ok(())
+}
+
+fn empty_quotients<D: Domain>(
+    count: usize,
+    template: &Polynomial<D>,
+    limits: &ComputeLimits,
+) -> Result<Vec<Polynomial<D>>, DivisionStop> {
+    let mut quotients = Vec::with_capacity(count);
+    for index in 0..count {
+        if let Some(stop) = limits.stop_every(index) {
+            return Err(DivisionStop::Run(stop));
+        }
+        quotients.push(template.zero_like());
+    }
+    Ok(quotients)
+}
+
+fn reverse_remainder<D: Domain>(
+    remainder: &mut [Term<D>],
+    limits: &ComputeLimits,
+) -> Result<(), DivisionStop> {
+    for index in 0..remainder.len() / 2 {
+        if let Some(stop) = limits.stop_every(index) {
+            return Err(DivisionStop::Run(stop));
+        }
+        let other = remainder.len() - 1 - index;
+        remainder.swap(index, other);
+    }
+    Ok(())
+}
+
+struct Reducer<'a, D: Domain> {
+    index: usize,
+    polynomial: &'a Polynomial<D>,
+    leading: &'a Term<D>,
+}
+
+fn find_reducer<'a, D: Domain>(
+    basis: &'a [Polynomial<D>],
+    lead: &Term<D>,
+    limits: &ComputeLimits,
+) -> Result<Option<Reducer<'a, D>>, DivisionStop> {
+    for (index, g) in basis.iter().enumerate() {
+        if let Some(stop) = limits.stop_every(index) {
+            return Err(DivisionStop::Run(stop));
+        }
+        let Some(lead_g) = g.lt() else { continue };
+        if lead_g.mono.divides(&lead.mono) {
+            return Ok(Some(Reducer {
+                index,
+                polynomial: g,
+                leading: lead_g,
+            }));
         }
     }
+    Ok(None)
+}
 
-    remainder.reverse();
-    Ok(Polynomial::from_sorted_terms(ring.clone(), remainder))
+fn reduce_with_quotient<D: Domain>(
+    state: &DivideState<'_, D>,
+    working: &mut Polynomial<D>,
+    quotients: &mut [Polynomial<D>],
+    reducer: Reducer<'_, D>,
+    lead: &Term<D>,
+    held: usize,
+) -> Result<(), DivisionStop> {
+    let ring = working.ring();
+    let index = reducer.index;
+    let reducer_polynomial = reducer.polynomial;
+    let lead_reducer = reducer.leading;
+    let multiple_bytes = monomial_bytes(ring.nvars());
+    let scale_bound = coefficient_division_bound::<D>(state.ops, &lead.coeff, &lead_reducer.coeff);
+    let qterm_bound = size_of::<Term<D>>()
+        .saturating_add(heap_exps_bytes(ring.nvars()))
+        .saturating_add(scale_bound);
+    let replacement_bound = sub_scaled_bound(working, reducer_polynomial, scale_bound, state.ops);
+    let quotient_capacity_delta = term_capacity_delta_for_vec(&quotients[index].terms, 1);
+    check(
+        state.limits,
+        held.saturating_add(multiple_bytes)
+            .saturating_add(scale_bound)
+            .saturating_add(qterm_bound)
+            .saturating_add(replacement_bound)
+            .saturating_add(quotient_capacity_delta),
+    )?;
+
+    let multiple = lead
+        .mono
+        .quotient(&lead_reducer.mono)
+        .expect("divides() implies quotient()");
+    let scale = divide_coefficients::<D>(state.ops, &lead.coeff, &lead_reducer.coeff);
+    let term = Term {
+        coeff: scale,
+        mono: multiple,
+    };
+    let term_bytes = term_bytes(&term, state.ops, ring.nvars());
+    let scale_bytes = state.ops.heap_bytes(&term.coeff);
+    let replacement_bound = sub_scaled_bound(working, reducer_polynomial, scale_bytes, state.ops);
+    let quotient_update_bytes = quotient_update_bound(&quotients[index], &term, state.ops);
+    check(
+        state.limits,
+        held.saturating_add(term_bytes)
+            .saturating_add(replacement_bound)
+            .saturating_add(quotient_update_bytes),
+    )?;
+    reserve_term_slot(
+        &mut quotients[index].terms,
+        held.saturating_add(term_bytes)
+            .saturating_add(replacement_bound)
+            .saturating_add(quotient_update_bytes),
+        state.limits,
+    )?;
+    *working =
+        working.sub_scaled_checked(reducer_polynomial, &term.coeff, &term.mono, state.ops)?;
+    quotients[index].push_term(term, state.ops);
+    Ok(())
+}
+
+fn move_to_remainder<D: Domain>(
+    working: &mut Polynomial<D>,
+    remainder: &mut Vec<Term<D>>,
+    held: usize,
+    limits: &ComputeLimits,
+) -> Result<(), DivisionStop> {
+    reserve_term_slot(remainder, held, limits)?;
+    let term = working
+        .pop_lt()
+        .expect("the leading term is held by the working polynomial");
+    remainder.push(term);
+    Ok(())
+}
+
+fn live_bytes<D: Domain>(
+    input_bytes: usize,
+    quotient_slots: usize,
+    quotients: &[Polynomial<D>],
+    working: &Polynomial<D>,
+    remainder: &Vec<Term<D>>,
+    ops: &D::Ops,
+) -> usize {
+    let quotient_bytes = quotients.iter().fold(0usize, |bytes, quotient| {
+        bytes.saturating_add(quotient.retained_bytes())
+    });
+    input_bytes
+        .saturating_add(quotient_slots)
+        .saturating_add(quotient_bytes)
+        .saturating_add(working.retained_bytes())
+        .saturating_add(retained_terms_bytes(
+            remainder,
+            remainder.capacity(),
+            working.ring().nvars(),
+            ops,
+        ))
+}
+
+fn sub_scaled_bound<D: Domain>(
+    working: &Polynomial<D>,
+    reducer: &Polynomial<D>,
+    scale_bytes: usize,
+    ops: &D::Ops,
+) -> usize {
+    let per_term = size_of::<Term<D>>() + heap_exps_bytes(working.ring().nvars());
+    let terms = working
+        .terms
+        .len()
+        .saturating_add(reducer.terms.len())
+        .saturating_mul(per_term);
+    let scaled = reducer.terms.iter().fold(0usize, |bytes, term| {
+        bytes
+            .saturating_add(ops.heap_bytes(&term.coeff))
+            .saturating_add(scale_bytes)
+    });
+    terms
+        .saturating_add(working.coefficient_bytes())
+        .saturating_add(scaled)
+        .saturating_add(scaled)
+        .saturating_add(heap_exps_bytes(working.ring().nvars()))
+}
+
+fn quotient_update_bound<D: Domain>(
+    quotient: &Polynomial<D>,
+    term: &Term<D>,
+    ops: &D::Ops,
+) -> usize {
+    let Ok(index) = quotient
+        .terms
+        .binary_search_by(|probe| probe.mono.cmp(&term.mono))
+    else {
+        return 0;
+    };
+    let existing = ops.heap_bytes(&quotient.terms[index].coeff);
+    let incoming = ops.heap_bytes(&term.coeff);
+    existing.saturating_add(incoming).saturating_mul(2)
 }
 
 /// Check that `polynomials` is the reduced Gröbner basis of the ideal it
@@ -307,10 +847,13 @@ pub(crate) fn check_basis<D: Domain>(
     limits: &ComputeLimits,
 ) -> Result<(), BasisError> {
     let ops = ring.ops();
+    stop(limits)?;
+    let basis_bytes = basis_input_bytes(polynomials);
+    check(limits, basis_bytes).map_err(BasisError::from)?;
     check_elements(ring, polynomials, limits, ops)?;
-    check_order(polynomials)?;
+    check_order(polynomials, limits)?;
     check_interreduced(polynomials, limits)?;
-    check_pairs(polynomials, limits, ops)
+    check_pairs(polynomials, limits, ops, basis_bytes)
 }
 
 fn check_elements<D: Domain>(
@@ -337,8 +880,12 @@ fn check_elements<D: Domain>(
     Ok(())
 }
 
-fn check_order<D: Domain>(polynomials: &[Polynomial<D>]) -> Result<(), BasisError> {
+fn check_order<D: Domain>(
+    polynomials: &[Polynomial<D>],
+    limits: &ComputeLimits,
+) -> Result<(), BasisError> {
     for index in 1..polynomials.len() {
+        stop_at(limits, index)?;
         let previous = polynomials[index - 1]
             .lm()
             .expect("a nonzero polynomial holds a leading monomial");
@@ -365,8 +912,11 @@ fn check_interreduced<D: Domain>(
             let lead = divisor
                 .lm()
                 .expect("a nonzero polynomial holds a leading monomial");
-            if poly.terms.iter().any(|term| lead.divides(&term.mono)) {
-                return Err(BasisError::NotInterreduced { index });
+            for (term_index, term) in poly.terms.iter().enumerate() {
+                stop_at(limits, term_index)?;
+                if lead.divides(&term.mono) {
+                    return Err(BasisError::NotInterreduced { index });
+                }
             }
         }
     }
@@ -377,12 +927,24 @@ fn check_pairs<D: Domain>(
     polynomials: &[Polynomial<D>],
     limits: &ComputeLimits,
     ops: &D::Ops,
+    basis_bytes: usize,
 ) -> Result<(), BasisError> {
     for left in 0..polynomials.len() {
         for right in (left + 1)..polynomials.len() {
             stop(limits)?;
+            check(
+                limits,
+                basis_bytes.saturating_add(s_polynomial_bound(
+                    &polynomials[left],
+                    &polynomials[right],
+                    ops,
+                )),
+            )
+            .map_err(BasisError::from)?;
             let spoly = polynomials[left].s_polynomial_checked(&polynomials[right], ops)?;
-            if !normal_form(polynomials, &spoly, limits)?.is_zero() {
+            check(limits, basis_bytes.saturating_add(spoly.retained_bytes()))
+                .map_err(BasisError::from)?;
+            if !normal_form_with_extra(polynomials, &spoly, limits, basis_bytes)?.is_zero() {
                 return Err(BasisError::NotGroebner { left, right });
             }
         }
@@ -406,11 +968,12 @@ fn check(limits: &ComputeLimits, bytes: usize) -> Result<(), DivisionStop> {
 }
 
 /// Report why the check stops now, or `None` to carry on.
-///
-/// The checks before the S-polynomials hold no data of their own, so the
-/// memory limit is read inside the division alone.
 fn stop(limits: &ComputeLimits) -> Result<(), BasisError> {
-    match limits.stop() {
+    stop_at(limits, 0)
+}
+
+fn stop_at(limits: &ComputeLimits, index: usize) -> Result<(), BasisError> {
+    match limits.stop_every(index) {
         Some(stop) => Err(BasisError::from(DivisionStop::Run(stop))),
         None => Ok(()),
     }
@@ -421,4 +984,108 @@ fn term_bytes<D: Domain>(term: &Term<D>, ops: &D::Ops, nvars: usize) -> usize {
     size_of::<Term<D>>()
         .saturating_add(heap_exps_bytes(nvars))
         .saturating_add(ops.heap_bytes(&term.coeff))
+}
+
+fn basis_input_bytes<D: Domain>(polynomials: &[Polynomial<D>]) -> usize {
+    let slots = size_of::<Polynomial<D>>().saturating_mul(polynomials.len());
+    polynomials.iter().fold(slots, |bytes, polynomial| {
+        bytes.saturating_add(polynomial.retained_bytes())
+    })
+}
+
+fn scaled_polynomial_bound<D: Domain>(
+    polynomial: &Polynomial<D>,
+    scale_bytes: usize,
+    ops: &D::Ops,
+) -> (usize, usize) {
+    let per_term = size_of::<Term<D>>() + heap_exps_bytes(polynomial.ring().nvars());
+    let slots = per_term.saturating_mul(polynomial.terms.len());
+    let coefficients = polynomial.terms.iter().fold(0usize, |bytes, term| {
+        bytes
+            .saturating_add(ops.heap_bytes(&term.coeff))
+            .saturating_add(scale_bytes)
+    });
+    (slots.saturating_add(coefficients), coefficients)
+}
+
+fn s_polynomial_bound<D: Domain>(
+    left: &Polynomial<D>,
+    right: &Polynomial<D>,
+    ops: &D::Ops,
+) -> usize {
+    let Some(left_lead) = left.lt() else { return 0 };
+    let Some(right_lead) = right.lt() else {
+        return 0;
+    };
+    let left_scale = ops.heap_bytes(&right_lead.coeff);
+    let right_scale = ops.heap_bytes(&left_lead.coeff);
+    let (left_scaled, left_coefficients) = scaled_polynomial_bound(left, left_scale, ops);
+    let (right_scaled, right_coefficients) = scaled_polynomial_bound(right, right_scale, ops);
+    let output_slots = size_of::<Term<D>>()
+        .saturating_add(heap_exps_bytes(left.ring().nvars()))
+        .saturating_mul(left.terms.len().saturating_add(right.terms.len()));
+    let quotient_monomials = heap_exps_bytes(left.ring().nvars()).saturating_mul(3);
+    left_scaled
+        .saturating_add(right_scaled)
+        .saturating_add(output_slots)
+        .saturating_add(left_coefficients)
+        .saturating_add(right_coefficients)
+        .saturating_add(left_coefficients)
+        .saturating_add(right_coefficients)
+        .saturating_add(quotient_monomials)
+}
+
+fn monomial_bytes(nvars: usize) -> usize {
+    heap_exps_bytes(nvars)
+}
+
+fn coefficient_division_bound<D: Domain>(
+    ops: &D::Ops,
+    numerator: &D::Coeff,
+    denominator: &D::Coeff,
+) -> usize {
+    ops.heap_bytes(numerator)
+        .saturating_add(ops.heap_bytes(denominator))
+}
+
+fn retained_terms_bytes<D: Domain>(
+    terms: &[Term<D>],
+    capacity: usize,
+    nvars: usize,
+    ops: &D::Ops,
+) -> usize {
+    let vector = size_of::<Term<D>>().saturating_mul(capacity);
+    let exponents = heap_exps_bytes(nvars).saturating_mul(terms.len());
+    let coefficients = terms.iter().fold(0usize, |bytes, term| {
+        bytes.saturating_add(ops.heap_bytes(&term.coeff))
+    });
+    vector
+        .saturating_add(exponents)
+        .saturating_add(coefficients)
+}
+
+fn reserve_term_slot<D: Domain>(
+    terms: &mut Vec<Term<D>>,
+    held: usize,
+    limits: &ComputeLimits,
+) -> Result<(), DivisionStop> {
+    if terms.len() == terms.capacity() {
+        let delta = term_capacity_delta_for_vec::<D>(terms, 1);
+        check(limits, held.saturating_add(delta))?;
+        terms.reserve_exact(1);
+        let actual =
+            size_of::<Term<D>>().saturating_mul(terms.capacity().saturating_sub(terms.len()));
+        check(limits, held.saturating_add(actual))?;
+    }
+    Ok(())
+}
+
+fn term_capacity_delta_for_vec<D: Domain>(terms: &Vec<Term<D>>, additional: usize) -> usize {
+    if additional == 0 || terms.len() < terms.capacity() {
+        return 0;
+    }
+    let needed = terms.len().saturating_add(additional);
+    let current = terms.capacity();
+    let next = needed.max(current.saturating_mul(2));
+    size_of::<Term<D>>().saturating_mul(next.saturating_sub(current))
 }

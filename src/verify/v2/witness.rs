@@ -12,7 +12,7 @@
 use super::Ctx;
 use super::arith::{self, Mono, Poly};
 use super::decode::{Pool, Reader, bounded, capped};
-use super::replay::{lead_multiple, pair_count};
+use super::replay::{lead_matches, pair_count};
 use crate::verify::error::{
     BinaryFault, Cap, DivisionFault, DivisionSite, VerifyError, WitnessFault,
 };
@@ -21,8 +21,8 @@ const KIND_COPRIME: u64 = 0;
 const KIND_CHAIN: u64 = 1;
 const KIND_REDUCE: u64 = 2;
 
-/// One step of a division trace: a monomial and a basis index.
-type Step = (Mono, usize);
+/// One step of a division trace: a pool index and a basis index.
+type Step = (usize, usize);
 
 /// A witness of one pair.
 enum Witness {
@@ -90,10 +90,10 @@ fn division_step(
 ) -> Result<Step, VerifyError> {
     ctx.meter.charge(1)?;
     let pool_index = reader.varint(&mut ctx.meter)?;
-    let mono = pool.take(pool_index, &mut ctx.meter)?;
+    let pool_index = pool.reference(pool_index, &mut ctx.meter)?;
     let element = reader.varint(&mut ctx.meter)?;
     let element = bounded(element, basis_len, "basis index")?;
-    Ok((mono, element))
+    Ok((pool_index, element))
 }
 
 /// Replay a division trace and require a zero residual at the end.
@@ -101,14 +101,23 @@ fn replay_division(
     start: &Poly,
     steps: &[Step],
     basis: &[Poly],
+    pool: &Pool,
     at: DivisionSite,
     ctx: &mut Ctx<'_>,
 ) -> Result<(), VerifyError> {
     ctx.meter.charge((start.term_count() as u64).max(1))?;
     ctx.meter.check_intermediate(start.term_count())?;
     let mut residual = start.clone();
-    for (step, (mono, element)) in steps.iter().enumerate() {
-        residual = replay_step(residual, mono, *element, basis, at, step, ctx)?;
+    for (step, (pool_index, element)) in steps.iter().enumerate() {
+        residual = replay_step(
+            residual,
+            pool.get(*pool_index),
+            *element,
+            basis,
+            at,
+            step,
+            ctx,
+        )?;
     }
     if !residual.is_zero() {
         return Err(VerifyError::Division {
@@ -137,10 +146,8 @@ fn replay_step(
         });
     }
     let reducer = &basis[element];
-    let lead = lead_multiple(mono, reducer, &mut ctx.meter)?;
     let residual_lead = residual.lm().expect("the residual is not zero");
-    arith::charge_monos(&mut ctx.meter, &lead, residual_lead)?;
-    if lead != *residual_lead {
+    if !lead_matches(mono, reducer, residual_lead, &mut ctx.meter)? {
         return Err(VerifyError::Division {
             at,
             step,
@@ -149,8 +156,8 @@ fn replay_step(
     }
     let coeff = residual.lc().expect("the residual is not zero");
     let multiple = arith::mono_mul(reducer, mono, &mut ctx.meter)?;
-    let scaled = arith::scale(&multiple, coeff, ctx.modulus, &mut ctx.meter)?;
-    arith::sub(&residual, &scaled, ctx.modulus, &mut ctx.meter)
+    let scaled = arith::scale_owned(multiple, coeff, ctx.modulus, &mut ctx.meter)?;
+    arith::sub_owned(residual, scaled, ctx.modulus, &mut ctx.meter)
 }
 
 /// Check the membership section: one division trace per input polynomial,
@@ -169,6 +176,7 @@ pub(super) fn membership(
             polynomial,
             &trace,
             basis,
+            pool,
             DivisionSite::Membership { input: index },
             ctx,
         )?;
@@ -233,7 +241,7 @@ pub(super) fn pairs(
     reader.finish()?;
 
     let order = topological_order(&witnesses, len, ctx)?;
-    validate_witnesses(&witnesses, &order, basis, len, ctx)
+    validate_witnesses(&witnesses, &order, basis, pool, len, ctx)
 }
 
 struct WitnessDecoder<'a, 'data, 'ctx> {
@@ -322,13 +330,14 @@ fn validate_witnesses(
     witnesses: &[Witness],
     order: &[usize],
     basis: &[Poly],
+    pool: &Pool,
     len: u64,
     ctx: &mut Ctx<'_>,
 ) -> Result<(), VerifyError> {
     let mut validated = vec![false; witnesses.len()];
     for &t in order {
-        let (i, j) = pair_of(t as u64, len);
-        validate_witness(&witnesses[t], i, j, basis, &validated, len, ctx)?;
+        let pair = pair_of(t as u64, len);
+        validate_witness(&witnesses[t], pair, basis, pool, &validated, len, ctx)?;
         validated[t] = true;
     }
     Ok(())
@@ -336,9 +345,9 @@ fn validate_witnesses(
 
 fn validate_witness(
     witness: &Witness,
-    i: usize,
-    j: usize,
+    (i, j): (usize, usize),
     basis: &[Poly],
+    pool: &Pool,
     validated: &[bool],
     len: u64,
     ctx: &mut Ctx<'_>,
@@ -348,7 +357,14 @@ fn validate_witness(
         Witness::Chain { k } => validate_chain(i, j, *k, validated, len),
         Witness::Reduce { steps } => {
             let polynomial = spoly(basis, i, j, ctx)?;
-            replay_division(&polynomial, steps, basis, DivisionSite::Pair { i, j }, ctx)
+            replay_division(
+                &polynomial,
+                steps,
+                basis,
+                pool,
+                DivisionSite::Pair { i, j },
+                ctx,
+            )
         }
     }
 }
@@ -410,7 +426,7 @@ fn spoly(basis: &[Poly], i: usize, j: usize, ctx: &mut Ctx<'_>) -> Result<Poly, 
     let right_cofactor = multiple.divide(right_lead);
     let left = arith::mono_mul(&basis[i], &left_cofactor, &mut ctx.meter)?;
     let right = arith::mono_mul(&basis[j], &right_cofactor, &mut ctx.meter)?;
-    arith::sub(&left, &right, ctx.modulus, &mut ctx.meter)
+    arith::sub_owned(left, right, ctx.modulus, &mut ctx.meter)
 }
 
 /// The two pair indices a `Chain` witness depends on.

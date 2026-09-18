@@ -548,6 +548,8 @@ pub enum Cap {
     /// Bytes of verifier arithmetic held at once. One prospective term
     /// costs `size_of::<Term>() + nvars * size_of::<Exp>()`.
     IntermediateBytes,
+    /// Estimated bytes of live v2 trace and basis values.
+    LiveBytes,
     /// Monomials in the v2 pool.
     PoolMonomials,
     /// Variable/exponent entries in the v2 pool.
@@ -581,6 +583,7 @@ impl fmt::Display for Cap {
             Cap::TotalTerms => write!(f, "total terms"),
             Cap::Entries => write!(f, "array entries"),
             Cap::IntermediateBytes => write!(f, "bytes of verifier arithmetic"),
+            Cap::LiveBytes => write!(f, "bytes of live trace and basis values"),
             Cap::PoolMonomials => write!(f, "monomials in the pool"),
             Cap::PoolEntries => write!(f, "entries in the monomial pool"),
             Cap::InputPolynomials => write!(f, "input polynomials"),

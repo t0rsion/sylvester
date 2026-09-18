@@ -1,78 +1,64 @@
 # Rational coefficients, CLI, and Python design
 
-## Release audit (2026-09-04)
+## Implementation notes
 
-The local release audit passes the default workspace suite, the ignored
-oracle sweeps, Rust 1.88, the extracted source crate, and installed Python
-wheels and source distributions. The complexity, dependency, workflow, and
-privacy checks also pass. The manifests had named Rust 1.85 even though the
-code needs 1.88.
-The rational property had bounded each exponent by 2 instead of bounding
-the monomial's total degree by 2. The source crate now carries the `eco-9`
-fixture that its stack test reads.
+The implementation follows this design. The notes below record deviations
+that affect the public surface or implementation limits.
 
-## Status after implementation (2026-08-19)
-
-The design is implemented in the chunks section 12 lays out. Each
-item below names what a chunk shipped as designed and the deviations its
-implementer recorded.
-
-**A1, the sealed domain over the prime field.** Shipped as designed:
+**Prime-field domain.** The public types
 `PolynomialRing<D>`, `Polynomial<D>`, `Ideal<D>`, and `GroebnerBasis<D>`
 all default to `D = PrimeField`, and `PolynomialRing` gained a content
 `Hash` next to its content `PartialEq`. `RingError::ZeroDenominator` and
-`RingError::CoefficientNotInvertible` landed in this chunk, ahead of
+`RingError::CoefficientNotInvertible` are defined before
 `Rationals` itself, because `Coefficient::normalized` needs both before
-any domain reads a fraction. Two deviations: `DomainOps`, not only
-`Domain`, is sealed, so a caller cannot write a third implementation of
-either trait even indirectly; and the debug assertion in
+any domain reads a fraction. The implementation also seals `DomainOps` and
+`Domain`, so a caller cannot write a third implementation of either trait
+even indirectly; the debug assertion in
 `Polynomial::from_sorted_terms` is narrower than a full invariant check,
 verifying the variable count and the strictly ascending order of the
 terms and nothing about zero coefficients, which the domain's own
 zero-is-`None` convention already rules out by construction.
 
-**A2, the rational domain.** Shipped as designed: the parser is generic
+**Rational domain.** The parser is generic
 over `D` and reads the `a/b` production of section 2.4 in both domains,
 and `ParseError::ZeroDenominator` carries a `position` field like every
-other `ParseError` variant. One deviation from the module list of
-section 10: `Rationals` is declared in `src/ring.rs`, next to
+other `ParseError` variant. `Rationals` is declared in `src/ring.rs`, next to
 `PrimeField`, rather than in `src/ring/rational.rs`, which holds
 `RationalOps` and the arithmetic alone. Prime-field parsing also routes
 every coefficient through `BigInt` first, the conversion the rational
 domain needs anyway, rather than keeping a separate machine-integer path.
 
-**A3, limits, budget, and the meters.** Shipped as designed: `ComputeLimits`
-and `groebner_basis_with_limits` stay crate-private, as the design's own
-body already says in section 3.8, even though the section 12 table lists
-them under this chunk's surface; `Budget` is the public type, and
-`ComputeOptions::budget` takes it directly. One deviation: cancellation
+**Limits and budgets.** `ComputeLimits`
+and `groebner_basis_with_limits` stay crate-private, as section 3.8
+specifies; `Budget` is the public type, and `ComputeOptions::budget` takes it
+directly. Cancellation
 gains no representation in any public error type, not even indirectly. A
 cancelled run reports `ComputeError::Timeout`, the same value an
 exhausted deadline reports, since both say the same thing to a caller:
 the run stopped before it produced a basis.
 
-**B, normal form and the checked basis.** Shipped as designed:
+**Normal form and the checked basis.**
 `GroebnerBasis::normal_form` and `GroebnerBasis::contains` both take a
 `Budget`; `GroebnerBasis::from_polynomials` is one method per domain,
 reached by turbofish (`GroebnerBasis::<PrimeField>::from_polynomials`,
 `GroebnerBasis::<Rationals>::from_polynomials`); `NormalFormError` and
 `BasisError` carry the variants section 5 lists. `Monomial::checked_mul`
-and `Polynomial::sub_scaled_checked` ship as a path separate from the
+and `Polynomial::sub_scaled_checked` provide a path separate from the
 engines' own unchecked multiply, so the F4 and classic hot loops keep
-their `expect`. One deviation: the Gröbner check inside
+their `expect`. The Gröbner check inside
 `from_polynomials` divides every pair's S-polynomial, with no skip for a
 pair whose leading monomials are coprime. The engines' own Buchberger
 product criterion, which does skip such pairs, was removed from the
 engines during the initial repair because its interaction with signatures
 had no soundness argument (`KNOWN_ISSUES.md`); reusing it here, on a
 one-shot check rather than a hot loop, was judged not worth reopening
-that question for.
+that question.
 
-**C, the multimodular engine.** Shipped as designed: `RationalOptions` and
+**Multimodular engine.** `RationalOptions` and
 `RationalStop` are public; `Ideal::<Rationals>::groebner_basis` and
 `groebner_basis_with_report` exist; `ComputeError::PrimesExhausted` and
-`ComputeReport::{modular, modular_concurrency}` ship as specified. Three
-deviations: the CRT accumulator of section 3.4 is keyed by a `BTreeMap`,
+`ComputeReport::{modular, modular_concurrency}` provide the specified
+reports. The CRT accumulator of section 3.4 is keyed by a `BTreeMap`,
 not a hash map, so folding a run walks its monomials in a fixed order
 with no separate sort before a candidate is built; a discarded run (one
 folded into a category that later loses prevalence) keeps the sequence
@@ -81,18 +67,18 @@ of section 4.2 read directly off the retained list; and the driver's
 concurrency is `std::thread::scope`, not a rayon pool, because each prime
 run already forces its own inner thread count to 1, leaving the driver to
 join a bounded, already-spawned set of threads rather than schedule a
-task graph. Decision 9 of section 13 is resolved: the installed msolve
+task graph. The installed msolve
 0.10.1 does emit a lifted rational basis with `-g 2` over a `0`
-characteristic line, so msolve stayed in the rational reference set. One
+characteristic line. One
 limit is narrower than section 3.8: the driver starts at most 256 prime
 runs at once, whatever `ComputeOptions::threads` says, and
 `ComputeReport::modular_concurrency` reports the largest number it
 started rather than the number the caller asked for.
 
-**D, Hilbert.** Shipped as designed: `HilbertSeries`, `HilbertError`,
+**Hilbert series.** `HilbertSeries`, `HilbertError`,
 `GroebnerBasis::{hilbert_series, krull_dimension, is_homogeneous}`, and
 `Ideal::has_homogeneous_generators` all carry the signatures of section
-6.1. Two deviations: there is no method returning the affine Hilbert
+6.1. There is no method returning the affine Hilbert
 function `H(d)` itself, only the series coefficients that are its first
 difference, since section 6.1 already states the two are not equal and a
 second method inviting the reader to conflate them was judged to work
@@ -105,38 +91,41 @@ the basis `[x^65535*y, z]` reaches 65,535 of them, which the calling
 stack does not hold. The budget charges the worklist and every dense
 coefficient vector before it is allocated.
 
-**E, the CLI.** Shipped as designed: seven subcommands (`gb`/`basis`,
-`certify`, `normal-form`/`nf`, `member`, `hilbert`, `dim`, `verify`),
-`.sylq` as a `syl`-format extension for a rational instance, and the six
-exit codes of section 8.4. `--certificate` implies `--certified`, and
+**CLI.** The command line interface provides eight subcommands (`gb`/`basis`,
+`certify`, `normal-form`/`nf`, `member`, `hilbert`, `dim`, `quotient`,
+`verify`), four formats (`ms`, `syl`, `text`, `json`), `.sylq` as a
+`syl`-format extension for a rational instance, and the six exit codes of
+section 8.4. JSON stores a `sylv-result-v1` computation record. The
+`quotient` command inspects finite-dimensional quotient algebras and writes
+labeled text. `--certificate` implies `--certified`, and
 `--certified` on a rational ring is a usage error (exit 2), reported
 before any engine runs, rather than attempted and failed. `--report`
 together with `--certified` is also a usage error, since the certified
 path's single timed call has no separate counters to report. `--report`
 alone writes counters to standard error, so a basis on standard output
-stays parseable by the next tool in a pipeline. One deviation from the
-output schema of section 8.2: over `Q`, `hilbert` and `dim` write an
-`# established:` comment and one line of what it means above the value,
+stays parseable by the next tool in a pipeline. Over `Q`, `hilbert` and
+`dim` write an `# established:` comment and one line of what it means above
+the value, as required by the output schema of section 8.2,
 because the value is of the ideal the lifted basis generates and the
 schema alone would read as a fact about the input ideal. A basis the
 command reads with `--from-basis` carries no lift, so it carries no
 comment either.
 
-**F, Python.** Shipped as designed: every exception class carries two
+**Python.** Every exception class carries two
 bases, `sylvester.SylvesterError` and the matching standard exception
 (`ValueError` for bad input, `RuntimeError` for an exhausted budget or a
-defect), exactly as section 9.3 specifies. pyo3 is pinned to `=0.23.5` as
-decided, built and tested against Python 3.14 through the `abi3-py310`
+defect), exactly as section 9.3 specifies. pyo3 is pinned to `=0.23.5`,
+built and tested against Python 3.14 through the `abi3-py310`
 wheel, so the pin does not narrow which interpreter runs the tests. One
 deviation: `num-bigint` and `num-rational` are direct dependencies of
 `sylvester-py` itself, not only pyo3 features, because the binding
 converts a `BigRational` coefficient by hand at the Python boundary
 rather than relying on a pyo3 conversion alone. `__contains__` is not
-implemented, as designed, so the sequence protocol's `in` iterates and
+implemented, so the sequence protocol's `in` iterates and
 compares polynomials by value, the same fallback Python gives any
 sequence that defines no `__contains__` of its own.
 
-**G, the harness.** Shipped as designed: rational input files use the
+**Benchmark harness.** Rational input files use the
 `.sylq` extension and an instance name suffixed `-q` (`cyclic-4-q`, and
 so on), which `GBBENCH_INSTANCES` matches the same way it matches a
 prime-field instance name. msolve's content-cleared normalization
@@ -144,12 +133,6 @@ prime-field instance name. msolve's content-cleared normalization
 gcd, not forced monic) is documented rather than assumed; `canon.py`'s
 `monic_q` step is what makes every tool's output comparable regardless of
 which normalization each one starts from.
-
-Working spec for the implementation. It fixes the coefficient model,
-the multimodular rational engine, the normal form and Hilbert series
-surface, the `sylv` binary, the Python package, the test plan, and the
-work split. Implementation agents follow this spec. A deviation needs a
-recorded reason in the agent's final report.
 
 The F4 engine of `docs/f4-design.md` does not change in its algebra or
 its matrix kernel, and neither does what it computes over a prime field:
@@ -178,8 +161,8 @@ every prime-field certified result, and the types say so.
    brings.
 4. The Hilbert series of the quotient by the leading monomial ideal, and
    the Krull dimension read off it.
-5. `sylv`, a command line binary in a new crate, over three input formats
-   and the certificate files.
+5. `sylv`, a command line binary in a new crate, over four formats, finite
+   quotient operations, and the certificate files.
 6. `sylvester`, a Python package in a new crate, built with pyo3 and
    maturin.
 
@@ -321,13 +304,10 @@ The cost lands in two places. Generic code gets a `D: Domain` bound in
 every signature, and code that learns the domain at run time, which is
 the CLI and the Python bindings, holds an enum over the two
 instantiations and branches once per entry point (sections 8.1 and 9.2).
-Section 13, item 1 records the runtime tag as the alternative the owner
-can still take.
 
 ### 2.2 What changes in the existing code
 
-The migration is mechanical and wide. The document lists it so no chunk
-discovers it late.
+The migration touches the following files.
 
 | file | change |
 |---|---|
@@ -516,8 +496,9 @@ runs and would need a wider kernel. That trade is outside this design.
 
 Determinism has a price. The sequence is public, so an adversary who
 picks the input knows which primes the confirmation of section 3.7 will
-use. Section 13, item 2 asks the owner whether a seeded random sequence,
-with the seed reported, is the better trade.
+use. A seeded random sequence with a reported seed would trade
+reproducibility across seeds for a probability statement. That alternative
+is outside this design.
 
 ### 3.3 Unlucky primes and the prevalence vote
 
@@ -571,8 +552,7 @@ constant-factor bound relative to the accumulator: a run of `k` primes
 retains `k` modular
 bases whatever the vote does with them, and the term vectors, monomial
 lists, and hash tables around them are counted too. The ledger of section
-3.8 charges all of it, and section 13, item 4 offers a bounded pool with
-recomputation as the alternative.
+3.8 charges all of it.
 
 Monomials below the leading monomial take no part in the vote. A basis
 coefficient divisible by `p` makes a monomial vanish in one run, which is
@@ -737,9 +717,8 @@ exists because an output-only check accepts `{1}`, so the docstring of
 Closing the gap needs cofactors over `Q`, which is section 4.
 
 Cost. T2 enumerates every pair of `G` and divides over `Q`, with the
-coefficient growth the multimodular pipeline exists to avoid. Whether it
-dominates a run is a measurement the harness will make; no factor for it
-appears in this document or in the README before that record exists.
+coefficient growth the multimodular pipeline exists to avoid. The cost of
+T2 is a measured property of the harness runs, not a claim made here.
 
 ### 3.8 Limits, threads, cancellation, determinism
 
@@ -1224,14 +1203,17 @@ is a break, disclosed in `CHANGELOG.md`, with no alias left behind.
 
 Added: `Domain`, `PrimeField`, `Rationals`, `DomainOps`, `PrimeOps`,
 `RationalOps`, `Felt` (now public), `Coefficient`, `Budget`,
-`RationalOptions`, `RationalStop`, `RationalMeta`, `ModularLift`,
+`CancellationToken`, `RationalOptions`, `RationalStop`, `RationalMeta`, `ModularLift`,
 `Established`, `HilbertSeries`, `HilbertError`, `NormalFormError`,
-`BasisError`, `ComputeError::PrimesExhausted`,
+`BasisError`, `DivisionResult`, `ArithmeticError`, `ComputeError::PrimesExhausted`,
 `RingError::{CoefficientNotInvertible, ZeroDenominator}`,
 `ParseError::ZeroDenominator`, `GroebnerBasis::{normal_form, contains,
-from_polynomials, hilbert_series, krull_dimension, is_homogeneous}`,
-`GroebnerBasis<Rationals>::lift`, and
-`Ideal::has_homogeneous_generators`.
+from_polynomials, divide, hilbert_series, krull_dimension, is_homogeneous,
+is_zero_dimensional, finite_quotient}`, `GroebnerBasis<Rationals>::lift`,
+`Ideal::has_homogeneous_generators`, `Polynomial::{try_add, try_sub,
+try_mul, try_neg, try_pow, try_scale}`, `FiniteQuotient`, `QuotientError`,
+`MultiplicationMatrix`, `UnivariatePolynomial`, `ResultEnvelope`,
+`EnvelopeDomain`, `ClaimedProvenance`, and `EnvelopeError`.
 
 Removed: nothing beyond the signature changes above. `Backend`,
 `F4Counters`, `verify::verify`, and both certificate contracts are
@@ -1318,6 +1300,13 @@ sylv hilbert [FILE] [--in-format F] [-o PATH]
         [--backend f4|classic] [--threads N]
         [--stop ...] [--extra-primes N] [--timeout SECS] [--memory BYTES]
 
+sylv quotient [FILE] [--in-format F] [--out-format text] [-o PATH]
+        [--modulus P | --rationals] [--from-basis]
+        [--backend f4|classic] [--threads N]
+        [--stop ...] [--extra-primes N] [--timeout SECS] [--memory BYTES]
+        [--standard-monomials] [--dimension]
+        [--matrix POLY] [--characteristic POLY] [--minimal POLY]
+
 sylv verify CERT [--max-bytes N] [--timeout SECS] [--out-format F] [--quiet]
 ```
 
@@ -1344,6 +1333,13 @@ line, with `dimension: none` for the unit ideal.
 `--certificate` implies `--certified`; passing `--certified` without
 `--certificate` runs the certified path and writes no file, which is
 still a stronger claim about the printed basis.
+
+`quotient` computes a basis, or checks one with `--from-basis`, and then
+builds its finite quotient algebra. A positive-dimensional leading ideal
+is rejected. With no operation flag, it prints the vector-space dimension
+and standard monomials. `--matrix`, `--characteristic`, and `--minimal`
+apply the named polynomial to the quotient. The command requires labeled
+text output.
 
 Ring resolution is per command, not per file, because `normal-form` reads
 two files and they must land in one ring. Three rules, in order:
@@ -1381,15 +1377,20 @@ share one deadline. A command whose remaining time reaches zero exits 3.
   variable, separated by `,`. It carries no ring. Variables are named
   `x1 .. xn`, which is the convention `gen.py` uses in every other
   format it writes; the sylvester runner under
-  `benchmarks/gb-comparison/runner` names them `x0 .. x(n-1)` today and
-  moves to `x1 .. xn` in chunk A1. Names change nothing about grevlex or
-  the computed basis, only the text. A rational coefficient is written
+  `benchmarks/gb-comparison/runner` uses the same names. Names change
+  nothing about grevlex or the computed basis, only the text. A rational
+  coefficient is written
   `a/b` in the coefficient field; the generator writes integers only, so
   reading stays a superset of what it writes.
 - `text`, the crate's own syntax: a `# vars:` line, a `# modulus:` or
   `# coefficients: rationals` line, then one polynomial per line in the
   syntax `parse_polynomial` reads and `Display` writes. It is the default
   output format and it round trips through `sylv` itself.
+- `json`, a `sylv-result-v1` computation record. It stores the ring, input,
+  basis, producer's provenance claim, and optional certificate bytes. The
+  reader validates the schema and ring metadata but does not trust the
+  claim or certificate. JSON output is available for Gröbner basis results;
+  quotient, Hilbert, and dimension output use their labeled text schemas.
 
 ### 8.4 Certificates, verification output, and exit codes
 
@@ -1437,13 +1438,12 @@ depending on `sylvester` and on pyo3 with features `extension-module`,
 `"=0.23.5"`, an exact pin rather than the caret default, because the GIL
 release call this document specifies is `Python::allow_threads`, which a
 later pyo3 renames. Changing the pin is a decision with binding-wide
-consequences (section 13, item 8), not a version bump.
+consequences, so it is an exact requirement rather than a version bump.
 
 `pyproject.toml` uses the maturin backend, with the build requirement
-`maturin>=1.11,<2`, which is the sibling project's, the distribution name
-`sylvester`, the crate's version,
-`requires-python = ">=3.10"` to match `abi3-py310`, the license fields
-and classifiers of the sibling `auslander-py`, and the mixed layout:
+`maturin>=1.12,<2`, the distribution name `sylvester`, the crate's version,
+`requires-python = ">=3.10"` to match `abi3-py310`, the package's license
+metadata, and the mixed layout:
 
 ```toml
 [tool.maturin]
@@ -1456,7 +1456,7 @@ next to `__init__.pyi` and `py.typed`. The cost is one shim that lists
 every export, and a test asserts the shim and the extension export the
 same names.
 
-Build and test, added to `AGENTS.md`:
+Build and test with:
 
 ```
 cd crates/sylvester-py && maturin develop --release
@@ -1470,18 +1470,10 @@ classifier, and the release process does not upload to PyPI.
 ### 9.2 The surface
 
 The domain is known only at run time in Python, so each Rust pair collapses to
-one Python class holding an enum, the same boundary cost as the CLI.
-
-| Rust | Python |
-|---|---|
-| `PolynomialRing<D>` | `PolynomialRing.prime_field(p, vars)`, `PolynomialRing.rationals(vars)`, `ring.modulus` (`None` over `Q`), `ring.variables` |
-| construction | `ring.parse(text)`, `ring.polynomial(terms)`, `ring.ideal(generators)` |
-| `Polynomial<D>` | `Polynomial`: `terms()`, `degree()`, `__str__`, `__eq__`, `__hash__` |
-| `Ideal<D>` | `Ideal`: `groebner_basis(**opts)`, `groebner_basis_certified(**opts)`, `has_homogeneous_generators()`, `generators` |
-| `GroebnerBasis<D>` | `GroebnerBasis`: `__len__`, `__getitem__`, `__iter__`, `normal_form`, `contains`, `hilbert_series`, `krull_dimension`, `is_homogeneous`, `lift`, and the static `from_polynomials` |
-| `HilbertSeries` | `HilbertSeries`: `numerator` (`list[int]`), `denominator_power`, `dimension()`, `multiplicity()`, `coefficient(d)` |
-| `CertifiedGroebnerBasis` | `.basis`, `.certificate` (`bytes`) |
-| `verify::verify` | `sylvester.verify(data) -> VerifiedGroebnerBasis` |
+one Python class holding an enum, the same boundary cost as the CLI. The
+[Python package README](../crates/sylvester-py/README.md) documents the
+current method and attribute surface. The paragraphs below record the domain,
+budget, and provenance semantics that shape that surface.
 
 `Polynomial.terms()` returns `list[tuple[Coefficient, list[int]]]`,
 largest monomial first, where `Coefficient` is `int` over `F_p` and
@@ -1523,35 +1515,36 @@ saturating conversion.
 
 Bad input is `ValueError`, an exhausted budget is a `BudgetExhausted`
 subclass of `RuntimeError`, and a defect inside the crate is a distinct
-`RuntimeError` subclass. The mapping follows `auslander-py`, and it
-matches on wrapped errors rather than on the wrapper: `CertifyError`
-carries `Engine(ComputeError)`, `WriterExhausted`, and
-`VerifierExhausted(VerifyError)`, and each inner value decides the class.
-
-| Rust | Python |
-|---|---|
-| `RingError`, `ParseError`, `NormalFormError::RingMismatch`, `BasisError::{RingMismatch, ZeroPolynomial, NotMonic, NotSorted, NotInterreduced, NotGroebner}` | `sylvester.RingError`, `sylvester.ParseError`, `sylvester.BasisError`, all `ValueError`, with `index` or `left` and `right` attached |
-| `Timeout` and `MemoryLimitExceeded`, wherever they occur: `ComputeError`, `NormalFormError`, `BasisError`, `HilbertError`, `CertifyError::Engine`, `CertifyError::WriterExhausted`, and the deadline variants of `VerifyError` | `sylvester.Timeout`, `sylvester.MemoryLimitExceeded`, both `sylvester.BudgetExhausted(RuntimeError)` |
-| `ComputeError::{DegreeLimit, ExponentLimit, TableFull, PrimesExhausted}`, `NormalFormError::ExponentLimit`, `BasisError::ExponentLimit`, `CertifyError::CapExceeded`, the cap variants of `VerifyError` | `sylvester.LimitExceeded(RuntimeError)`, with `limit` attached where the variant carries one |
-| `CertifyError::{Rejected, Emitter, InputMismatch}` | `sylvester.InternalDefect(RuntimeError)`: the crate contradicted itself |
-| the rejection variants of `VerifyError` from `sylvester.verify` | `sylvester.CertificateInvalid(ValueError)`: untrusted bytes are input |
-| asking `Ideal(rationals).groebner_basis_certified` | `ValueError` naming the domain |
+`RuntimeError` subclass. Wrapped errors are classified by their inner value:
+`CertifyError` carries `Engine(ComputeError)`, `WriterExhausted`, and
+`VerifierExhausted(VerifyError)`, and each inner value selects the Python
+exception. Ring, parser, basis-shape, and rejected-certificate errors map to
+`ValueError`. `Timeout` and `MemoryLimitExceeded` subclass
+`BudgetExhausted`; degree, exponent, table, prime, and verifier-cap limits map
+to `LimitExceeded`; internal contradictions map to `InternalDefect`. A
+`BasisError` retains `index`, `left`, and `right` where available. Asking
+`Ideal(rationals).groebner_basis_certified` raises `ValueError` naming the
+domain.
 
 `sylvester.verify` returns `VerifiedGroebnerBasis`, a class distinct from
 `GroebnerBasis`, with `input`, `basis`, `modulus`, and `nvars`. Its
 polynomials use the synthetic names `x1 .. xn`, for the reason section
 8.4 gives, and the class documents it.
 
-Every compute call, every certified call, every `verify`, every normal
-form, every basis check, and every Hilbert series releases the GIL around
-the Rust work with `Python::allow_threads`. The rule around it: convert
-and clone every input into an owned Rust value first, including copying
-the bytes of `verify` out of the Python buffer, then release the GIL,
-then convert results and errors into Python objects after it is back. A
-`PyRef` or a borrowed buffer cannot cross into the released region. The
+Every method with a budget converts Python values while holding the GIL, then
+borrows immutable Rust inputs or moves owned values into a joined worker. The
+binding releases the GIL around the Rust work with `Python::allow_threads`. A
+`PyRef` or a borrowed buffer cannot cross into the released region. Calls
+originating on the main Python thread poll pending signals with
+`Python::check_signals`; Ctrl-C cancels the worker, and the binding joins it
+before raising `KeyboardInterrupt`. `check_signals` is a no-op for calls
+originating on a background Python thread. Those calls still enforce any
+supplied `timeout` and `memory_limit` and join the worker, but Ctrl-C is not
+propagated through them. Use `timeout` to bound a background call.
+
 The existing invariants make the release sound: `PolynomialRing`, `Ideal`,
-`Polynomial`, and `GroebnerBasis` are `Send + Sync`, the compute methods
-take `&self` and return owned values, and no error borrows from the ring.
+`Polynomial`, and `GroebnerBasis` are `Send + Sync`, the compute methods take
+`&self` and return owned values, and no error borrows from the ring.
 A static assertion in the binding crate fails the build if any of those
 types stops being `Send + Sync`. A pytest case starts a computation in
 one thread and passes a `threading.Event` back and forth with the main
@@ -1591,7 +1584,7 @@ The modular driver is five files, one job each:
   compute/modular/crt.rs          # the accumulator of section 3.4
   compute/modular/reconstruct.rs  # the lift of section 3.6
   compute/modular/check.rs        # T1 and T2 of section 3.7
-crates/sylvester-cli/src/{main.rs, format/{ms,syl,text}.rs}
+crates/sylvester-cli/src/{main.rs, format/{json,ms,syl,text}.rs}
 crates/sylvester-cli/tests/cli.rs
 crates/sylvester-py/{src/lib.rs, python/sylvester/*, tests/*}
 ```
@@ -1691,172 +1684,29 @@ the four families over `Q`, under the protocol of the prime-field cells:
 full canonical output comparison, pinned cores, recorded repetitions,
 recorded versions and full command lines.
 
-One precondition comes first, and the gate of section 1.2 depends on it.
 Each reference tool needs an invocation that emits a lifted rational
-basis, and that has to be established rather than assumed. The harness
-uses msolve today with `-g 2` over a prime field, and whether the
-installed msolve 0.10.1 emits a rational basis is an open question
-(section 13, item 9). Singular over `Q`, through both `std` and
-`modStd`, and Groebner.jl over `Rational{BigInt}` are the references
-known to produce one. If msolve cannot, it is dropped from the rational
-cells and the record says so.
+basis. The harness uses msolve 0.10.1 with `-g 2` over `Q`.
+Singular over `Q`, through both `std` and `modStd`, and Groebner.jl over
+`Rational{BigInt}` are the other references known to produce one.
 
 `sylv-runner` gains a rational mode. Every number in `README.md`,
 `CHANGELOG.md`, or `KNOWN_ISSUES.md` comes from the record, copied,
 never typed.
 
-## 12. Work breakdown
+## Design corrections
 
-An earlier draft ran four chunks in parallel behind one coefficient
-chunk. The file dependencies do not allow it, the same way they did not
-before. The coefficient migration alone is too large for one reviewable
-commit, so it lands in three stages, each of which compiles and keeps
-`cargo test` green.
+Several claims in early drafts were false and are excluded from this design.
 
-| chunk | owns | depends on |
-|---|---|---|
-| A1. Sealed domain over the prime field | `src/ring.rs`, `src/ring/field.rs`, `src/poly.rs`, `src/ideal.rs`, `src/certificate.rs`, `src/lib.rs`, `src/compute/**`, `src/cert/**`, `tests/**`, `benches/**`, `benchmarks/gb-comparison/runner/{Cargo.toml, Cargo.lock, src/main.rs}`, root `Cargo.toml` and `Cargo.lock` | none |
-| A2. The rational domain | `src/ring/rational.rs`, `src/ring.rs`, `src/poly.rs`, `src/ideal.rs`, `src/lib.rs`, `tests/roundtrip.rs`, `tests/isolation.rs` | A1 |
-| A3. Limits, budget, and the meters | `src/compute/mod.rs`, `src/compute/f4/{mod,kernel}.rs`, `src/compute/{classic,interreduce}.rs`, `src/cert/mod.rs`, `src/lib.rs` | A2 |
-| B. Normal form and the checked basis | `src/normal_form.rs`, `src/poly.rs` (checked multiply), `src/ideal.rs`, `src/lib.rs`, `tests/{normal_form,isolation}.rs` | A3 |
-| C. Multimodular engine | `src/compute/modular/**`, `src/compute/mod.rs`, `src/ideal.rs`, `src/lib.rs`, `tests/{rational,isolation}.rs` | B |
-| D. Hilbert | `src/hilbert.rs`, `src/ideal.rs`, `src/lib.rs`, `tests/{hilbert,isolation}.rs` | C |
-| E. CLI | `crates/sylvester-cli/**`, root `Cargo.toml` and `Cargo.lock` | D |
-| F. Python | `crates/sylvester-py/**`, root `Cargo.toml` and `Cargo.lock` | E |
-| G. Harness | `benchmarks/gb-comparison/**` | C |
-| H. Docs | `README.md`, `CHANGELOG.md`, `KNOWN_ISSUES.md`, `AGENTS.md`, `PLAN.md` status lines | all |
-
-Three boundaries inside the A stages are set here, because each one is a
-place where a naive split would not compile.
-
-- A1 introduces `Coefficient` and the `num-*` dependencies, not A2.
-  `DomainOps::convert` takes a `&Coefficient`, so the type has to exist
-  with the trait. A1 also changes the public term accessor, so the tests,
-  the benches, and the runner move with it, including the runner's own
-  `Cargo.lock`, which the new dependencies change, and its variable
-  naming, which goes from `x0 .. x(n-1)` to `x1 .. xn` in the same
-  commit as the rest of its migration. A1 adds the workspace `exclude`
-  entry for that package (section 10).
-- A2 introduces `RationalMeta`, `ModularLift`, and `Established` as
-  types, because `Rationals::BasisMeta` names `RationalMeta` the moment
-  the domain exists. Chunk C is what first fills a `ModularLift` in.
-  Until then the only rational basis a caller can build is a checked one
-  from chunk B.
-- A3 owns `src/compute/f4/kernel.rs`, because cancellation reaches the
-  per-worker deadlines that file builds.
-
-A1 is the sealed traits, the public operation types, and the generic
-scaffold with `PrimeField` as the only domain, adapting every engine,
-certificate, bench, and test signature. A2 adds `Rationals`, rational
-arithmetic, the parser and `Display` paths, and the basis metadata types.
-A3 extracts `Budget`, promotes `ComputeLimits`, adds cancellation, and
-fixes the three memory meters. Nothing rational computes until C.
-
-A1 through D are sequential, because each owns `src/ideal.rs` or
-`src/lib.rs` in turn. E and F both touch the root manifest's workspace
-members and the lock file, so F follows E rather than running beside it;
-G shares no file with either and runs as soon as C lands. Every chunk
-that adds a module also updates `tests/isolation.rs`. The existing golden
-certificates must still verify byte for byte at the end of every stage.
-
-Two rules hold unchanged. A chunk lands only with its tests. A
-commit that claims a speed win carries a before and after number from the
-harness record.
-
-## 13. Implementation decisions
-
-Each item carries the design's proposal. The owner may override any of
-them. Items 1 to 5 change types or control flow, so they are answered
-before chunk A1 starts.
-
-1. **Coefficient parameter against a runtime tag.** Section 2.1 proposes
-   the sealed type parameter `PolynomialRing<D>`, which makes "no
-   certification over Q" a compile error and keeps the engines on
-   concrete types, at the cost of an enum boundary in the CLI and the
-   Python bindings. The alternative is one non-generic type with a domain
-   tag and an enum of term storages, which keeps those two boundaries
-   simple and moves the domain check to run time everywhere else. A
-   related sub-decision: whether the public types get a default parameter
-   (`PolynomialRing<D = PrimeField>`), which shortens prime-field
-   signatures and hides the domain in the docs.
-2. **Deterministic or seeded primes.** Section 3.2 proposes the fixed
-   descending sequence, which makes the rational basis and its counters
-   reproducible and gives an adversary the confirming primes in advance.
-   The alternative is a seeded sequence with the seed in `ModularLift`,
-   which supports a probability statement and gives up reproducibility
-   across seeds.
-3. **The default stopping rule.** Rust uses `RationalStop::Unchanged {
-   extra: 2 }`. The CLI and Python binding default to `ContainsInput`,
-   which adds T1 and T2 and still does not exclude `{1}`.
-4. **How much a rational run may retain.** Section 3.3 keeps every
-   completed run so the accumulator can be rebuilt when prevalence
-   changes, and the retained bytes are the sum of every modular output.
-   The alternative is a bounded pool with recomputation when the pool
-   misses.
-5. **Per-prime failure policy.** Section 3.5 stops the whole run on
-   `DegreeLimit`, `ExponentLimit`, and `TableFull`. The alternative is a
-   bounded retry with the retries counted.
-6. **Hilbert resource limits.** Section 6.2 gives `hilbert_series` a
-   `Budget` and an error type, because no proved bound on the recursion
-   is offered. The alternative is an infallible method and a promise the
-   design cannot back.
-7. **The dimension of the zero quotient.** Proposed `Option<usize>` with
-   `None` for the unit ideal. The alternative is a two-variant enum,
-   which reads better at the call site and adds a public type.
-8. **The pyo3 pin.** Proposed `=0.23.5`, matching `auslander-py`, with
-   `Python::allow_threads`. A newer pin changes the GIL call and parts of
-   the `Bound` API through the whole binding.
-9. **The rational reference tool.** Section 11.4 makes a working
-   rational invocation a precondition of the gate. If msolve 0.10.1
-   cannot emit a lifted rational basis, confirm that Singular and
-   Groebner.jl are enough and that msolve is dropped from the rational
-   cells.
-10. **New dependencies.** `num-bigint`, `num-rational`, `num-integer`,
-    and `num-traits` in the library; `clap` in the CLI; `pyo3` in the
-    bindings. The verifier gains none. Confirm.
-11. **CLI input formats.** Proposed three: `ms`, `syl`, and `text`.
-    `syl` carries no ring and exists for the harness inputs; dropping it
-    removes a format and a flag interaction. The `syl` variable naming
-    change (`x0` to `x1`) in the runner rides on this.
-12. **The standalone verifier's output.** Section 8.4 has `sylv verify`
-    print the basis under synthetic names, since certificates carry no
-    variable names. The alternative is to report acceptance only.
-
-## Review record
-
-Codex (gpt-5.6-sol, xhigh) reviewed this design as an adversary over six
-rounds and endorsed it at the end of the sixth. The record is the
-disposition, not an endorsement of any earlier draft.
-
-- Round 1 found the worst defect: the claim that a modular leading ideal
-  always contains the rational one, used to convict primes as "proven
-  unlucky". The counterexample `{ x + y, x + (p + 1) y }` is now in
-  section 3.3. It also killed the false Hilbert identity
-  `L = (L : x_j) ∩ (L + (x_j))`, the affine Hilbert function statement,
-  the missing `gcd(a, b) = 1`, and the runtime domain tag, which the
-  sealed type parameter replaced.
-- Round 2 showed the Hilbert recursion could not terminate under the
-  stated pivot rule (`L = (x, y z)` returns its parent), that
-  `sub_scaled` multiplies unchecked so `Monomial::checked_mul` alone does
-  not fix normal form, that `GroebnerBasis::new` is crate-private so the
-  CLI could not act on a supplied basis, that speculative runs need a
-  cancellation flag, and that `ComputeLimits` and `WriterBudget` collide
-  with names `src/compute/mod.rs` already imports.
-- Round 3 found that a checked rational basis has no honest
-  `ModularLift` (now `RationalMeta::Checked`), that
-  `ComputeError::Cancelled` cannot be internal-only on a public
-  exhaustive enum (now a crate-private `RunError`), that `ContainsInput`
-  could rerun T1 and T2 on a candidate it had already rejected, and that
-  the A1 to A3 split did not compile at its boundaries.
-- Round 4 corrected the order of normalization against the invertibility
-  test (`3/3` over `F_3`), a generic constructor with no way to build
-  `D::BasisMeta`, a cancellation flag that would have cancelled the work
-  after it, an undefined memory reservation, and the workspace capture of
-  the benchmark runner and its lock file.
-- Round 5 closed the last three implementation defects: the deadline
-  covers the driver's own loops and not only the prime runs, the CLI
-  resolves one ring per command so a `syl` basis can meet a `text`
-  polynomial, and three remaining claims were cut back to what is known.
-- Round 6 was the endorsement and a style pass. It added the pivot tie
-  break of section 6.2, limited the retention claim to consumed runs,
-  fixed the scope of the 31-bit bound, and cut the remaining filler.
+- A modular leading ideal need not contain the rational leading ideal. The
+  counterexample in section 3.3 explains why the driver votes on observed
+  leading monomial sets instead of classifying a prime from input
+  coefficients.
+- Rational reconstruction requires a reduced fraction with
+  `gcd(a, b) = 1` and `gcd(b, M) = 1`. The bounds and congruence alone do not
+  define the reconstructed value.
+- The Hilbert numerator follows the exact sequence in section 6.2. The
+  identity `L = (L : x_j) ∩ (L + (x_j))` is false, so it is not used as a
+  proof. The pivot rule makes both recursive branches smaller.
+- T1 and T2 establish that a lifted basis generates an ideal containing the
+  input ideal. They do not establish the reverse containment. In particular,
+  `{1}` passes both tests for every input.

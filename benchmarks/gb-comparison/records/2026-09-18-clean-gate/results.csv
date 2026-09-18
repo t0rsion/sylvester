@@ -1,0 +1,9 @@
+instance,tool,config,status,seconds,size,basis_sha256,runs,spread_min_s,spread_max_s,cores,cmd
+cyclic-7,sylvester-f4,default,OK,0.076606215,209,,3,,,,runner/bin/sylv-runner inputs/cyclic-7.syl f4 1 1073741827
+cyclic-7,msolve,default,OK,0.078391977,209,,7,0.075686028,0.081225376,,runner/bin/msolve-inproc inputs/cyclic-7.syl 1073741827 1
+katsura-9,sylvester-f4,default,OK,0.252875262,272,,3,,,,runner/bin/sylv-runner inputs/katsura-9.syl f4 1 1073741827
+katsura-9,msolve,default,OK,0.229818113,272,,3,0.229505115,0.246824979,,runner/bin/msolve-inproc inputs/katsura-9.syl 1073741827 1
+eco-9,sylvester-f4,default,OK,0.015791203,106,,3,,,,runner/bin/sylv-runner inputs/eco-9.syl f4 1 1073741827
+eco-9,msolve,default,OK,0.013231605,106,,37,0.013151795,0.022346442,,runner/bin/msolve-inproc inputs/eco-9.syl 1073741827 1
+noon-6,sylvester-f4,default,OK,0.011724404,187,,3,,,,runner/bin/sylv-runner inputs/noon-6.syl f4 1 1073741827
+noon-6,msolve,default,OK,0.011754756,187,,43,0.011654932,0.014082227,,runner/bin/msolve-inproc inputs/noon-6.syl 1073741827 1

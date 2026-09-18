@@ -16,6 +16,7 @@ const KIND_INPUT: u64 = 0;
 const KIND_MUL: u64 = 1;
 const KIND_COMB: u64 = 2;
 const KIND_SCALE: u64 = 3;
+const POLL_STEPS: usize = 1 << 20;
 
 /// The node values and the use counts the trace declares.
 pub(super) struct Nodes {
@@ -218,14 +219,15 @@ fn mul_node(
 ) -> Result<(Poly, Vec<usize>), VerifyError> {
     let src = source(reader, id, ctx)?;
     let pool_index = reader.varint(&mut ctx.meter)?;
-    let mono = pool.take(pool_index, &mut ctx.meter)?;
+    let mono_index = pool.reference(pool_index, &mut ctx.meter)?;
+    let mono = pool.get(mono_index);
     if mono.is_identity() {
         return Err(VerifyError::Trace {
             node: id,
             fault: NodeFault::IdentityMultiplier,
         });
     }
-    let value = arith::mono_mul(nodes.value(src)?, &mono, &mut ctx.meter)?;
+    let value = arith::mono_mul(nodes.value(src)?, mono, &mut ctx.meter)?;
     Ok((value, vec![src]))
 }
 
@@ -260,9 +262,17 @@ fn comb_node(
     let (src, scalar) = iter.next().expect("a combination has at least two steps");
     let mut value = arith::scale(nodes.value(src)?, scalar, ctx.modulus, &mut ctx.meter)?;
     sources.push(src);
-    for (src, scalar) in iter {
-        let scaled = arith::scale(nodes.value(src)?, scalar, ctx.modulus, &mut ctx.meter)?;
-        value = arith::add(&value, &scaled, ctx.modulus, &mut ctx.meter)?;
+    for (index, (src, scalar)) in iter.enumerate() {
+        if index > 0 && index.is_multiple_of(POLL_STEPS) {
+            ctx.meter.poll()?;
+        }
+        value = arith::add_scaled_owned(
+            value,
+            nodes.value(src)?,
+            scalar,
+            ctx.modulus,
+            &mut ctx.meter,
+        )?;
         sources.push(src);
     }
     Ok((value, sources))
@@ -529,14 +539,16 @@ fn check_term_reduced(
     Ok(())
 }
 
-/// The multiple `mono * lm(g)`, or an error when it passes the exponent
-/// bound.
-pub(super) fn lead_multiple(
+/// Compare `mono * lm(g)` with a target, or report exponent overflow.
+pub(super) fn lead_matches(
     mono: &Mono,
     element: &Poly,
+    target: &Mono,
     meter: &mut Meter,
-) -> Result<Mono, VerifyError> {
+) -> Result<bool, VerifyError> {
     let lead = element.lm().expect("every basis element is nonzero");
     arith::charge_monos(meter, mono, lead)?;
-    mono.mul(lead)
+    let (matches, support) = mono.mul_matches(lead, target)?;
+    meter.charge((support + target.support()).max(1) as u64)?;
+    Ok(matches)
 }

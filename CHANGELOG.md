@@ -3,6 +3,71 @@
 This file follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions follow [semantic versioning](https://semver.org/).
 
+## 0.4.0 (2026-09-18)
+
+Finite quotient algebras, polynomial arithmetic, budgeted expressions,
+division with quotients, saved computation records, and cancellation.
+
+### Added
+
+- `GroebnerBasis::is_zero_dimensional` and `finite_quotient` in both
+  coefficient domains. `FiniteQuotient` retains its source basis and
+  enumerates standard monomials in ascending grevlex order.
+- Quotient reduction, residue coordinates, addition, multiplication, and
+  powers. Multiplication matrices are computed on request. Characteristic
+  polynomials use division-free arithmetic; minimal polynomials use the
+  first dependence among powers of a residue. These operations have no
+  independent certificate contract.
+- `Polynomial::try_add`, `try_sub`, `try_mul`, `try_neg`, `try_pow`, and
+  `try_scale`, each under a `Budget`. Ring mismatches, exponent overflow,
+  and exhausted budgets are typed errors.
+- Ring generators and `parse_polynomial_with_budget`, with parentheses,
+  unary signs, exact numeric fractions, and `^` or `**` powers.
+- `GroebnerBasis::divide` and `DivisionResult`. Each quotient belongs to
+  a divisor in the basis, in basis order. The identity is
+  `f = sum_i q_i g_i + r`; it is not an origin witness in the input generators.
+- `ResultEnvelope`, storing the ring, input, basis, an untrusted provenance
+  claim, and optional certificate bytes. `verify_prime` independently
+  verifies the certificate and matches its full input and basis to the
+  record. Loading JSON alone establishes no mathematical claim.
+- `CancellationToken` and `Budget::cancellation`. Independent verifier
+  limits accept a shared stop flag. Cancellation reports exhaustion through
+  the existing timeout errors.
+- `Ideal<Rationals>::check_basis_equality`, an explicit exact check with
+  origins in the input generators. It checks both ideal inclusions and
+  the candidate basis properties. It is expensive and has no independent
+  certificate contract. The existing rational stopping rules stay unchanged.
+- `ResultEnvelope::check_rational`, which checks a saved rational statement
+  under one budget. A saved `equals_input` claim alone establishes nothing.
+- Python polynomial operators, finite quotient operations, division,
+  saved records, and an optional structured SymPy adapter. A notebook
+  demonstrates characteristic and minimal polynomials of a residue.
+- CLI `quotient`, JSON computation records, division quotients, memory units,
+  and phase messages on standard error.
+- Standalone CLI archives and Python wheels for Linux, macOS, and Windows,
+  on x86-64 and ARM64. Python artifacts remain GitHub release downloads.
+
+### Changed
+
+- `Budget` implements `Clone` but no longer implements `Copy`, because a
+  budget can hold a shared cancellation token.
+- Verifier exhaustion distinguishes `Cap::LiveBytes` from
+  `Cap::IntermediateBytes`, matching the separate caller limits.
+- The v2 verifier merges owned polynomial buffers, retains pool indices,
+  and checks leading products without allocating temporary polynomials.
+
+### Fixed
+
+- Python operations release the GIL while waiting for work. For calls on
+  the Python main thread, an interrupt cancels the worker and joins it
+  before raising `KeyboardInterrupt`.
+- Polynomial arithmetic, division, parsing, and quotient operations account
+  for retained buffers before allocating intermediate values.
+- Verification observes cancellation during tail merges and conversion of
+  accepted v2 data to public result types.
+- CLI reads share the command deadline and memory allowance. File outputs
+  use a temporary file and rename; certificate and result paths must differ.
+
 ## 0.3.0 (2026-09-04)
 
 A coefficient parameter, a multimodular rational engine, normal form and

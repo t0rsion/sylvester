@@ -1,0 +1,10 @@
+baseline,taskset -c 0-3,12-15 <clean-worktree>/target/release/sylv certify <repo>/benchmarks/gb-comparison/inputs/cyclic-5.syl --modulus 1073741827 --threads 1 --certificate <record-scratch>/baseline/cyclic-5.cert
+patched,taskset -c 0-3,12-15 <patched-worktree>/target/release/sylv certify <repo>/benchmarks/gb-comparison/inputs/cyclic-5.syl --modulus 1073741827 --threads 1 --certificate <record-scratch>/candidate/cyclic-5.cert
+baseline,taskset -c 0-3,12-15 <clean-worktree>/target/release/sylv certify <repo>/benchmarks/gb-comparison/inputs/cyclic-6.syl --modulus 1073741827 --threads 1 --certificate <record-scratch>/baseline/cyclic-6.cert
+patched,taskset -c 0-3,12-15 <patched-worktree>/target/release/sylv certify <repo>/benchmarks/gb-comparison/inputs/cyclic-6.syl --modulus 1073741827 --threads 1 --certificate <record-scratch>/candidate/cyclic-6.cert
+baseline,taskset -c 0-3,12-15 <clean-worktree>/target/release/sylv certify <repo>/benchmarks/gb-comparison/inputs/katsura-5.syl --modulus 1073741827 --threads 1 --certificate <record-scratch>/baseline/katsura-5.cert
+patched,taskset -c 0-3,12-15 <patched-worktree>/target/release/sylv certify <repo>/benchmarks/gb-comparison/inputs/katsura-5.syl --modulus 1073741827 --threads 1 --certificate <record-scratch>/candidate/katsura-5.cert
+baseline,taskset -c 0-3,12-15 <clean-worktree>/target/release/sylv certify <repo>/benchmarks/gb-comparison/inputs/eco-8.syl --modulus 1073741827 --threads 1 --certificate <record-scratch>/baseline/eco-8.cert
+patched,taskset -c 0-3,12-15 <patched-worktree>/target/release/sylv certify <repo>/benchmarks/gb-comparison/inputs/eco-8.syl --modulus 1073741827 --threads 1 --certificate <record-scratch>/candidate/eco-8.cert
+baseline,taskset -c 0-3,12-15 <clean-worktree>/target/release/sylv certify <repo>/benchmarks/gb-comparison/inputs/noon-5.syl --modulus 1073741827 --threads 1 --certificate <record-scratch>/baseline/noon-5.cert
+patched,taskset -c 0-3,12-15 <patched-worktree>/target/release/sylv certify <repo>/benchmarks/gb-comparison/inputs/noon-5.syl --modulus 1073741827 --threads 1 --certificate <record-scratch>/candidate/noon-5.cert

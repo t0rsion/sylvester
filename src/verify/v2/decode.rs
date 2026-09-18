@@ -302,6 +302,27 @@ pub(super) struct Pool {
 }
 
 impl Pool {
+    /// Mark a pool entry as used and return its index.
+    ///
+    /// The charge covers the sparse support that a caller reads. The index
+    /// stays cheap to retain when the caller can revisit the pool later.
+    pub(super) fn reference(
+        &mut self,
+        index: u64,
+        meter: &mut Meter,
+    ) -> Result<usize, VerifyError> {
+        let index = bounded(index, self.monos.len(), "pool index")?;
+        let mono = &self.monos[index];
+        meter.charge(1 + mono.support() as u64)?;
+        self.used[index] = true;
+        Ok(index)
+    }
+
+    /// Return a pool entry whose index was checked during decoding.
+    pub(super) fn get(&self, index: usize) -> &Mono {
+        &self.monos[index]
+    }
+
     /// Return the monomial an index names, and mark the entry as used.
     ///
     /// The charge covers the copy: one unit per support entry, plus one.

@@ -4,32 +4,43 @@
 //! The Rust library carries the coefficient domain as a type parameter.
 //! Python learns the domain at run time, so each pair of Rust
 //! instantiations collapses to one Python class holding an enum over the
-//! two, and the ring constructor picks the arm. `docs/rational-design.md` section 9 fixes the
-//! surface, the error mapping, and the rule around the GIL.
+//! two, and the ring constructor picks the arm. `docs/rational-design.md`
+//! fixes the base surface and the rule around the GIL.
 //!
-//! Every computation releases the GIL. The rule is one order: convert and
-//! clone every input into an owned Rust value, release the GIL, run, take
-//! the GIL back, and only then build Python objects. No borrowed Python
-//! value crosses into the released region.
+//! Every computation releases the GIL. Python values are converted while the
+//! GIL is held, then immutable Rust values are borrowed or moved into a
+//! joined worker. No borrowed Python value crosses into the released region.
+//!
+//! The calling Python main thread polls pending signals while the worker
+//! runs. Python delivers signals to that thread; calls from other Python
+//! threads still release the GIL but do not receive signal exceptions there.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::num::NonZeroUsize;
-use std::time::Duration;
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::mpsc::{RecvTimeoutError, sync_channel};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
-use num_bigint::BigInt;
+use num_bigint::{BigInt, Sign};
 use num_rational::BigRational;
-use pyo3::exceptions::{PyException, PyIndexError, PyRuntimeError, PyValueError};
+use num_traits::{ToPrimitive, Zero};
+use pyo3::exceptions::{PyException, PyIndexError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::sync::GILOnceCell;
 use pyo3::types::{PyBytes, PyDict, PyIterator, PyList, PySlice, PyTuple, PyType};
 
 use sylvester::verify::{self, VerifyError};
 use sylvester::{
-    Backend, BasisError, Budget, CertifiedGroebnerBasis, CertifyError, Coefficient, ComputeError,
-    ComputeOptions, ComputeReport, Established, F4Counters, GroebnerBasis, HilbertError,
-    HilbertSeries, Ideal, ModularLift, NormalFormError, ParseError, Polynomial, PolynomialRing,
-    PrimeField, RationalOptions, RationalStop, Rationals, RingError,
+    ArithmeticError, Backend, BasisError, Budget, CancellationToken, CertifiedGroebnerBasis,
+    CertifyError, ClaimedProvenance, Coefficient, ComputeError, ComputeOptions, ComputeReport,
+    EnvelopeDomain, EnvelopeError, EqualityCheckError, Established, ExpressionError,
+    FiniteQuotient, GroebnerBasis, HilbertError, HilbertSeries, Ideal, ModularLift,
+    MultiplicationMatrix, NormalFormError, ParseError, Polynomial, PolynomialRing, PrimeField,
+    QuotientError, RationalEqualityCheck, RationalOptions, RationalStop, Rationals, ResultEnvelope,
+    RingError, UnivariatePolynomial,
 };
 
 /// The largest exponent one variable holds, which is what the engines pack.
@@ -75,6 +86,17 @@ struct Exceptions {
     internal_defect: Py<PyType>,
 }
 
+struct LeafExceptions {
+    ring: Py<PyType>,
+    parse: Py<PyType>,
+    basis: Py<PyType>,
+    certificate_invalid: Py<PyType>,
+    timeout: Py<PyType>,
+    memory_limit: Py<PyType>,
+    limit_exceeded: Py<PyType>,
+    internal_defect: Py<PyType>,
+}
+
 static EXCEPTIONS: GILOnceCell<Exceptions> = GILOnceCell::new();
 
 /// Build one exception class.
@@ -93,17 +115,6 @@ fn new_exception<'py>(
     let bases = PyTuple::new(py, bases)?;
     let class = py.get_type::<PyType>().call1((name, bases, namespace))?;
     Ok(class.downcast_into::<PyType>()?.unbind())
-}
-
-struct LeafExceptions {
-    ring: Py<PyType>,
-    parse: Py<PyType>,
-    basis: Py<PyType>,
-    certificate_invalid: Py<PyType>,
-    timeout: Py<PyType>,
-    memory_limit: Py<PyType>,
-    limit_exceeded: Py<PyType>,
-    internal_defect: Py<PyType>,
 }
 
 fn build_exceptions(py: Python<'_>) -> PyResult<Exceptions> {
@@ -126,7 +137,7 @@ fn build_exceptions(py: Python<'_>) -> PyResult<Exceptions> {
          follows. Timeout and MemoryLimitExceeded are the two subclasses.",
     )?;
     let budget_type = budget_exhausted.bind(py).clone();
-    let leaves = build_leaf_exceptions(py, &base_type, &budget_type)?;
+    let leaves = build_leaf_exceptions(py, &base_type, &budget_type, &runtime_error)?;
     Ok(Exceptions {
         ring: leaves.ring,
         parse: leaves.parse,
@@ -145,52 +156,70 @@ fn build_leaf_exceptions(
     py: Python<'_>,
     base: &Bound<'_, PyType>,
     budget: &Bound<'_, PyType>,
+    runtime_error: &Bound<'_, PyType>,
 ) -> PyResult<LeafExceptions> {
     let value_error = py.get_type::<PyValueError>();
-    let runtime_error = py.get_type::<PyRuntimeError>();
     Ok(LeafExceptions {
         ring: new_exception(
             py,
             "RingError",
             &[base, &value_error],
-            "A ring construction failed. The value does not meet the ring contract.",
+            "A construction through the ring stopped: a modulus that is not \
+             prime, a variable name the parser cannot read, an exponent \
+             count that is not the variable count, or a polynomial of \
+             another ring.",
         )?,
         parse: new_exception(
             py,
             "ParseError",
             &[base, &value_error],
-            "The text is not a polynomial of the ring. The message gives the byte position.",
+            "The text is not a polynomial of the ring. The message names \
+             the byte position and what the parser found there.",
         )?,
         basis: new_exception(
             py,
             "BasisError",
             &[base, &value_error],
-            "A supplied list is not a reduced Gröbner basis.",
+            "A supplied list is not a reduced Gröbner basis. `index` names \
+             the element that failed a shape check, and `left` and `right` \
+             the first pair whose S-polynomial has a nonzero remainder.",
         )?,
         certificate_invalid: new_exception(
             py,
             "CertificateInvalid",
             &[base, &value_error],
-            "The verifier rejected the certificate bytes.",
+            "The verifier rejected the certificate bytes. The bytes are \
+             untrusted input, so this is a ValueError and says nothing \
+             about the engines.",
         )?,
-        timeout: new_exception(py, "Timeout", &[budget], "The deadline passed.")?,
+        timeout: new_exception(
+            py,
+            "Timeout",
+            &[budget],
+            "The deadline passed before the computation finished.",
+        )?,
         memory_limit: new_exception(
             py,
             "MemoryLimitExceeded",
             &[budget],
-            "The live data passed the memory limit.",
+            "The live data of the computation passed the memory limit.",
         )?,
         limit_exceeded: new_exception(
             py,
             "LimitExceeded",
-            &[base, &runtime_error],
-            "The computation reached a structural limit.",
+            &[base, runtime_error],
+            "The computation reached a structural limit of this release: a \
+             degree or an exponent past the width of one exponent, a full \
+             monomial table, an exhausted prime sequence, or a certificate \
+             cap. `limit` carries the bound where the limit names one.",
         )?,
         internal_defect: new_exception(
             py,
             "InternalDefect",
-            &[base, &runtime_error],
-            "Sylvester contradicted an internal invariant.",
+            &[base, runtime_error],
+            "The crate contradicted itself: it wrote a certificate its own \
+             verifier rejected, or the emitter reported a fault. This is a \
+             defect in sylvester, never bad input.",
         )?,
     })
 }
@@ -236,6 +265,29 @@ fn of_ring(py: Python<'_>, error: RingError) -> PyErr {
 
 fn of_parse(py: Python<'_>, error: ParseError) -> PyErr {
     raise(py, &exceptions(py).parse, error.to_string())
+}
+
+fn of_expression(py: Python<'_>, error: ExpressionError) -> PyErr {
+    let classes = exceptions(py);
+    let message = error.to_string();
+    match error {
+        ExpressionError::Parse(inner) => of_parse(py, inner),
+        ExpressionError::Ring(inner) => of_ring(py, inner),
+        ExpressionError::Timeout => raise(py, &classes.timeout, message),
+        ExpressionError::MemoryLimitExceeded => raise(py, &classes.memory_limit, message),
+        ExpressionError::ExponentLimit { limit } => {
+            raise_with(py, &classes.limit_exceeded, message, |value| {
+                value.setattr("limit", limit)
+            })
+        }
+        ExpressionError::NestingLimit { limit, .. } => {
+            raise_with(py, &classes.limit_exceeded, message, |value| {
+                value.setattr("limit", limit)
+            })
+        }
+        ExpressionError::Compute(inner) => of_compute(py, inner),
+        ExpressionError::Arithmetic(inner) => operation_error(py, inner),
+    }
 }
 
 fn of_compute(py: Python<'_>, error: ComputeError) -> PyErr {
@@ -322,15 +374,69 @@ fn of_hilbert(py: Python<'_>, error: HilbertError) -> PyErr {
     }
 }
 
+fn of_quotient(py: Python<'_>, error: QuotientError) -> PyErr {
+    let message = error.to_string();
+    match error {
+        QuotientError::RingMismatch => raise(py, &exceptions(py).ring, message),
+        QuotientError::ExponentLimit { limit } => {
+            raise_with(py, &exceptions(py).limit_exceeded, message, |value| {
+                value.setattr("limit", limit)
+            })
+        }
+        QuotientError::Timeout => raise(py, &exceptions(py).timeout, message),
+        QuotientError::MemoryLimitExceeded => raise(py, &exceptions(py).memory_limit, message),
+        QuotientError::NotFinite => PyValueError::new_err(message),
+    }
+}
+
+fn of_envelope(py: Python<'_>, error: EnvelopeError) -> PyErr {
+    match error {
+        EnvelopeError::RingMismatch | EnvelopeError::Ring(_) => {
+            raise(py, &exceptions(py).ring, error.to_string())
+        }
+        EnvelopeError::Expression(inner) => of_expression(py, inner),
+        EnvelopeError::Verification(inner) => of_verify(py, inner),
+        EnvelopeError::EqualityCheck(inner) => of_equality(py, inner),
+        EnvelopeError::Timeout => raise(py, &exceptions(py).timeout, error.to_string()),
+        EnvelopeError::MemoryLimitExceeded => {
+            raise(py, &exceptions(py).memory_limit, error.to_string())
+        }
+        EnvelopeError::CertificateMismatch | EnvelopeError::Format(_) => {
+            raise(py, &exceptions(py).certificate_invalid, error.to_string())
+        }
+    }
+}
+
+fn of_equality(py: Python<'_>, error: EqualityCheckError) -> PyErr {
+    let message = error.to_string();
+    match error {
+        EqualityCheckError::RingMismatch => raise(py, &exceptions(py).ring, message),
+        EqualityCheckError::Candidate(inner) => of_basis(py, inner),
+        EqualityCheckError::ReverseMembership { generator } => {
+            raise_basis(py, message, Some(generator), None)
+        }
+        EqualityCheckError::ForwardMembership { basis } => {
+            raise_basis(py, message, Some(basis), None)
+        }
+        EqualityCheckError::ExponentLimit { limit } => {
+            raise_with(py, &exceptions(py).limit_exceeded, message, |value| {
+                value.setattr("limit", limit)
+            })
+        }
+        EqualityCheckError::Timeout => raise(py, &exceptions(py).timeout, message),
+        EqualityCheckError::MemoryLimitExceeded => raise(py, &exceptions(py).memory_limit, message),
+    }
+}
+
 fn of_certify(py: Python<'_>, error: CertifyError) -> PyErr {
     let classes = exceptions(py);
     let message = error.to_string();
     match error {
         CertifyError::Engine(inner) | CertifyError::WriterExhausted(inner) => of_compute(py, inner),
         CertifyError::VerifierExhausted(inner) => of_exhausted_verifier(py, inner),
-        CertifyError::CapExceeded { .. } => {
+        CertifyError::CapExceeded { limit, .. } => {
             raise_with(py, &classes.limit_exceeded, message, |value| {
-                value.setattr("limit", py.None())
+                value.setattr("limit", limit)
             })
         }
         CertifyError::Emitter(_) | CertifyError::InputMismatch | CertifyError::Rejected(_) => {
@@ -406,6 +512,87 @@ fn budget_of(timeout: Option<f64>, memory_limit: Option<usize>) -> PyResult<Budg
     Ok(budget)
 }
 
+fn cancellable_budget(
+    timeout: Option<f64>,
+    memory_limit: Option<usize>,
+    cancellation: &CancellationToken,
+) -> PyResult<Budget> {
+    Ok(budget_of(timeout, memory_limit)?.cancellation(cancellation.clone()))
+}
+
+fn run_with_signals<T, E, F, C>(py: Python<'_>, cancel: C, work: F) -> Result<Result<T, E>, PyErr>
+where
+    T: Send,
+    E: Send,
+    F: FnOnce() -> Result<T, E> + Send,
+    C: Fn(),
+{
+    let (sender, receiver) = sync_channel::<Result<Result<T, E>, ()>>(1);
+    let receiver = Arc::new(Mutex::new(receiver));
+    thread::scope(|scope| {
+        let spawned = thread::Builder::new().spawn_scoped(scope, move || {
+            let result = catch_unwind(AssertUnwindSafe(work));
+            let message = match result {
+                Ok(result) => Ok(result),
+                Err(_) => Err(()),
+            };
+            let _ = sender.send(message);
+        });
+        if let Err(error) = spawned {
+            return Err(PyRuntimeError::new_err(format!(
+                "the worker could not start: {error}"
+            )));
+        }
+        loop {
+            let receiver_for_wait = Arc::clone(&receiver);
+            let received = py.allow_threads(move || match receiver_for_wait.lock() {
+                Ok(receiver) => receiver.recv_timeout(Duration::from_millis(20)),
+                Err(_) => Err(RecvTimeoutError::Disconnected),
+            });
+            match received {
+                Ok(Ok(result)) => return Ok(result),
+                Ok(Err(())) => {
+                    return Err(PyRuntimeError::new_err("the worker panicked"));
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    if let Err(signal) = py.check_signals() {
+                        cancel();
+                        let receiver_for_cleanup = Arc::clone(&receiver);
+                        let _ = py.allow_threads(move || {
+                            receiver_for_cleanup
+                                .lock()
+                                .ok()
+                                .and_then(|receiver| receiver.recv().ok())
+                        });
+                        return Err(signal);
+                    }
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(PyRuntimeError::new_err("the worker ended without a result"));
+                }
+            }
+        }
+    })
+}
+
+/// Run one budgeted operation with a signal-aware worker.
+fn run_budgeted<T, E, F>(
+    py: Python<'_>,
+    timeout: Option<f64>,
+    memory_limit: Option<usize>,
+    work: F,
+) -> PyResult<Result<T, E>>
+where
+    T: Send,
+    E: Send,
+    F: FnOnce(Budget) -> Result<T, E> + Send,
+{
+    let cancellation = CancellationToken::new();
+    let budget = cancellable_budget(timeout, memory_limit, &cancellation)?;
+    let cancel = cancellation.clone();
+    run_with_signals(py, move || cancel.cancel(), move || work(budget))
+}
+
 fn backend_of(name: &str) -> PyResult<Backend> {
     match name {
         "f4" => Ok(Backend::F4),
@@ -426,8 +613,8 @@ fn stop_of(stop: Option<&str>, extra_primes: Option<usize>) -> PyResult<Rational
         },
     };
     match stop {
-        Some("unchanged") => Ok(RationalStop::Unchanged { extra }),
         None | Some("contains_input") => Ok(RationalStop::ContainsInput { extra }),
+        Some("unchanged") => Ok(RationalStop::Unchanged { extra }),
         Some(_) => Err(PyValueError::new_err(
             "stop is \"unchanged\" or \"contains_input\"".to_string(),
         )),
@@ -446,6 +633,7 @@ fn compute_options(
     threads: Option<usize>,
     stop: Option<&str>,
     extra_primes: Option<usize>,
+    cancellation: Option<&CancellationToken>,
 ) -> PyResult<ComputeOptions> {
     for (name, given) in [
         ("stop", stop.is_some()),
@@ -457,7 +645,11 @@ fn compute_options(
             )));
         }
     }
-    let mut options = ComputeOptions::new().budget(budget_of(timeout, memory_limit)?);
+    let mut budget = budget_of(timeout, memory_limit)?;
+    if let Some(token) = cancellation {
+        budget = budget.cancellation((*token).clone());
+    }
+    let mut options = ComputeOptions::new().budget(budget);
     if let Some(name) = backend {
         options = options.backend(backend_of(name)?);
     }
@@ -474,8 +666,13 @@ fn rational_options(
     threads: Option<usize>,
     stop: Option<&str>,
     extra_primes: Option<usize>,
+    cancellation: Option<&CancellationToken>,
 ) -> PyResult<RationalOptions> {
-    let mut options = ComputeOptions::new().budget(budget_of(timeout, memory_limit)?);
+    let mut budget = budget_of(timeout, memory_limit)?;
+    if let Some(token) = cancellation {
+        budget = budget.cancellation((*token).clone());
+    }
+    let mut options = ComputeOptions::new().budget(budget);
     if let Some(name) = backend {
         options = options.backend(backend_of(name)?);
     }
@@ -507,16 +704,18 @@ fn coefficient_of(value: &Bound<'_, PyAny>) -> PyResult<Coefficient> {
     ))
 }
 
-fn exponents_of(exponents: &[i64]) -> PyResult<Vec<u16>> {
+fn exponents_of(exponents: &[BigInt]) -> PyResult<Vec<u16>> {
     exponents
         .iter()
-        .map(|&exponent| {
-            if !(0..=MAX_EXPONENT).contains(&exponent) {
+        .map(|exponent| {
+            let Some(exponent) = exponent.to_u64() else {
                 return Err(PyValueError::new_err(format!(
                     "an exponent is between 0 and {MAX_EXPONENT}"
                 )));
-            }
-            Ok(exponent as u16)
+            };
+            u16::try_from(exponent).map_err(|_| {
+                PyValueError::new_err(format!("an exponent is between 0 and {MAX_EXPONENT}"))
+            })
         })
         .collect()
 }
@@ -532,6 +731,272 @@ enum AnyRing {
 enum AnyPolynomial {
     Prime(Polynomial<PrimeField>),
     Rational(Polynomial<Rationals>),
+}
+
+fn ring_of(polynomial: &AnyPolynomial) -> AnyRing {
+    match polynomial {
+        AnyPolynomial::Prime(value) => AnyRing::Prime(value.ring().clone()),
+        AnyPolynomial::Rational(value) => AnyRing::Rational(value.ring().clone()),
+    }
+}
+
+fn polynomial_from_terms(
+    template: &AnyPolynomial,
+    terms: Vec<(Coefficient, Vec<u16>)>,
+) -> Result<AnyPolynomial, RingError> {
+    match template {
+        AnyPolynomial::Prime(value) => Ok(AnyPolynomial::Prime(value.ring().polynomial(terms)?)),
+        AnyPolynomial::Rational(value) => {
+            Ok(AnyPolynomial::Rational(value.ring().polynomial(terms)?))
+        }
+    }
+}
+
+type OperationBudget = Budget;
+
+fn operation_error(py: Python<'_>, error: ArithmeticError) -> PyErr {
+    match error {
+        ArithmeticError::RingMismatch => foreign_argument(py),
+        ArithmeticError::CoefficientConversion(error) => of_ring(py, error),
+        ArithmeticError::ExponentLimit { limit } => raise_with(
+            py,
+            &exceptions(py).limit_exceeded,
+            error.to_string(),
+            |value| value.setattr("limit", limit),
+        ),
+        ArithmeticError::Timeout => raise(py, &exceptions(py).timeout, error.to_string()),
+        ArithmeticError::MemoryLimitExceeded => {
+            raise(py, &exceptions(py).memory_limit, error.to_string())
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum BinaryOperation {
+    Add,
+    Subtract,
+    Multiply,
+    ReverseSubtract,
+}
+
+#[derive(Clone, Copy)]
+enum UnsupportedOperand {
+    ReturnNotImplemented,
+    RaiseTypeError,
+}
+
+fn apply_binary(
+    left: &AnyPolynomial,
+    right: &AnyPolynomial,
+    operation: BinaryOperation,
+    budget: OperationBudget,
+) -> Result<AnyPolynomial, ArithmeticError> {
+    match operation {
+        BinaryOperation::Add => add_polynomials(left, right, budget),
+        BinaryOperation::Subtract => subtract_polynomials(left, right, budget),
+        BinaryOperation::Multiply => multiply_polynomials(left, right, budget),
+        BinaryOperation::ReverseSubtract => subtract_polynomials(right, left, budget),
+    }
+}
+
+fn binary_operation(
+    py: Python<'_>,
+    left: &AnyPolynomial,
+    other: &Bound<'_, PyAny>,
+    operation: BinaryOperation,
+    unsupported: UnsupportedOperand,
+    timeout: Option<f64>,
+    memory_limit: Option<usize>,
+) -> PyResult<Py<PyAny>> {
+    let right = match other.downcast::<PyPolynomial>() {
+        Ok(value) => value.get().inner.clone(),
+        Err(_) => {
+            let Some(scalar) = scalar_from(other)? else {
+                return match unsupported {
+                    UnsupportedOperand::ReturnNotImplemented => Ok(py.NotImplemented()),
+                    UnsupportedOperand::RaiseTypeError => Err(PyTypeError::new_err(
+                        "the operand is not a polynomial or an integer, Fraction, or (numerator, denominator) scalar",
+                    )),
+                };
+            };
+            scalar_polynomial(left, &scalar).map_err(|error| of_ring(py, error))?
+        }
+    };
+    if ring_of(left) != ring_of(&right) {
+        return Err(foreign_argument(py));
+    }
+    let result = run_budgeted(py, timeout, memory_limit, |budget| {
+        apply_binary(left, &right, operation, budget)
+    })?
+    .map_err(|error| operation_error(py, error))?;
+    polynomial_result(py, result)
+}
+
+fn power_result(
+    py: Python<'_>,
+    value: &AnyPolynomial,
+    exponent: u64,
+    timeout: Option<f64>,
+    memory_limit: Option<usize>,
+) -> PyResult<Py<PyAny>> {
+    let result = run_budgeted(py, timeout, memory_limit, |budget| {
+        power_polynomial(value, exponent, budget)
+    })?
+    .map_err(|error| operation_error(py, error))?;
+    polynomial_result(py, result)
+}
+
+fn negated_polynomial(
+    value: &AnyPolynomial,
+    budget: OperationBudget,
+) -> Result<AnyPolynomial, ArithmeticError> {
+    match value {
+        AnyPolynomial::Prime(value) => Ok(AnyPolynomial::Prime(value.try_neg(budget)?)),
+        AnyPolynomial::Rational(value) => Ok(AnyPolynomial::Rational(value.try_neg(budget)?)),
+    }
+}
+
+fn negation_result(
+    py: Python<'_>,
+    value: &AnyPolynomial,
+    timeout: Option<f64>,
+    memory_limit: Option<usize>,
+) -> PyResult<Py<PyAny>> {
+    let result = run_budgeted(py, timeout, memory_limit, |budget| {
+        negated_polynomial(value, budget)
+    })?
+    .map_err(|error| operation_error(py, error))?;
+    polynomial_result(py, result)
+}
+
+fn power_polynomial(
+    value: &AnyPolynomial,
+    exponent: u64,
+    budget: OperationBudget,
+) -> Result<AnyPolynomial, ArithmeticError> {
+    let exponent = u32::try_from(exponent).map_err(|_| ArithmeticError::ExponentLimit {
+        limit: u16::MAX as u32,
+    })?;
+    match value {
+        AnyPolynomial::Prime(value) => Ok(AnyPolynomial::Prime(value.try_pow(exponent, budget)?)),
+        AnyPolynomial::Rational(value) => {
+            Ok(AnyPolynomial::Rational(value.try_pow(exponent, budget)?))
+        }
+    }
+}
+
+fn nonnegative_exponent_from(value: &Bound<'_, PyAny>) -> PyResult<BigInt> {
+    let exponent = value
+        .extract::<BigInt>()
+        .map_err(|_| PyValueError::new_err("the polynomial exponent is a nonnegative integer"))?;
+    if exponent.sign() == Sign::Minus {
+        return Err(PyValueError::new_err(
+            "the polynomial exponent is a nonnegative integer",
+        ));
+    }
+    Ok(exponent)
+}
+
+fn polynomial_exponent_from(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<u64> {
+    let exponent = nonnegative_exponent_from(value)?;
+    exponent.try_into().map_err(|_| {
+        raise_with(
+            py,
+            &exceptions(py).limit_exceeded,
+            "the polynomial exponent is above 65535".to_string(),
+            |error| error.setattr("limit", MAX_EXPONENT),
+        )
+    })
+}
+
+fn quotient_exponent_from(value: &Bound<'_, PyAny>) -> PyResult<usize> {
+    let exponent = nonnegative_exponent_from(value)?;
+    usize::try_from(exponent).map_err(|_| {
+        PyValueError::new_err("the quotient exponent is a nonnegative integer that fits usize")
+    })
+}
+
+fn index_from(value: &Bound<'_, PyAny>) -> PyResult<Option<usize>> {
+    let index = value
+        .extract::<BigInt>()
+        .map_err(|_| PyTypeError::new_err("an index is an integer"))?;
+    if index.sign() == Sign::Minus {
+        return Ok(None);
+    }
+    Ok(usize::try_from(index).ok())
+}
+
+fn add_polynomials(
+    left: &AnyPolynomial,
+    right: &AnyPolynomial,
+    budget: OperationBudget,
+) -> Result<AnyPolynomial, ArithmeticError> {
+    match (left, right) {
+        (AnyPolynomial::Prime(left), AnyPolynomial::Prime(right)) => {
+            Ok(AnyPolynomial::Prime(left.try_add(right, budget)?))
+        }
+        (AnyPolynomial::Rational(left), AnyPolynomial::Rational(right)) => {
+            Ok(AnyPolynomial::Rational(left.try_add(right, budget)?))
+        }
+        _ => Err(ArithmeticError::RingMismatch),
+    }
+}
+
+fn subtract_polynomials(
+    left: &AnyPolynomial,
+    right: &AnyPolynomial,
+    budget: OperationBudget,
+) -> Result<AnyPolynomial, ArithmeticError> {
+    match (left, right) {
+        (AnyPolynomial::Prime(left), AnyPolynomial::Prime(right)) => {
+            Ok(AnyPolynomial::Prime(left.try_sub(right, budget)?))
+        }
+        (AnyPolynomial::Rational(left), AnyPolynomial::Rational(right)) => {
+            Ok(AnyPolynomial::Rational(left.try_sub(right, budget)?))
+        }
+        _ => Err(ArithmeticError::RingMismatch),
+    }
+}
+
+fn multiply_polynomials(
+    left: &AnyPolynomial,
+    right: &AnyPolynomial,
+    budget: OperationBudget,
+) -> Result<AnyPolynomial, ArithmeticError> {
+    match (left, right) {
+        (AnyPolynomial::Prime(left), AnyPolynomial::Prime(right)) => {
+            Ok(AnyPolynomial::Prime(left.try_mul(right, budget)?))
+        }
+        (AnyPolynomial::Rational(left), AnyPolynomial::Rational(right)) => {
+            Ok(AnyPolynomial::Rational(left.try_mul(right, budget)?))
+        }
+        _ => Err(ArithmeticError::RingMismatch),
+    }
+}
+
+fn scalar_polynomial(
+    template: &AnyPolynomial,
+    scalar: &Coefficient,
+) -> Result<AnyPolynomial, RingError> {
+    let nvars = match template {
+        AnyPolynomial::Prime(value) => value.ring().nvars(),
+        AnyPolynomial::Rational(value) => value.ring().nvars(),
+    };
+    polynomial_from_terms(template, vec![(scalar.clone(), vec![0; nvars])])
+}
+
+fn scalar_from(value: &Bound<'_, PyAny>) -> PyResult<Option<Coefficient>> {
+    if value.extract::<BigInt>().is_ok()
+        || value.extract::<BigRational>().is_ok()
+        || value.extract::<(BigInt, BigInt)>().is_ok()
+    {
+        return Ok(Some(coefficient_of(value)?));
+    }
+    Ok(None)
+}
+
+fn polynomial_result(py: Python<'_>, inner: AnyPolynomial) -> PyResult<Py<PyAny>> {
+    Ok(Py::new(py, PyPolynomial { inner })?.into_any())
 }
 
 #[derive(Clone, Debug)]
@@ -560,6 +1025,78 @@ impl AnyBasis {
             AnyBasis::Rational(basis) => AnyPolynomial::Rational(basis[index].clone()),
         }
     }
+}
+
+#[derive(Clone, Debug)]
+enum AnyQuotient {
+    Prime(FiniteQuotient<PrimeField>),
+    Rational(FiniteQuotient<Rationals>),
+}
+
+#[derive(Clone, Debug)]
+enum AnyMatrix {
+    Prime(MultiplicationMatrix<PrimeField>),
+    Rational(MultiplicationMatrix<Rationals>),
+}
+
+#[derive(Clone, Debug)]
+enum AnyUnivariate {
+    Prime(UnivariatePolynomial<PrimeField>),
+    Rational(UnivariatePolynomial<Rationals>),
+}
+
+fn ring_of_quotient(quotient: &AnyQuotient) -> AnyRing {
+    match quotient {
+        AnyQuotient::Prime(value) => AnyRing::Prime(value.ring().clone()),
+        AnyQuotient::Rational(value) => AnyRing::Rational(value.ring().clone()),
+    }
+}
+
+fn basis_of_quotient(quotient: &AnyQuotient) -> AnyBasis {
+    match quotient {
+        AnyQuotient::Prime(value) => AnyBasis::Prime(value.source_basis().clone()),
+        AnyQuotient::Rational(value) => AnyBasis::Rational(value.source_basis().clone()),
+    }
+}
+
+fn ring_of_matrix(matrix: &AnyMatrix) -> AnyRing {
+    match matrix {
+        AnyMatrix::Prime(value) => AnyRing::Prime(value.ring().clone()),
+        AnyMatrix::Rational(value) => AnyRing::Rational(value.ring().clone()),
+    }
+}
+
+fn ring_of_univariate(polynomial: &AnyUnivariate) -> AnyRing {
+    match polynomial {
+        AnyUnivariate::Prime(value) => AnyRing::Prime(value.ring().clone()),
+        AnyUnivariate::Rational(value) => AnyRing::Rational(value.ring().clone()),
+    }
+}
+
+fn prime_coefficient_object<'py>(
+    py: Python<'py>,
+    coefficient: &sylvester::Felt,
+) -> PyResult<Py<PyAny>> {
+    let list = PyList::new(py, [coefficient.value()])?;
+    Ok(list.get_item(0)?.unbind())
+}
+
+fn rational_coefficient_object<'py>(
+    py: Python<'py>,
+    coefficient: &BigRational,
+) -> PyResult<Py<PyAny>> {
+    let list = PyList::new(py, [coefficient])?;
+    Ok(list.get_item(0)?.unbind())
+}
+
+fn prime_zero() -> &'static sylvester::Felt {
+    static ZERO: std::sync::OnceLock<sylvester::Felt> = std::sync::OnceLock::new();
+    ZERO.get_or_init(sylvester::Felt::default)
+}
+
+fn rational_zero() -> &'static BigRational {
+    static ZERO: std::sync::OnceLock<BigRational> = std::sync::OnceLock::new();
+    ZERO.get_or_init(BigRational::zero)
 }
 
 fn hash_of(polynomial: &AnyPolynomial) -> isize {
@@ -646,6 +1183,53 @@ impl PyRing {
         }
     }
 
+    /// The degree-one variable polynomials, in ring order.
+    #[getter]
+    fn gens(&self) -> Vec<PyPolynomial> {
+        match &self.inner {
+            AnyRing::Prime(ring) => ring
+                .generators()
+                .into_iter()
+                .map(|value| PyPolynomial {
+                    inner: AnyPolynomial::Prime(value),
+                })
+                .collect(),
+            AnyRing::Rational(ring) => ring
+                .generators()
+                .into_iter()
+                .map(|value| PyPolynomial {
+                    inner: AnyPolynomial::Rational(value),
+                })
+                .collect(),
+        }
+    }
+
+    /// The zero polynomial of this ring.
+    #[getter]
+    fn zero(&self) -> PyPolynomial {
+        match &self.inner {
+            AnyRing::Prime(ring) => PyPolynomial {
+                inner: AnyPolynomial::Prime(ring.zero()),
+            },
+            AnyRing::Rational(ring) => PyPolynomial {
+                inner: AnyPolynomial::Rational(ring.zero()),
+            },
+        }
+    }
+
+    /// The constant one polynomial of this ring.
+    #[getter]
+    fn one(&self) -> PyPolynomial {
+        match &self.inner {
+            AnyRing::Prime(ring) => PyPolynomial {
+                inner: AnyPolynomial::Prime(ring.one()),
+            },
+            AnyRing::Rational(ring) => PyPolynomial {
+                inner: AnyPolynomial::Rational(ring.one()),
+            },
+        }
+    }
+
     /// Read a polynomial from text.
     ///
     /// The syntax is the one `str(polynomial)` writes: terms separated by
@@ -653,15 +1237,29 @@ impl PyRing {
     /// `x^2*y - 3*z + 1`. Over `Q` a coefficient may name a fraction
     /// (`1/2*x`). Raises ParseError on text the ring cannot read, and
     /// RingError on a coefficient the domain has no value for.
-    #[pyo3(text_signature = "($self, text)")]
-    fn parse(&self, py: Python<'_>, text: &str) -> PyResult<PyPolynomial> {
+    #[pyo3(signature = (text, *, timeout=None, memory_limit=None))]
+    #[pyo3(text_signature = "($self, text, *, timeout=None, memory_limit=None)")]
+    fn parse(
+        &self,
+        py: Python<'_>,
+        text: &str,
+        timeout: Option<f64>,
+        memory_limit: Option<usize>,
+    ) -> PyResult<PyPolynomial> {
+        let text = text.to_owned();
         let inner = match &self.inner {
-            AnyRing::Prime(ring) => {
-                AnyPolynomial::Prime(ring.parse_polynomial(text).map_err(|e| of_ring(py, e))?)
-            }
-            AnyRing::Rational(ring) => {
-                AnyPolynomial::Rational(ring.parse_polynomial(text).map_err(|e| of_ring(py, e))?)
-            }
+            AnyRing::Prime(ring) => AnyPolynomial::Prime(
+                run_budgeted(py, timeout, memory_limit, |budget| {
+                    ring.parse_polynomial_with_budget(&text, budget)
+                })?
+                .map_err(|e| of_expression(py, e))?,
+            ),
+            AnyRing::Rational(ring) => AnyPolynomial::Rational(
+                run_budgeted(py, timeout, memory_limit, |budget| {
+                    ring.parse_polynomial_with_budget(&text, budget)
+                })?
+                .map_err(|e| of_expression(py, e))?,
+            ),
         };
         Ok(PyPolynomial { inner })
     }
@@ -671,12 +1269,14 @@ impl PyRing {
     /// A coefficient is an int, a `fractions.Fraction`, or a
     /// `(numerator, denominator)` pair. Exponents hold one entry per
     /// variable, each between 0 and 65535. Repeated monomials add up and a
-    /// term that reduces to zero drops out.
+    /// term that reduces to zero drops out. A negative or larger Python
+    /// integer raises ValueError, including one too large for a machine
+    /// integer.
     #[pyo3(text_signature = "($self, terms)")]
     fn polynomial(
         &self,
         py: Python<'_>,
-        terms: Vec<(Py<PyAny>, Vec<i64>)>,
+        terms: Vec<(Py<PyAny>, Vec<BigInt>)>,
     ) -> PyResult<PyPolynomial> {
         let mut read: Vec<(Coefficient, Vec<u16>)> = Vec::with_capacity(terms.len());
         for (coefficient, exponents) in &terms {
@@ -841,6 +1441,192 @@ impl PyPolynomial {
     fn __hash__(&self) -> isize {
         hash_of(&self.inner)
     }
+
+    /// Add another polynomial or a scalar.
+    fn __add__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        binary_operation(
+            py,
+            &self.inner,
+            other,
+            BinaryOperation::Add,
+            UnsupportedOperand::ReturnNotImplemented,
+            None,
+            None,
+        )
+    }
+
+    /// Add another polynomial or a scalar from the right.
+    fn __radd__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        binary_operation(
+            py,
+            &self.inner,
+            other,
+            BinaryOperation::Add,
+            UnsupportedOperand::ReturnNotImplemented,
+            None,
+            None,
+        )
+    }
+
+    /// Subtract another polynomial or a scalar.
+    fn __sub__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        binary_operation(
+            py,
+            &self.inner,
+            other,
+            BinaryOperation::Subtract,
+            UnsupportedOperand::ReturnNotImplemented,
+            None,
+            None,
+        )
+    }
+
+    /// Subtract a polynomial from a scalar or another polynomial.
+    fn __rsub__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        binary_operation(
+            py,
+            &self.inner,
+            other,
+            BinaryOperation::ReverseSubtract,
+            UnsupportedOperand::ReturnNotImplemented,
+            None,
+            None,
+        )
+    }
+
+    /// Multiply by another polynomial or a scalar.
+    fn __mul__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        binary_operation(
+            py,
+            &self.inner,
+            other,
+            BinaryOperation::Multiply,
+            UnsupportedOperand::ReturnNotImplemented,
+            None,
+            None,
+        )
+    }
+
+    /// Multiply a polynomial by this value from the right.
+    fn __rmul__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        binary_operation(
+            py,
+            &self.inner,
+            other,
+            BinaryOperation::Multiply,
+            UnsupportedOperand::ReturnNotImplemented,
+            None,
+            None,
+        )
+    }
+
+    /// Negate the polynomial.
+    fn __neg__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        negation_result(py, &self.inner, None, None)
+    }
+
+    /// Raise the polynomial to a nonnegative integer power.
+    fn __pow__(
+        &self,
+        py: Python<'_>,
+        exponent: &Bound<'_, PyAny>,
+        modulo: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Py<PyAny>> {
+        if modulo.is_some() {
+            return Ok(py.NotImplemented());
+        }
+        let exponent = polynomial_exponent_from(py, exponent)?;
+        power_result(py, &self.inner, exponent, None, None)
+    }
+
+    /// Negate the polynomial under an optional budget.
+    #[pyo3(signature = (*, timeout=None, memory_limit=None))]
+    #[pyo3(text_signature = "($self, *, timeout=None, memory_limit=None)")]
+    fn neg(
+        &self,
+        py: Python<'_>,
+        timeout: Option<f64>,
+        memory_limit: Option<usize>,
+    ) -> PyResult<Py<PyAny>> {
+        negation_result(py, &self.inner, timeout, memory_limit)
+    }
+
+    /// Add another polynomial or scalar under an optional budget.
+    #[pyo3(signature = (other, *, timeout=None, memory_limit=None))]
+    #[pyo3(text_signature = "($self, other, *, timeout=None, memory_limit=None)")]
+    fn add(
+        &self,
+        py: Python<'_>,
+        other: &Bound<'_, PyAny>,
+        timeout: Option<f64>,
+        memory_limit: Option<usize>,
+    ) -> PyResult<Py<PyAny>> {
+        binary_operation(
+            py,
+            &self.inner,
+            other,
+            BinaryOperation::Add,
+            UnsupportedOperand::RaiseTypeError,
+            timeout,
+            memory_limit,
+        )
+    }
+
+    /// Subtract another polynomial or scalar under an optional budget.
+    #[pyo3(signature = (other, *, timeout=None, memory_limit=None))]
+    #[pyo3(text_signature = "($self, other, *, timeout=None, memory_limit=None)")]
+    fn sub(
+        &self,
+        py: Python<'_>,
+        other: &Bound<'_, PyAny>,
+        timeout: Option<f64>,
+        memory_limit: Option<usize>,
+    ) -> PyResult<Py<PyAny>> {
+        binary_operation(
+            py,
+            &self.inner,
+            other,
+            BinaryOperation::Subtract,
+            UnsupportedOperand::RaiseTypeError,
+            timeout,
+            memory_limit,
+        )
+    }
+
+    /// Multiply by another polynomial or scalar under an optional budget.
+    #[pyo3(signature = (other, *, timeout=None, memory_limit=None))]
+    #[pyo3(text_signature = "($self, other, *, timeout=None, memory_limit=None)")]
+    fn mul(
+        &self,
+        py: Python<'_>,
+        other: &Bound<'_, PyAny>,
+        timeout: Option<f64>,
+        memory_limit: Option<usize>,
+    ) -> PyResult<Py<PyAny>> {
+        binary_operation(
+            py,
+            &self.inner,
+            other,
+            BinaryOperation::Multiply,
+            UnsupportedOperand::RaiseTypeError,
+            timeout,
+            memory_limit,
+        )
+    }
+
+    /// Raise the polynomial to a nonnegative integer power under a budget.
+    #[pyo3(signature = (exponent, *, timeout=None, memory_limit=None))]
+    #[pyo3(text_signature = "($self, exponent, *, timeout=None, memory_limit=None)")]
+    fn pow(
+        &self,
+        py: Python<'_>,
+        exponent: &Bound<'_, PyAny>,
+        timeout: Option<f64>,
+        memory_limit: Option<usize>,
+    ) -> PyResult<Py<PyAny>> {
+        let exponent = polynomial_exponent_from(py, exponent)?;
+        power_result(py, &self.inner, exponent, timeout, memory_limit)
+    }
 }
 
 /// The ideal a list of polynomials generates.
@@ -905,8 +1691,9 @@ impl PyIdeal {
     /// `memory_limit` is bytes. `threads` is the thread count of the run,
     /// and over `Q` it is the number of prime runs the driver starts at
     /// once. `stop` (`"unchanged"` or `"contains_input"`) and
-    /// `extra_primes` describe the multimodular engine, so passing either
-    /// on a prime-field ideal raises ValueError.
+    /// `stop` defaults to `"contains_input"` over `Q`. `extra_primes`
+    /// describes the multimodular engine, so passing either rational-only
+    /// keyword on a prime-field ideal raises ValueError.
     ///
     /// The result carries no proof. Over `F_p` use
     /// `groebner_basis_certified` for a basis an independent verifier
@@ -917,6 +1704,9 @@ impl PyIdeal {
     #[pyo3(
         text_signature = "($self, *, backend=None, timeout=None, memory_limit=None, threads=None, stop=None, extra_primes=None)"
     )]
+    // Each argument is a public Python keyword. A Rust options value would
+    // replace that Python call shape rather than shorten it.
+    #[allow(clippy::too_many_arguments)]
     fn groebner_basis(
         slf: &Bound<'_, Self>,
         backend: Option<&str>,
@@ -929,35 +1719,41 @@ impl PyIdeal {
         let py = slf.py();
         let inner = match &slf.get().inner {
             AnyIdeal::Prime(ideal) => {
-                let options =
-                    compute_options(backend, timeout, memory_limit, threads, stop, extra_primes)?;
-                let ideal = ideal.clone();
-                AnyBasis::Prime(
-                    py.allow_threads(|| ideal.groebner_basis(options))
-                        .map_err(|e| of_compute(py, e))?,
-                )
+                let cancellation = CancellationToken::new();
+                let options = compute_options(
+                    backend,
+                    timeout,
+                    memory_limit,
+                    threads,
+                    stop,
+                    extra_primes,
+                    Some(&cancellation),
+                )?;
+                compute_prime_basis(py, ideal, options, cancellation)?
             }
             AnyIdeal::Rational(ideal) => {
-                let options =
-                    rational_options(backend, timeout, memory_limit, threads, stop, extra_primes)?;
-                let ideal = ideal.clone();
-                AnyBasis::Rational(
-                    py.allow_threads(|| ideal.groebner_basis(options))
-                        .map_err(|e| of_compute(py, e))?,
-                )
+                let cancellation = CancellationToken::new();
+                let options = rational_options(
+                    backend,
+                    timeout,
+                    memory_limit,
+                    threads,
+                    stop,
+                    extra_primes,
+                    Some(&cancellation),
+                )?;
+                compute_rational_basis(py, ideal, options, cancellation)?
             }
         };
         Ok(PyBasis { inner })
     }
 
-    /// The reduced Gröbner basis and a report of the run.
-    ///
-    /// The basis is the one `groebner_basis` returns for the same
-    /// keywords, and it carries no proof either.
+    /// The reduced Gröbner basis and the report of the engine run.
     #[pyo3(signature = (*, backend=None, timeout=None, memory_limit=None, threads=None, stop=None, extra_primes=None))]
     #[pyo3(
         text_signature = "($self, *, backend=None, timeout=None, memory_limit=None, threads=None, stop=None, extra_primes=None)"
     )]
+    #[allow(clippy::too_many_arguments)]
     fn groebner_basis_with_report(
         slf: &Bound<'_, Self>,
         backend: Option<&str>,
@@ -970,25 +1766,33 @@ impl PyIdeal {
         let py = slf.py();
         let (inner, report) = match &slf.get().inner {
             AnyIdeal::Prime(ideal) => {
-                let options =
-                    compute_options(backend, timeout, memory_limit, threads, stop, extra_primes)?;
-                let ideal = ideal.clone();
-                let (basis, report) = py
-                    .allow_threads(|| ideal.groebner_basis_with_report(options))
-                    .map_err(|e| of_compute(py, e))?;
-                (AnyBasis::Prime(basis), report)
+                let cancellation = CancellationToken::new();
+                let options = compute_options(
+                    backend,
+                    timeout,
+                    memory_limit,
+                    threads,
+                    stop,
+                    extra_primes,
+                    Some(&cancellation),
+                )?;
+                compute_prime_basis_with_report(py, ideal, options, cancellation)?
             }
             AnyIdeal::Rational(ideal) => {
-                let options =
-                    rational_options(backend, timeout, memory_limit, threads, stop, extra_primes)?;
-                let ideal = ideal.clone();
-                let (basis, report) = py
-                    .allow_threads(|| ideal.groebner_basis_with_report(options))
-                    .map_err(|e| of_compute(py, e))?;
-                (AnyBasis::Rational(basis), report)
+                let cancellation = CancellationToken::new();
+                let options = rational_options(
+                    backend,
+                    timeout,
+                    memory_limit,
+                    threads,
+                    stop,
+                    extra_primes,
+                    Some(&cancellation),
+                )?;
+                compute_rational_basis_with_report(py, ideal, options, cancellation)?
             }
         };
-        Ok((PyBasis { inner }, PyComputeReport { inner: report }))
+        Ok((PyBasis { inner }, report))
     }
 
     /// The reduced Gröbner basis and the certificate an independent
@@ -1015,11 +1819,22 @@ impl PyIdeal {
         let py = slf.py();
         match &slf.get().inner {
             AnyIdeal::Prime(ideal) => {
-                let options = compute_options(backend, timeout, memory_limit, threads, None, None)?;
-                let ideal = ideal.clone();
-                let certified = py
-                    .allow_threads(|| ideal.groebner_basis_certified(options))
-                    .map_err(|e| of_certify(py, e))?;
+                let cancellation = CancellationToken::new();
+                let options = compute_options(
+                    backend,
+                    timeout,
+                    memory_limit,
+                    threads,
+                    None,
+                    None,
+                    Some(&cancellation),
+                )?;
+                let certified = run_with_signals(
+                    py,
+                    || cancellation.cancel(),
+                    move || ideal.groebner_basis_certified(options),
+                )?
+                .map_err(|e| of_certify(py, e))?;
                 Ok(PyCertified { inner: certified })
             }
             AnyIdeal::Rational(_) => Err(PyValueError::new_err(
@@ -1027,6 +1842,36 @@ impl PyIdeal {
                     .to_string(),
             )),
         }
+    }
+
+    /// Check exact equality between a rational input ideal and a candidate.
+    ///
+    /// The check validates the candidate, proves both ideal inclusions with
+    /// tracked rational cofactors, and retains the source data. It is a
+    /// library check, not an independent certificate.
+    #[pyo3(signature = (basis, *, timeout=None, memory_limit=None))]
+    #[pyo3(text_signature = "($self, basis, *, timeout=None, memory_limit=None)")]
+    fn check_basis_equality(
+        &self,
+        py: Python<'_>,
+        basis: &PyBasis,
+        timeout: Option<f64>,
+        memory_limit: Option<usize>,
+    ) -> PyResult<PyRationalEqualityCheck> {
+        let (ideal, basis) = match (&self.inner, &basis.inner) {
+            (AnyIdeal::Rational(ideal), AnyBasis::Rational(basis)) => (ideal, basis),
+            (AnyIdeal::Rational(_), _) => return Err(foreign_argument(py)),
+            (AnyIdeal::Prime(_), _) => {
+                return Err(PyValueError::new_err(
+                    "exact ideal equality checks are available over the rational numbers only",
+                ));
+            }
+        };
+        let checked = run_budgeted(py, timeout, memory_limit, move |budget| {
+            ideal.check_basis_equality(basis, budget)
+        })?
+        .map_err(|error| of_equality(py, error))?;
+        Ok(PyRationalEqualityCheck { inner: checked })
     }
 
     fn __repr__(&self) -> String {
@@ -1038,6 +1883,66 @@ impl PyIdeal {
     }
 }
 
+fn compute_prime_basis(
+    py: Python<'_>,
+    ideal: &Ideal<PrimeField>,
+    options: ComputeOptions,
+    cancellation: CancellationToken,
+) -> PyResult<AnyBasis> {
+    let basis = run_with_signals(
+        py,
+        || cancellation.cancel(),
+        move || ideal.groebner_basis(options),
+    )?
+    .map_err(|error| of_compute(py, error))?;
+    Ok(AnyBasis::Prime(basis))
+}
+
+fn compute_rational_basis(
+    py: Python<'_>,
+    ideal: &Ideal<Rationals>,
+    options: RationalOptions,
+    cancellation: CancellationToken,
+) -> PyResult<AnyBasis> {
+    let basis = run_with_signals(
+        py,
+        || cancellation.cancel(),
+        move || ideal.groebner_basis(options),
+    )?
+    .map_err(|error| of_compute(py, error))?;
+    Ok(AnyBasis::Rational(basis))
+}
+
+fn compute_prime_basis_with_report(
+    py: Python<'_>,
+    ideal: &Ideal<PrimeField>,
+    options: ComputeOptions,
+    cancellation: CancellationToken,
+) -> PyResult<(AnyBasis, PyComputeReport)> {
+    let (basis, report) = run_with_signals(
+        py,
+        || cancellation.cancel(),
+        move || ideal.groebner_basis_with_report(options),
+    )?
+    .map_err(|error| of_compute(py, error))?;
+    Ok((AnyBasis::Prime(basis), PyComputeReport { inner: report }))
+}
+
+fn compute_rational_basis_with_report(
+    py: Python<'_>,
+    ideal: &Ideal<Rationals>,
+    options: RationalOptions,
+    cancellation: CancellationToken,
+) -> PyResult<(AnyBasis, PyComputeReport)> {
+    let (basis, report) = run_with_signals(
+        py,
+        || cancellation.cancel(),
+        move || ideal.groebner_basis_with_report(options),
+    )?
+    .map_err(|error| of_compute(py, error))?;
+    Ok((AnyBasis::Rational(basis), PyComputeReport { inner: report }))
+}
+
 /// A reduced Gröbner basis under grevlex.
 ///
 /// The value is a sequence: `len`, indexing with negative indices and
@@ -1047,42 +1952,6 @@ impl PyIdeal {
 #[pyclass(frozen, name = "GroebnerBasis", module = "sylvester")]
 struct PyBasis {
     inner: AnyBasis,
-}
-
-fn checked_prime_basis(
-    py: Python<'_>,
-    ring: &PolynomialRing<PrimeField>,
-    polynomials: &[Py<PyPolynomial>],
-    budget: Budget,
-) -> PyResult<GroebnerBasis<PrimeField>> {
-    let mut collected = Vec::with_capacity(polynomials.len());
-    for (index, polynomial) in polynomials.iter().enumerate() {
-        match &polynomial.get().inner {
-            AnyPolynomial::Prime(value) => collected.push(value.clone()),
-            AnyPolynomial::Rational(_) => return Err(foreign_polynomial(py, index)),
-        }
-    }
-    let ring = ring.clone();
-    py.allow_threads(|| GroebnerBasis::<PrimeField>::from_polynomials(&ring, collected, budget))
-        .map_err(|error| of_basis(py, error))
-}
-
-fn checked_rational_basis(
-    py: Python<'_>,
-    ring: &PolynomialRing<Rationals>,
-    polynomials: &[Py<PyPolynomial>],
-    budget: Budget,
-) -> PyResult<GroebnerBasis<Rationals>> {
-    let mut collected = Vec::with_capacity(polynomials.len());
-    for (index, polynomial) in polynomials.iter().enumerate() {
-        match &polynomial.get().inner {
-            AnyPolynomial::Rational(value) => collected.push(value.clone()),
-            AnyPolynomial::Prime(_) => return Err(foreign_polynomial(py, index)),
-        }
-    }
-    let ring = ring.clone();
-    py.allow_threads(|| GroebnerBasis::<Rationals>::from_polynomials(&ring, collected, budget))
-        .map_err(|error| of_basis(py, error))
 }
 
 #[pymethods]
@@ -1106,13 +1975,36 @@ impl PyBasis {
         timeout: Option<f64>,
         memory_limit: Option<usize>,
     ) -> PyResult<PyBasis> {
-        let budget = budget_of(timeout, memory_limit)?;
         let inner = match &ring.inner {
             AnyRing::Prime(ring) => {
-                AnyBasis::Prime(checked_prime_basis(py, ring, &polynomials, budget)?)
+                let mut collected = Vec::with_capacity(polynomials.len());
+                for (index, polynomial) in polynomials.iter().enumerate() {
+                    match &polynomial.get().inner {
+                        AnyPolynomial::Prime(f) => collected.push(f.clone()),
+                        AnyPolynomial::Rational(_) => return Err(foreign_polynomial(py, index)),
+                    }
+                }
+                AnyBasis::Prime(
+                    run_budgeted(py, timeout, memory_limit, move |budget| {
+                        GroebnerBasis::<PrimeField>::from_polynomials(ring, collected, budget)
+                    })?
+                    .map_err(|e| of_basis(py, e))?,
+                )
             }
             AnyRing::Rational(ring) => {
-                AnyBasis::Rational(checked_rational_basis(py, ring, &polynomials, budget)?)
+                let mut collected = Vec::with_capacity(polynomials.len());
+                for (index, polynomial) in polynomials.iter().enumerate() {
+                    match &polynomial.get().inner {
+                        AnyPolynomial::Rational(f) => collected.push(f.clone()),
+                        AnyPolynomial::Prime(_) => return Err(foreign_polynomial(py, index)),
+                    }
+                }
+                AnyBasis::Rational(
+                    run_budgeted(py, timeout, memory_limit, move |budget| {
+                        GroebnerBasis::<Rationals>::from_polynomials(ring, collected, budget)
+                    })?
+                    .map_err(|e| of_basis(py, e))?,
+                )
             }
         };
         Ok(PyBasis { inner })
@@ -1144,25 +2036,122 @@ impl PyBasis {
         timeout: Option<f64>,
         memory_limit: Option<usize>,
     ) -> PyResult<PyPolynomial> {
-        let budget = budget_of(timeout, memory_limit)?;
         let inner = match (&self.inner, &f.inner) {
-            (AnyBasis::Prime(basis), AnyPolynomial::Prime(f)) => {
-                let (basis, f) = (basis.clone(), f.clone());
-                AnyPolynomial::Prime(
-                    py.allow_threads(|| basis.normal_form(&f, budget))
-                        .map_err(|e| of_normal_form(py, e))?,
-                )
-            }
-            (AnyBasis::Rational(basis), AnyPolynomial::Rational(f)) => {
-                let (basis, f) = (basis.clone(), f.clone());
-                AnyPolynomial::Rational(
-                    py.allow_threads(|| basis.normal_form(&f, budget))
-                        .map_err(|e| of_normal_form(py, e))?,
-                )
-            }
+            (AnyBasis::Prime(basis), AnyPolynomial::Prime(f)) => AnyPolynomial::Prime(
+                run_budgeted(py, timeout, memory_limit, move |budget| {
+                    basis.normal_form(f, budget)
+                })?
+                .map_err(|e| of_normal_form(py, e))?,
+            ),
+            (AnyBasis::Rational(basis), AnyPolynomial::Rational(f)) => AnyPolynomial::Rational(
+                run_budgeted(py, timeout, memory_limit, move |budget| {
+                    basis.normal_form(f, budget)
+                })?
+                .map_err(|e| of_normal_form(py, e))?,
+            ),
             _ => return Err(foreign_argument(py)),
         };
         Ok(PyPolynomial { inner })
+    }
+
+    /// Report whether this basis defines a finite quotient algebra.
+    fn is_zero_dimensional(&self) -> bool {
+        match &self.inner {
+            AnyBasis::Prime(basis) => basis.is_zero_dimensional(),
+            AnyBasis::Rational(basis) => basis.is_zero_dimensional(),
+        }
+    }
+
+    /// Build the finite quotient algebra defined by this basis.
+    #[pyo3(signature = (*, timeout=None, memory_limit=None))]
+    #[pyo3(text_signature = "($self, *, timeout=None, memory_limit=None)")]
+    fn finite_quotient(
+        &self,
+        py: Python<'_>,
+        timeout: Option<f64>,
+        memory_limit: Option<usize>,
+    ) -> PyResult<PyFiniteQuotient> {
+        let inner = match &self.inner {
+            AnyBasis::Prime(basis) => AnyQuotient::Prime(
+                run_budgeted(py, timeout, memory_limit, move |budget| {
+                    basis.finite_quotient(budget)
+                })?
+                .map_err(|error| of_quotient(py, error))?,
+            ),
+            AnyBasis::Rational(basis) => AnyQuotient::Rational(
+                run_budgeted(py, timeout, memory_limit, move |budget| {
+                    basis.finite_quotient(budget)
+                })?
+                .map_err(|error| of_quotient(py, error))?,
+            ),
+        };
+        Ok(PyFiniteQuotient { inner })
+    }
+
+    /// Divide `f` by every basis element and return the quotients and remainder.
+    #[pyo3(signature = (f, *, timeout=None, memory_limit=None))]
+    #[pyo3(text_signature = "($self, f, *, timeout=None, memory_limit=None)")]
+    fn divide(
+        &self,
+        py: Python<'_>,
+        f: &PyPolynomial,
+        timeout: Option<f64>,
+        memory_limit: Option<usize>,
+    ) -> PyResult<(Vec<PyPolynomial>, PyPolynomial)> {
+        match (&self.inner, &f.inner) {
+            (AnyBasis::Prime(basis), AnyPolynomial::Prime(value)) => {
+                let result = run_budgeted(py, timeout, memory_limit, move |budget| {
+                    basis.divide(value, budget)
+                })?
+                .map_err(|error| of_normal_form(py, error))?;
+                let quotients = result
+                    .quotients
+                    .into_iter()
+                    .map(|quotient| PyPolynomial {
+                        inner: AnyPolynomial::Prime(quotient),
+                    })
+                    .collect();
+                Ok((
+                    quotients,
+                    PyPolynomial {
+                        inner: AnyPolynomial::Prime(result.remainder),
+                    },
+                ))
+            }
+            (AnyBasis::Rational(basis), AnyPolynomial::Rational(value)) => {
+                let result = run_budgeted(py, timeout, memory_limit, move |budget| {
+                    basis.divide(value, budget)
+                })?
+                .map_err(|error| of_normal_form(py, error))?;
+                let quotients = result
+                    .quotients
+                    .into_iter()
+                    .map(|quotient| PyPolynomial {
+                        inner: AnyPolynomial::Rational(quotient),
+                    })
+                    .collect();
+                Ok((
+                    quotients,
+                    PyPolynomial {
+                        inner: AnyPolynomial::Rational(result.remainder),
+                    },
+                ))
+            }
+            _ => Err(foreign_argument(py)),
+        }
+    }
+
+    /// Divide `f` by this basis and return `(quotients, remainder)`.
+    #[pyo3(signature = (f, *, timeout=None, memory_limit=None))]
+    #[pyo3(text_signature = "($self, f, *, timeout=None, memory_limit=None)")]
+    fn divmod(
+        &self,
+        py: Python<'_>,
+        f: &PyPolynomial,
+        timeout: Option<f64>,
+        memory_limit: Option<usize>,
+    ) -> PyResult<(Vec<PyPolynomial>, PyPolynomial)> {
+        self.divide(py, f, timeout, memory_limit)
     }
 
     /// Report whether `f` belongs to the ideal this basis generates.
@@ -1188,17 +2177,18 @@ impl PyBasis {
         timeout: Option<f64>,
         memory_limit: Option<usize>,
     ) -> PyResult<bool> {
-        let budget = budget_of(timeout, memory_limit)?;
         match (&self.inner, &f.inner) {
             (AnyBasis::Prime(basis), AnyPolynomial::Prime(f)) => {
-                let (basis, f) = (basis.clone(), f.clone());
-                py.allow_threads(|| basis.contains(&f, budget))
-                    .map_err(|e| of_normal_form(py, e))
+                run_budgeted(py, timeout, memory_limit, move |budget| {
+                    basis.contains(f, budget)
+                })?
+                .map_err(|e| of_normal_form(py, e))
             }
             (AnyBasis::Rational(basis), AnyPolynomial::Rational(f)) => {
-                let (basis, f) = (basis.clone(), f.clone());
-                py.allow_threads(|| basis.contains(&f, budget))
-                    .map_err(|e| of_normal_form(py, e))
+                run_budgeted(py, timeout, memory_limit, move |budget| {
+                    basis.contains(f, budget)
+                })?
+                .map_err(|e| of_normal_form(py, e))
             }
             _ => Err(foreign_argument(py)),
         }
@@ -1225,16 +2215,13 @@ impl PyBasis {
         timeout: Option<f64>,
         memory_limit: Option<usize>,
     ) -> PyResult<PyHilbertSeries> {
-        let budget = budget_of(timeout, memory_limit)?;
         let series = match &self.inner {
-            AnyBasis::Prime(basis) => {
-                let basis = basis.clone();
-                py.allow_threads(|| basis.hilbert_series(budget))
-            }
-            AnyBasis::Rational(basis) => {
-                let basis = basis.clone();
-                py.allow_threads(|| basis.hilbert_series(budget))
-            }
+            AnyBasis::Prime(basis) => run_budgeted(py, timeout, memory_limit, move |budget| {
+                basis.hilbert_series(budget)
+            })?,
+            AnyBasis::Rational(basis) => run_budgeted(py, timeout, memory_limit, move |budget| {
+                basis.hilbert_series(budget)
+            })?,
         };
         Ok(PyHilbertSeries {
             inner: series.map_err(|e| of_hilbert(py, e))?,
@@ -1348,6 +2335,902 @@ impl PyBasis {
 
     fn __repr__(&self) -> String {
         format!("GroebnerBasis({} polynomials)", self.inner.len())
+    }
+}
+
+/// A successful exact rational ideal equality check with origin data.
+#[pyclass(frozen, name = "RationalEqualityCheck", module = "sylvester")]
+struct PyRationalEqualityCheck {
+    inner: RationalEqualityCheck,
+}
+
+#[pymethods]
+impl PyRationalEqualityCheck {
+    /// The input ideal retained by the check.
+    #[getter]
+    fn input(&self) -> PyIdeal {
+        PyIdeal {
+            inner: AnyIdeal::Rational(self.inner.input().clone()),
+        }
+    }
+
+    /// The candidate basis retained by the check.
+    #[getter]
+    fn basis(&self) -> PyBasis {
+        PyBasis {
+            inner: AnyBasis::Rational(self.inner.basis().clone()),
+        }
+    }
+
+    /// The cofactor rows, in basis and input generator order.
+    #[getter]
+    fn origins(&self) -> Vec<Vec<PyPolynomial>> {
+        self.inner
+            .origins()
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|polynomial| PyPolynomial {
+                        inner: AnyPolynomial::Rational(polynomial.clone()),
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Counters from the exact check.
+    #[getter]
+    fn metrics<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let metrics = self.inner.metrics();
+        let result = PyDict::new(py);
+        result.set_item("raw_basis_elements", metrics.raw_basis_elements)?;
+        result.set_item("raw_basis_terms", metrics.raw_basis_terms)?;
+        result.set_item("final_working_bytes", metrics.final_working_bytes)?;
+        Ok(result)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "RationalEqualityCheck({} basis elements, {} origin rows)",
+            self.inner.basis().len(),
+            self.inner.origins().len()
+        )
+    }
+}
+
+fn prime_optional_coefficients<'py, I>(
+    py: Python<'py>,
+    coefficients: I,
+) -> PyResult<Bound<'py, PyList>>
+where
+    I: IntoIterator<Item = Option<u64>>,
+    I::IntoIter: ExactSizeIterator,
+{
+    PyList::new(py, coefficients.into_iter().map(|value| value.unwrap_or(0)))
+}
+
+fn rational_optional_coefficients<'py, I>(
+    py: Python<'py>,
+    coefficients: I,
+) -> PyResult<Bound<'py, PyList>>
+where
+    I: IntoIterator<Item = Option<BigRational>>,
+    I::IntoIter: ExactSizeIterator,
+{
+    PyList::new(
+        py,
+        coefficients
+            .into_iter()
+            .map(|value| value.unwrap_or_else(BigRational::zero)),
+    )
+}
+
+/// A finite-dimensional quotient algebra defined by a Gröbner basis.
+#[pyclass(frozen, name = "FiniteQuotient", module = "sylvester")]
+struct PyFiniteQuotient {
+    inner: AnyQuotient,
+}
+
+#[pymethods]
+impl PyFiniteQuotient {
+    /// The polynomial ring of the quotient.
+    #[getter]
+    fn ring(&self) -> PyRing {
+        PyRing {
+            inner: ring_of_quotient(&self.inner),
+        }
+    }
+
+    /// The basis that defines this quotient, including rational lift data.
+    #[getter]
+    fn source_basis(&self) -> PyBasis {
+        PyBasis {
+            inner: basis_of_quotient(&self.inner),
+        }
+    }
+
+    /// The standard monomials as exponent vectors in ring order.
+    #[getter]
+    fn basis(&self) -> Vec<Vec<u16>> {
+        match &self.inner {
+            AnyQuotient::Prime(value) => value.standard_monomials().to_vec(),
+            AnyQuotient::Rational(value) => value.standard_monomials().to_vec(),
+        }
+    }
+
+    /// The standard monomials as exponent vectors in ring order.
+    #[getter]
+    fn standard_monomials(&self) -> Vec<Vec<u16>> {
+        self.basis()
+    }
+
+    /// The vector-space dimension of the quotient.
+    #[getter]
+    fn dimension(&self) -> usize {
+        match &self.inner {
+            AnyQuotient::Prime(value) => value.vector_space_dimension(),
+            AnyQuotient::Rational(value) => value.vector_space_dimension(),
+        }
+    }
+
+    /// The vector-space dimension of the quotient.
+    fn vector_space_dimension(&self) -> usize {
+        self.dimension()
+    }
+
+    /// Reduce a polynomial to its residue class.
+    #[pyo3(signature = (polynomial, *, timeout=None, memory_limit=None))]
+    #[pyo3(text_signature = "($self, polynomial, *, timeout=None, memory_limit=None)")]
+    fn reduce(
+        &self,
+        py: Python<'_>,
+        polynomial: &PyPolynomial,
+        timeout: Option<f64>,
+        memory_limit: Option<usize>,
+    ) -> PyResult<PyPolynomial> {
+        let inner = match (&self.inner, &polynomial.inner) {
+            (AnyQuotient::Prime(quotient), AnyPolynomial::Prime(value)) => AnyPolynomial::Prime(
+                run_budgeted(py, timeout, memory_limit, move |budget| {
+                    quotient.reduce(value, budget)
+                })?
+                .map_err(|error| of_quotient(py, error))?,
+            ),
+            (AnyQuotient::Rational(quotient), AnyPolynomial::Rational(value)) => {
+                AnyPolynomial::Rational(
+                    run_budgeted(py, timeout, memory_limit, move |budget| {
+                        quotient.reduce(value, budget)
+                    })?
+                    .map_err(|error| of_quotient(py, error))?,
+                )
+            }
+            _ => return Err(foreign_argument(py)),
+        };
+        Ok(PyPolynomial { inner })
+    }
+
+    /// Return coordinates of a residue in the standard monomial basis.
+    #[pyo3(signature = (polynomial, *, timeout=None, memory_limit=None))]
+    #[pyo3(text_signature = "($self, polynomial, *, timeout=None, memory_limit=None)")]
+    fn coordinates<'py>(
+        &self,
+        py: Python<'py>,
+        polynomial: &PyPolynomial,
+        timeout: Option<f64>,
+        memory_limit: Option<usize>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        match (&self.inner, &polynomial.inner) {
+            (AnyQuotient::Prime(quotient), AnyPolynomial::Prime(value)) => {
+                let coordinates = run_budgeted(py, timeout, memory_limit, move |budget| {
+                    quotient.coordinates(value, budget)
+                })?
+                .map_err(|error| of_quotient(py, error))?;
+                prime_optional_coefficients(
+                    py,
+                    coordinates
+                        .into_iter()
+                        .map(|coefficient| coefficient.map(|value| value.value())),
+                )
+            }
+            (AnyQuotient::Rational(quotient), AnyPolynomial::Rational(value)) => {
+                let coordinates = run_budgeted(py, timeout, memory_limit, move |budget| {
+                    quotient.coordinates(value, budget)
+                })?
+                .map_err(|error| of_quotient(py, error))?;
+                rational_optional_coefficients(py, coordinates)
+            }
+            _ => Err(foreign_argument(py)),
+        }
+    }
+
+    /// Add two residue classes and reduce the result.
+    #[pyo3(signature = (left, right, *, timeout=None, memory_limit=None))]
+    #[pyo3(text_signature = "($self, left, right, *, timeout=None, memory_limit=None)")]
+    fn add(
+        &self,
+        py: Python<'_>,
+        left: &PyPolynomial,
+        right: &PyPolynomial,
+        timeout: Option<f64>,
+        memory_limit: Option<usize>,
+    ) -> PyResult<PyPolynomial> {
+        let inner = match (&self.inner, &left.inner, &right.inner) {
+            (
+                AnyQuotient::Prime(quotient),
+                AnyPolynomial::Prime(left),
+                AnyPolynomial::Prime(right),
+            ) => AnyPolynomial::Prime(
+                run_budgeted(py, timeout, memory_limit, move |budget| {
+                    quotient.add(left, right, budget)
+                })?
+                .map_err(|error| of_quotient(py, error))?,
+            ),
+            (
+                AnyQuotient::Rational(quotient),
+                AnyPolynomial::Rational(left),
+                AnyPolynomial::Rational(right),
+            ) => AnyPolynomial::Rational(
+                run_budgeted(py, timeout, memory_limit, move |budget| {
+                    quotient.add(left, right, budget)
+                })?
+                .map_err(|error| of_quotient(py, error))?,
+            ),
+            _ => return Err(foreign_argument(py)),
+        };
+        Ok(PyPolynomial { inner })
+    }
+
+    /// Multiply two residue classes and reduce the result.
+    #[pyo3(signature = (left, right, *, timeout=None, memory_limit=None))]
+    #[pyo3(text_signature = "($self, left, right, *, timeout=None, memory_limit=None)")]
+    fn multiply(
+        &self,
+        py: Python<'_>,
+        left: &PyPolynomial,
+        right: &PyPolynomial,
+        timeout: Option<f64>,
+        memory_limit: Option<usize>,
+    ) -> PyResult<PyPolynomial> {
+        let inner = match (&self.inner, &left.inner, &right.inner) {
+            (
+                AnyQuotient::Prime(quotient),
+                AnyPolynomial::Prime(left),
+                AnyPolynomial::Prime(right),
+            ) => AnyPolynomial::Prime(
+                run_budgeted(py, timeout, memory_limit, move |budget| {
+                    quotient.multiply(left, right, budget)
+                })?
+                .map_err(|error| of_quotient(py, error))?,
+            ),
+            (
+                AnyQuotient::Rational(quotient),
+                AnyPolynomial::Rational(left),
+                AnyPolynomial::Rational(right),
+            ) => AnyPolynomial::Rational(
+                run_budgeted(py, timeout, memory_limit, move |budget| {
+                    quotient.multiply(left, right, budget)
+                })?
+                .map_err(|error| of_quotient(py, error))?,
+            ),
+            _ => return Err(foreign_argument(py)),
+        };
+        Ok(PyPolynomial { inner })
+    }
+
+    /// Raise a residue class to a nonnegative integer power.
+    #[pyo3(signature = (polynomial, exponent, *, timeout=None, memory_limit=None))]
+    #[pyo3(text_signature = "($self, polynomial, exponent, *, timeout=None, memory_limit=None)")]
+    fn pow(
+        &self,
+        py: Python<'_>,
+        polynomial: &PyPolynomial,
+        exponent: &Bound<'_, PyAny>,
+        timeout: Option<f64>,
+        memory_limit: Option<usize>,
+    ) -> PyResult<PyPolynomial> {
+        let exponent = quotient_exponent_from(exponent)?;
+        let inner = match (&self.inner, &polynomial.inner) {
+            (AnyQuotient::Prime(quotient), AnyPolynomial::Prime(value)) => AnyPolynomial::Prime(
+                run_budgeted(py, timeout, memory_limit, move |budget| {
+                    quotient.pow(value, exponent, budget)
+                })?
+                .map_err(|error| of_quotient(py, error))?,
+            ),
+            (AnyQuotient::Rational(quotient), AnyPolynomial::Rational(value)) => {
+                AnyPolynomial::Rational(
+                    run_budgeted(py, timeout, memory_limit, move |budget| {
+                        quotient.pow(value, exponent, budget)
+                    })?
+                    .map_err(|error| of_quotient(py, error))?,
+                )
+            }
+            _ => return Err(foreign_argument(py)),
+        };
+        Ok(PyPolynomial { inner })
+    }
+
+    /// Build the matrix of multiplication by a residue class.
+    #[pyo3(signature = (polynomial, *, timeout=None, memory_limit=None))]
+    #[pyo3(text_signature = "($self, polynomial, *, timeout=None, memory_limit=None)")]
+    fn multiplication_matrix(
+        &self,
+        py: Python<'_>,
+        polynomial: &PyPolynomial,
+        timeout: Option<f64>,
+        memory_limit: Option<usize>,
+    ) -> PyResult<PyMultiplicationMatrix> {
+        let inner = match (&self.inner, &polynomial.inner) {
+            (AnyQuotient::Prime(quotient), AnyPolynomial::Prime(value)) => AnyMatrix::Prime(
+                run_budgeted(py, timeout, memory_limit, move |budget| {
+                    quotient.multiplication_matrix(value, budget)
+                })?
+                .map_err(|error| of_quotient(py, error))?,
+            ),
+            (AnyQuotient::Rational(quotient), AnyPolynomial::Rational(value)) => {
+                AnyMatrix::Rational(
+                    run_budgeted(py, timeout, memory_limit, move |budget| {
+                        quotient.multiplication_matrix(value, budget)
+                    })?
+                    .map_err(|error| of_quotient(py, error))?,
+                )
+            }
+            _ => return Err(foreign_argument(py)),
+        };
+        Ok(PyMultiplicationMatrix { inner })
+    }
+
+    /// Return the characteristic polynomial of multiplication by a residue class.
+    #[pyo3(signature = (polynomial, *, timeout=None, memory_limit=None))]
+    #[pyo3(text_signature = "($self, polynomial, *, timeout=None, memory_limit=None)")]
+    fn characteristic_polynomial(
+        &self,
+        py: Python<'_>,
+        polynomial: &PyPolynomial,
+        timeout: Option<f64>,
+        memory_limit: Option<usize>,
+    ) -> PyResult<PyUnivariatePolynomial> {
+        let inner = match (&self.inner, &polynomial.inner) {
+            (AnyQuotient::Prime(quotient), AnyPolynomial::Prime(value)) => AnyUnivariate::Prime(
+                run_budgeted(py, timeout, memory_limit, move |budget| {
+                    quotient.characteristic_polynomial(value, budget)
+                })?
+                .map_err(|error| of_quotient(py, error))?,
+            ),
+            (AnyQuotient::Rational(quotient), AnyPolynomial::Rational(value)) => {
+                AnyUnivariate::Rational(
+                    run_budgeted(py, timeout, memory_limit, move |budget| {
+                        quotient.characteristic_polynomial(value, budget)
+                    })?
+                    .map_err(|error| of_quotient(py, error))?,
+                )
+            }
+            _ => return Err(foreign_argument(py)),
+        };
+        Ok(PyUnivariatePolynomial { inner })
+    }
+
+    /// Return the minimal polynomial of multiplication by a residue class.
+    #[pyo3(signature = (polynomial, *, timeout=None, memory_limit=None))]
+    #[pyo3(text_signature = "($self, polynomial, *, timeout=None, memory_limit=None)")]
+    fn minimal_polynomial(
+        &self,
+        py: Python<'_>,
+        polynomial: &PyPolynomial,
+        timeout: Option<f64>,
+        memory_limit: Option<usize>,
+    ) -> PyResult<PyUnivariatePolynomial> {
+        let inner = match (&self.inner, &polynomial.inner) {
+            (AnyQuotient::Prime(quotient), AnyPolynomial::Prime(value)) => AnyUnivariate::Prime(
+                run_budgeted(py, timeout, memory_limit, move |budget| {
+                    quotient.minimal_polynomial(value, budget)
+                })?
+                .map_err(|error| of_quotient(py, error))?,
+            ),
+            (AnyQuotient::Rational(quotient), AnyPolynomial::Rational(value)) => {
+                AnyUnivariate::Rational(
+                    run_budgeted(py, timeout, memory_limit, move |budget| {
+                        quotient.minimal_polynomial(value, budget)
+                    })?
+                    .map_err(|error| of_quotient(py, error))?,
+                )
+            }
+            _ => return Err(foreign_argument(py)),
+        };
+        Ok(PyUnivariatePolynomial { inner })
+    }
+
+    fn __repr__(&self) -> String {
+        format!("FiniteQuotient(dimension={})", self.dimension())
+    }
+}
+
+/// A square matrix of multiplication by a quotient residue class.
+#[pyclass(frozen, name = "MultiplicationMatrix", module = "sylvester")]
+struct PyMultiplicationMatrix {
+    inner: AnyMatrix,
+}
+
+#[pymethods]
+impl PyMultiplicationMatrix {
+    /// The coefficient ring used by the matrix.
+    #[getter]
+    fn ring(&self) -> PyRing {
+        PyRing {
+            inner: ring_of_matrix(&self.inner),
+        }
+    }
+
+    /// The number of rows and columns.
+    #[getter]
+    fn dimension(&self) -> usize {
+        match &self.inner {
+            AnyMatrix::Prime(value) => value.dimension(),
+            AnyMatrix::Rational(value) => value.dimension(),
+        }
+    }
+
+    /// The entries as rows of a Python list. Zero entries are ordinary zero
+    /// coefficients in the ring's Python domain.
+    #[getter]
+    fn entries<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let dimension = self.dimension();
+        match &self.inner {
+            AnyMatrix::Prime(value) => PyList::new(
+                py,
+                (0..dimension)
+                    .map(|row| {
+                        (0..dimension)
+                            .map(|column| {
+                                value
+                                    .entry(row, column)
+                                    .map_or(0, |coefficient| coefficient.value())
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            AnyMatrix::Rational(value) => PyList::new(
+                py,
+                (0..dimension)
+                    .map(|row| {
+                        (0..dimension)
+                            .map(|column| {
+                                value
+                                    .entry(row, column)
+                                    .cloned()
+                                    .unwrap_or_else(BigRational::zero)
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+        }
+    }
+
+    /// The entries in row-major order.
+    #[getter]
+    fn flat_entries<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        match &self.inner {
+            AnyMatrix::Prime(value) => prime_optional_coefficients(
+                py,
+                value
+                    .entries()
+                    .iter()
+                    .map(|coefficient| coefficient.as_ref().map(|value| value.value())),
+            ),
+            AnyMatrix::Rational(value) => {
+                rational_optional_coefficients(py, value.entries().iter().map(Clone::clone))
+            }
+        }
+    }
+
+    /// Read one matrix entry, or None for an out-of-range index.
+    /// Negative and too large integer indexes are out of range.
+    fn entry<'py>(
+        &self,
+        py: Python<'py>,
+        row: &Bound<'_, PyAny>,
+        column: &Bound<'_, PyAny>,
+    ) -> PyResult<Option<Py<PyAny>>> {
+        let Some(row) = index_from(row)? else {
+            return Ok(None);
+        };
+        let Some(column) = index_from(column)? else {
+            return Ok(None);
+        };
+        if row >= self.dimension() || column >= self.dimension() {
+            return Ok(None);
+        }
+        match &self.inner {
+            AnyMatrix::Prime(value) => Ok(Some(prime_coefficient_object(
+                py,
+                value.entry(row, column).unwrap_or_else(|| prime_zero()),
+            )?)),
+            AnyMatrix::Rational(value) => Ok(Some(rational_coefficient_object(
+                py,
+                value.entry(row, column).unwrap_or_else(|| rational_zero()),
+            )?)),
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "MultiplicationMatrix({}x{})",
+            self.dimension(),
+            self.dimension()
+        )
+    }
+}
+
+/// A univariate polynomial returned by a quotient spectrum computation.
+#[pyclass(frozen, name = "UnivariatePolynomial", module = "sylvester")]
+struct PyUnivariatePolynomial {
+    inner: AnyUnivariate,
+}
+
+#[pymethods]
+impl PyUnivariatePolynomial {
+    /// The ring that supplies the coefficients.
+    #[getter]
+    fn ring(&self) -> PyRing {
+        PyRing {
+            inner: ring_of_univariate(&self.inner),
+        }
+    }
+
+    /// Coefficients from the constant term upward. Zero entries are ordinary
+    /// zero coefficients in the ring's Python domain.
+    #[getter]
+    fn coefficients<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        match &self.inner {
+            AnyUnivariate::Prime(value) => prime_optional_coefficients(
+                py,
+                value
+                    .coefficients()
+                    .iter()
+                    .map(|coefficient| coefficient.as_ref().map(|value| value.value())),
+            ),
+            AnyUnivariate::Rational(value) => {
+                rational_optional_coefficients(py, value.coefficients().iter().map(Clone::clone))
+            }
+        }
+    }
+
+    /// Return the coefficient of `t**degree`, or None past the coefficient list.
+    /// A negative or too large integer degree is out of range.
+    fn coefficient<'py>(
+        &self,
+        py: Python<'py>,
+        degree: &Bound<'_, PyAny>,
+    ) -> PyResult<Option<Py<PyAny>>> {
+        let Some(degree) = index_from(degree)? else {
+            return Ok(None);
+        };
+        match &self.inner {
+            AnyUnivariate::Prime(value) => {
+                if degree >= value.coefficients().len() {
+                    return Ok(None);
+                }
+                Ok(Some(prime_coefficient_object(
+                    py,
+                    value.coefficient(degree).unwrap_or_else(|| prime_zero()),
+                )?))
+            }
+            AnyUnivariate::Rational(value) => {
+                if degree >= value.coefficients().len() {
+                    return Ok(None);
+                }
+                Ok(Some(rational_coefficient_object(
+                    py,
+                    value.coefficient(degree).unwrap_or_else(|| rational_zero()),
+                )?))
+            }
+        }
+    }
+
+    /// The largest nonzero degree, or None for the zero polynomial.
+    #[getter]
+    fn degree(&self) -> Option<usize> {
+        match &self.inner {
+            AnyUnivariate::Prime(value) => value.degree(),
+            AnyUnivariate::Rational(value) => value.degree(),
+        }
+    }
+
+    /// Report whether every coefficient is zero.
+    #[getter]
+    fn is_zero(&self) -> bool {
+        match &self.inner {
+            AnyUnivariate::Prime(value) => value.is_zero(),
+            AnyUnivariate::Rational(value) => value.is_zero(),
+        }
+    }
+
+    fn __str__(&self) -> String {
+        match &self.inner {
+            AnyUnivariate::Prime(value) => value.to_string(),
+            AnyUnivariate::Rational(value) => value.to_string(),
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!("UnivariatePolynomial({:?})", self.__str__())
+    }
+}
+
+/// A saved input, basis, and untrusted provenance claim.
+#[pyclass(frozen, name = "ResultEnvelope", module = "sylvester")]
+struct PyResultEnvelope {
+    inner: ResultEnvelope,
+}
+
+fn provenance_name(provenance: ClaimedProvenance) -> &'static str {
+    match provenance {
+        ClaimedProvenance::Unverified => "unverified",
+        ClaimedProvenance::SuppliedBasis => "supplied_basis",
+        ClaimedProvenance::Unchanged => "unchanged",
+        ClaimedProvenance::ContainsInput => "contains_input",
+        ClaimedProvenance::EqualsInput => "equals_input",
+        ClaimedProvenance::Certified => "certified",
+    }
+}
+
+#[pymethods]
+impl PyResultEnvelope {
+    /// Record a prime-field ideal and basis with an optional unverified certificate.
+    #[staticmethod]
+    #[pyo3(signature = (ideal, basis, certificate=None, *, timeout=None, memory_limit=None))]
+    #[pyo3(text_signature = "(ideal, basis, certificate=None, *, timeout=None, memory_limit=None)")]
+    fn from_prime(
+        py: Python<'_>,
+        ideal: &PyIdeal,
+        basis: &PyBasis,
+        certificate: Option<Vec<u8>>,
+        timeout: Option<f64>,
+        memory_limit: Option<usize>,
+    ) -> PyResult<Self> {
+        let cancellation = CancellationToken::new();
+        let budget = cancellable_budget(timeout, memory_limit, &cancellation)?;
+        let inner = match (&ideal.inner, &basis.inner) {
+            (AnyIdeal::Prime(ideal), AnyBasis::Prime(basis)) => run_with_signals(
+                py,
+                || cancellation.cancel(),
+                move || ResultEnvelope::from_prime(ideal, basis, certificate.as_deref(), budget),
+            )?
+            .map_err(|error| of_envelope(py, error))?,
+            _ => return Err(foreign_argument(py)),
+        };
+        Ok(PyResultEnvelope { inner })
+    }
+
+    /// Record a certified prime-field basis after matching its certificate.
+    #[staticmethod]
+    #[pyo3(signature = (ideal, certified, *, timeout=None, memory_limit=None))]
+    #[pyo3(text_signature = "(ideal, certified, *, timeout=None, memory_limit=None)")]
+    fn from_certified(
+        py: Python<'_>,
+        ideal: &PyIdeal,
+        certified: &PyCertified,
+        timeout: Option<f64>,
+        memory_limit: Option<usize>,
+    ) -> PyResult<Self> {
+        let cancellation = CancellationToken::new();
+        let budget = cancellable_budget(timeout, memory_limit, &cancellation)?;
+        let inner = match &ideal.inner {
+            AnyIdeal::Prime(ideal) => {
+                let certified = &certified.inner;
+                run_with_signals(
+                    py,
+                    || cancellation.cancel(),
+                    move || ResultEnvelope::from_certified(ideal, certified, budget),
+                )?
+                .map_err(|error| of_envelope(py, error))?
+            }
+            AnyIdeal::Rational(_) => {
+                return Err(PyValueError::new_err(
+                    "the rational numbers have no certified path".to_string(),
+                ));
+            }
+        };
+        Ok(PyResultEnvelope { inner })
+    }
+
+    /// Record a rational ideal and basis with its lift claim.
+    #[staticmethod]
+    #[pyo3(signature = (ideal, basis, *, timeout=None, memory_limit=None))]
+    #[pyo3(text_signature = "(ideal, basis, *, timeout=None, memory_limit=None)")]
+    fn from_rational(
+        py: Python<'_>,
+        ideal: &PyIdeal,
+        basis: &PyBasis,
+        timeout: Option<f64>,
+        memory_limit: Option<usize>,
+    ) -> PyResult<Self> {
+        let cancellation = CancellationToken::new();
+        let budget = cancellable_budget(timeout, memory_limit, &cancellation)?;
+        let inner = match (&ideal.inner, &basis.inner) {
+            (AnyIdeal::Rational(ideal), AnyBasis::Rational(basis)) => run_with_signals(
+                py,
+                || cancellation.cancel(),
+                move || ResultEnvelope::from_rational(ideal, basis, budget),
+            )?
+            .map_err(|error| of_envelope(py, error))?,
+            _ => return Err(foreign_argument(py)),
+        };
+        Ok(PyResultEnvelope { inner })
+    }
+
+    /// Record a successful exact rational equality check.
+    #[staticmethod]
+    #[pyo3(signature = (checked, *, timeout=None, memory_limit=None))]
+    #[pyo3(text_signature = "(checked, *, timeout=None, memory_limit=None)")]
+    fn from_checked_rational(
+        py: Python<'_>,
+        checked: &PyRationalEqualityCheck,
+        timeout: Option<f64>,
+        memory_limit: Option<usize>,
+    ) -> PyResult<Self> {
+        let checked = &checked.inner;
+        let inner = run_budgeted(py, timeout, memory_limit, move |budget| {
+            ResultEnvelope::from_checked_rational(checked, budget)
+        })?
+        .map_err(|error| of_envelope(py, error))?;
+        Ok(PyResultEnvelope { inner })
+    }
+
+    /// Recheck a loaded rational record for exact ideal equality.
+    #[pyo3(signature = (*, timeout=None, memory_limit=None))]
+    #[pyo3(text_signature = "($self, *, timeout=None, memory_limit=None)")]
+    fn check_rational(
+        &self,
+        py: Python<'_>,
+        timeout: Option<f64>,
+        memory_limit: Option<usize>,
+    ) -> PyResult<PyRationalEqualityCheck> {
+        let record = &self.inner;
+        let checked = run_budgeted(py, timeout, memory_limit, move |budget| {
+            record.check_rational(budget)
+        })?
+        .map_err(|error| of_envelope(py, error))?;
+        Ok(PyRationalEqualityCheck { inner: checked })
+    }
+
+    /// Load a record without trusting its provenance or certificate.
+    #[staticmethod]
+    #[pyo3(signature = (data, *, timeout=None, memory_limit=None))]
+    #[pyo3(text_signature = "(data, *, timeout=None, memory_limit=None)")]
+    fn from_json(
+        py: Python<'_>,
+        data: &Bound<'_, PyAny>,
+        timeout: Option<f64>,
+        memory_limit: Option<usize>,
+    ) -> PyResult<Self> {
+        let cancellation = CancellationToken::new();
+        let budget = cancellable_budget(timeout, memory_limit, &cancellation)?;
+        let data = envelope_bytes(py, data, memory_limit)?;
+        let inner = run_with_signals(
+            py,
+            || cancellation.cancel(),
+            move || ResultEnvelope::from_json(&data, budget),
+        )?
+        .map_err(|error| of_envelope(py, error))?;
+        Ok(PyResultEnvelope { inner })
+    }
+
+    /// Serialize the record to JSON bytes.
+    #[pyo3(signature = (*, timeout=None, memory_limit=None))]
+    #[pyo3(text_signature = "($self, *, timeout=None, memory_limit=None)")]
+    fn to_json<'py>(
+        &self,
+        py: Python<'py>,
+        timeout: Option<f64>,
+        memory_limit: Option<usize>,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let cancellation = CancellationToken::new();
+        let budget = cancellable_budget(timeout, memory_limit, &cancellation)?;
+        let record = &self.inner;
+        let data = run_with_signals(py, || cancellation.cancel(), move || record.to_json(budget))?
+            .map_err(|error| of_envelope(py, error))?;
+        Ok(PyBytes::new(py, &data))
+    }
+
+    /// The domain metadata as a dictionary.
+    #[getter]
+    fn domain<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let out = PyDict::new(py);
+        match self.inner.domain() {
+            EnvelopeDomain::PrimeField { modulus } => {
+                out.set_item("kind", "prime_field")?;
+                out.set_item("modulus", modulus)?;
+            }
+            EnvelopeDomain::Rationals => {
+                out.set_item("kind", "rationals")?;
+            }
+        }
+        Ok(out)
+    }
+
+    /// The variable names in ring order.
+    #[getter]
+    fn variables(&self) -> Vec<String> {
+        self.inner.variables().to_vec()
+    }
+
+    /// The input expressions stored in the record.
+    #[getter]
+    fn input(&self) -> Vec<String> {
+        self.inner.input().to_vec()
+    }
+
+    /// The basis expressions stored in the record.
+    #[getter]
+    fn basis(&self) -> Vec<String> {
+        self.inner.basis().to_vec()
+    }
+
+    /// The producer's untrusted provenance claim.
+    #[getter]
+    fn claimed_provenance(&self) -> &'static str {
+        provenance_name(self.inner.claimed_provenance())
+    }
+
+    /// Certificate bytes stored in the record, if any.
+    #[getter]
+    fn certificate<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyBytes>> {
+        self.inner
+            .certificate()
+            .map(|bytes| PyBytes::new(py, bytes))
+    }
+
+    /// Verify and match the stored prime certificate.
+    #[pyo3(signature = (*, timeout=None, max_bytes=None, max_work_units=None, max_intermediate_bytes=None, max_live_bytes=None))]
+    #[pyo3(
+        text_signature = "($self, *, timeout=None, max_bytes=None, max_work_units=None, max_intermediate_bytes=None, max_live_bytes=None)"
+    )]
+    fn verify_prime(
+        &self,
+        py: Python<'_>,
+        timeout: Option<f64>,
+        max_bytes: Option<usize>,
+        max_work_units: Option<u64>,
+        max_intermediate_bytes: Option<usize>,
+        max_live_bytes: Option<usize>,
+    ) -> PyResult<PyVerified> {
+        let mut caps = verification_limits(
+            None,
+            max_bytes,
+            max_work_units,
+            max_intermediate_bytes,
+            max_live_bytes,
+        )?;
+        let cancellation = CancellationToken::new();
+        caps.cancellation = Some(cancellation.shared_flag());
+        let budget = cancellable_budget(timeout, None, &cancellation)?;
+        let record = &self.inner;
+        let verified = run_with_signals(
+            py,
+            || cancellation.cancel(),
+            move || record.verify_prime(&caps, budget),
+        )?
+        .map_err(|error| of_envelope(py, error))?;
+        verified_to_python(py, verified)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "ResultEnvelope(domain={:?}, {} input, {} basis)",
+            self.domain_name(),
+            self.inner.input().len(),
+            self.inner.basis().len()
+        )
+    }
+}
+
+impl PyResultEnvelope {
+    fn domain_name(&self) -> &'static str {
+        match self.inner.domain() {
+            EnvelopeDomain::PrimeField { .. } => "prime_field",
+            EnvelopeDomain::Rationals => "rationals",
+        }
     }
 }
 
@@ -1537,7 +3420,7 @@ impl PyComputeReport {
     }
 }
 
-fn set_matrix_counters(dict: &Bound<'_, PyDict>, counters: &F4Counters) -> PyResult<()> {
+fn set_matrix_counters(dict: &Bound<'_, PyDict>, counters: &sylvester::F4Counters) -> PyResult<()> {
     dict.set_item("batches", counters.batches)?;
     dict.set_item("matrix_rows", counters.matrix_rows)?;
     dict.set_item("matrix_columns", counters.matrix_columns)?;
@@ -1550,7 +3433,7 @@ fn set_matrix_counters(dict: &Bound<'_, PyDict>, counters: &F4Counters) -> PyRes
     Ok(())
 }
 
-fn set_pair_counters(dict: &Bound<'_, PyDict>, counters: &F4Counters) -> PyResult<()> {
+fn set_pair_counters(dict: &Bound<'_, PyDict>, counters: &sylvester::F4Counters) -> PyResult<()> {
     dict.set_item("pairs_generated", counters.pairs_generated)?;
     dict.set_item("pairs_discarded_product", counters.pairs_discarded_product)?;
     dict.set_item("pairs_discarded_b", counters.pairs_discarded_b)?;
@@ -1619,22 +3502,95 @@ impl PyVerified {
     }
 }
 
-/// Check certificate bytes with the independent verifier.
-///
-/// Acceptance proves that the input and the basis inside the certificate
-/// generate the same ideal, and that the basis is the reduced Gröbner basis
-/// of that ideal under grevlex. It says nothing about who wrote the bytes.
-/// The verifier shares no code with the engines.
-///
-/// Raises CertificateInvalid when the bytes do not hold, and Timeout or
-/// LimitExceeded when the verifier ran out of its own budget, which says
-/// nothing about the certificate.
-#[pyfunction(name = "verify")]
-#[pyo3(text_signature = "(data)")]
-fn verify_certificate(py: Python<'_>, data: Vec<u8>) -> PyResult<PyVerified> {
-    let verified = py
-        .allow_threads(|| verify::verify(&data))
-        .map_err(|e| of_verify(py, e))?;
+/// Build verifier limits from Python keyword values.
+fn verification_limits(
+    timeout: Option<f64>,
+    max_bytes: Option<usize>,
+    max_work_units: Option<u64>,
+    max_intermediate_bytes: Option<usize>,
+    max_live_bytes: Option<usize>,
+) -> PyResult<verify::Limits> {
+    let mut limits = verify::Limits::default();
+    if let Some(seconds) = timeout {
+        limits.deadline = Instant::now().checked_add(duration_of("timeout", seconds)?);
+    }
+    if let Some(value) = max_bytes {
+        limits.max_bytes = value;
+    }
+    if let Some(value) = max_work_units {
+        limits.max_work_units = value;
+    }
+    if let Some(value) = max_intermediate_bytes {
+        limits.max_intermediate_bytes = value;
+    }
+    if let Some(value) = max_live_bytes {
+        limits.max_live_bytes = value;
+    }
+    Ok(limits)
+}
+
+fn certificate_bytes(
+    py: Python<'_>,
+    data: &Bound<'_, PyAny>,
+    max_bytes: usize,
+) -> PyResult<Vec<u8>> {
+    let length = data.len()?;
+    if length > max_bytes {
+        return Err(raise_with(
+            py,
+            &exceptions(py).limit_exceeded,
+            format!("the certificate is larger than the {max_bytes}-byte cap"),
+            |value| value.setattr("limit", max_bytes),
+        ));
+    }
+    let bytes = data.extract::<Vec<u8>>()?;
+    if bytes.len() > max_bytes {
+        return Err(raise_with(
+            py,
+            &exceptions(py).limit_exceeded,
+            format!("the certificate is larger than the {max_bytes}-byte cap"),
+            |value| value.setattr("limit", max_bytes),
+        ));
+    }
+    Ok(bytes)
+}
+
+fn envelope_bytes(
+    py: Python<'_>,
+    data: &Bound<'_, PyAny>,
+    memory_limit: Option<usize>,
+) -> PyResult<Vec<u8>> {
+    let length = data.len()?;
+    if let Some(limit) = memory_limit {
+        let estimate = length
+            .saturating_mul(32)
+            .saturating_add(std::mem::size_of::<ResultEnvelope>());
+        if estimate > limit {
+            return Err(raise(
+                py,
+                &exceptions(py).memory_limit,
+                "the computation record passed its memory limit before decoding".to_string(),
+            ));
+        }
+    }
+    let bytes = data.extract::<Vec<u8>>()?;
+    if let Some(limit) = memory_limit {
+        let estimate = bytes
+            .len()
+            .saturating_mul(32)
+            .saturating_add(std::mem::size_of::<ResultEnvelope>());
+        if estimate > limit {
+            return Err(raise(
+                py,
+                &exceptions(py).memory_limit,
+                "the computation record passed its memory limit before decoding".to_string(),
+            ));
+        }
+    }
+    Ok(bytes)
+}
+
+fn verified_to_python(py: Python<'_>, verified: verify::VerifiedGb) -> PyResult<PyVerified> {
     let names: Vec<String> = (1..=verified.nvars())
         .map(|index| format!("x{index}"))
         .collect();
@@ -1678,20 +3634,41 @@ fn verify_certificate(py: Python<'_>, data: Vec<u8>) -> PyResult<PyVerified> {
     })
 }
 
-/// Gröbner bases over prime fields and over the rational numbers, under the
-/// grevlex order, with independent certificate verifiers.
-#[pymodule(name = "_sylvester")]
-fn sylvester_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    let py = m.py();
-    let classes = build_exceptions(py)?;
-    add_exception_classes(m, &classes)?;
-    EXCEPTIONS
-        .set(py, classes)
-        .map_err(|_| PyRuntimeError::new_err("the exception classes are already built"))?;
-    m.add("__version__", env!("CARGO_PKG_VERSION"))?;
-    add_value_classes(m)?;
-    m.add_function(wrap_pyfunction!(verify_certificate, m)?)?;
-    Ok(())
+/// Check certificate bytes with the independent verifier.
+///
+/// `timeout` is seconds. The other keywords replace the matching default
+/// resource caps. Exhaustion says nothing about the certificate.
+#[pyfunction(name = "verify")]
+#[pyo3(signature = (data, *, timeout=None, max_bytes=None, max_work_units=None, max_intermediate_bytes=None, max_live_bytes=None))]
+#[pyo3(
+    text_signature = "(data, *, timeout=None, max_bytes=None, max_work_units=None, max_intermediate_bytes=None, max_live_bytes=None)"
+)]
+fn verify_certificate(
+    py: Python<'_>,
+    data: &Bound<'_, PyAny>,
+    timeout: Option<f64>,
+    max_bytes: Option<usize>,
+    max_work_units: Option<u64>,
+    max_intermediate_bytes: Option<usize>,
+    max_live_bytes: Option<usize>,
+) -> PyResult<PyVerified> {
+    let mut limits = verification_limits(
+        timeout,
+        max_bytes,
+        max_work_units,
+        max_intermediate_bytes,
+        max_live_bytes,
+    )?;
+    let data = certificate_bytes(py, data, limits.max_bytes)?;
+    let cancellation = CancellationToken::new();
+    limits.cancellation = Some(cancellation.shared_flag());
+    let verified = run_with_signals(
+        py,
+        || cancellation.cancel(),
+        move || verify::verify_with_limits(&data, &limits),
+    )?
+    .map_err(|error| of_verify(py, error))?;
+    verified_to_python(py, verified)
 }
 
 fn add_exception_classes(m: &Bound<'_, PyModule>, classes: &Exceptions) -> PyResult<()> {
@@ -1714,13 +3691,49 @@ fn add_exception_classes(m: &Bound<'_, PyModule>, classes: &Exceptions) -> PyRes
 }
 
 fn add_value_classes(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    add_ring_classes(m)?;
+    add_quotient_classes(m)?;
+    add_result_classes(m)?;
+    Ok(())
+}
+
+fn add_ring_classes(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyRing>()?;
     m.add_class::<PyPolynomial>()?;
     m.add_class::<PyIdeal>()?;
     m.add_class::<PyBasis>()?;
+    Ok(())
+}
+
+fn add_quotient_classes(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<PyRationalEqualityCheck>()?;
+    m.add_class::<PyFiniteQuotient>()?;
+    m.add_class::<PyMultiplicationMatrix>()?;
+    m.add_class::<PyUnivariatePolynomial>()?;
+    Ok(())
+}
+
+fn add_result_classes(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<PyResultEnvelope>()?;
     m.add_class::<PyCertified>()?;
     m.add_class::<PyHilbertSeries>()?;
     m.add_class::<PyComputeReport>()?;
     m.add_class::<PyVerified>()?;
+    Ok(())
+}
+
+/// Gröbner bases over prime fields and over the rational numbers, under the
+/// grevlex order, with independent certificate verifiers.
+#[pymodule(name = "_sylvester")]
+fn sylvester_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    let py = m.py();
+    let classes = build_exceptions(py)?;
+    add_exception_classes(m, &classes)?;
+    EXCEPTIONS
+        .set(py, classes)
+        .map_err(|_| PyRuntimeError::new_err("the exception classes are already built"))?;
+    m.add("__version__", env!("CARGO_PKG_VERSION"))?;
+    add_value_classes(m)?;
+    m.add_function(wrap_pyfunction!(verify_certificate, m)?)?;
     Ok(())
 }

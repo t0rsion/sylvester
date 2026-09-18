@@ -18,9 +18,11 @@ The families are:
 `results.json.zst` contains commands, counters, and complete bases. Frozen
 records stay under `records/`.
 
-The current record remeasures every sylvester cell and the four msolve gate
-cells. It reuses the remaining external cells from the frozen 2026-08-19 record.
-`results.json.zst` records this provenance in `_meta`.
+The current record contains 228 cells. It remeasures 116 targets: every
+sylvester cell and the four msolve gate cells. It reuses 112 external cells
+from the frozen 2026-08-19 record. `results.json.zst` records this provenance
+in `_meta`. The gate values in `REPORT.md` come from the clean eight-cell
+rerun in `records/2026-09-18-clean-gate/`.
 
 Decode and verify the exact raw record:
 
@@ -218,7 +220,7 @@ Five rows per instance, from one runner binary. The runner takes one mode:
 `f4`, `classic`, `certified`, `f4-certified`, or `rational`
 (see "Rational protocol"), and a thread count.
 `f4/default` and `classic/default` are the raw one-thread configurations,
-and the gate in docs/f4-design.md 1.1 applies to `f4/default`.
+and the gate in docs/f4-design.md section 14 applies to `f4/default`.
 `f4/threads8` is `f4` on 8 threads. `classic/certified` runs
 `groebner_basis_certified` on the classic backend, which writes a
 `sylv-gb-cert-v1` certificate, and `f4/certified` runs the same call on the

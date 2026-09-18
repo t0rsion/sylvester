@@ -1,0 +1,36 @@
+Engine and verifier baseline equivalence
+
+public_baseline,5a32b213cb83e509887f38a7b389fe1bc86d9edf
+measured_baseline,396aa0d6cc581078ce9889c78317264501cc8eb9
+scope,src (all engine and verifier source files)
+comparison,git diff --quiet public_baseline measured_baseline -- src,result=identical
+
+path,public_git_object,measured_git_object,status
+src,828b51c6e87af26ead84538ffa4a4da3f65b6cae,828b51c6e87af26ead84538ffa4a4da3f65b6cae,match
+src/compute,229ddb568a5b79c6a156d317fb6211fd53efa74a,229ddb568a5b79c6a156d317fb6211fd53efa74a,match
+src/compute/f4,0b96b96eab590eeb142dd55b58159e97a62e09a8,0b96b96eab590eeb142dd55b58159e97a62e09a8,match
+src/compute/modular,3dc9ddaaaaf1c99e0915e9545bf9350ce939ef05,3dc9ddaaaaf1c99e0915e9545bf9350ce939ef05,match
+src/cert,2f6454d295f3f173eadf4da5e2c30013d2e5c87f,2f6454d295f3f173eadf4da5e2c30013d2e5c87f,match
+src/cert/v2,9a1476aabdbc19987e7b98e8cfd9315c8cb7fbcf,9a1476aabdbc19987e7b98e8cfd9315c8cb7fbcf,match
+src/verify,52ddfbdb1df6e00fb4b0df411272479873161718,52ddfbdb1df6e00fb4b0df411272479873161718,match
+src/verify/v2,15bb21db12ea47f042186e9d08038f538e191b74,15bb21db12ea47f042186e9d08038f538e191b74,match
+src/ring,381c284b7fb611a5992d09862e4ec2627ca90ba3,381c284b7fb611a5992d09862e4ec2627ca90ba3,match
+src/lib.rs,7f203d7c17de4ec0fb1124191138adb8a000868f,7f203d7c17de4ec0fb1124191138adb8a000868f,match
+src/poly.rs,7d422f21d007d1581395131ed74bca8db8a808c0,7d422f21d007d1581395131ed74bca8db8a808c0,match
+src/ideal.rs,f4f965e3c488753e452d69774892553398552cc5,f4f965e3c488753e452d69774892553398552cc5,match
+src/normal_form.rs,66222fc4ef9581fbaf4cefd5bb7994da54265e62,66222fc4ef9581fbaf4cefd5bb7994da54265e62,match
+src/hilbert.rs,ddc465c2f4302e52ae9ac1b5cdf7c4bec27aaabc,ddc465c2f4302e52ae9ac1b5cdf7c4bec27aaabc,match
+
+The full source tree hash and every listed engine, ring, polynomial, and
+verifier subtree hash match. The measured baseline commit is retained in
+the timing provenance. The public baseline differs only in release
+metadata outside src. The changed paths are:
+
+```text
+CITATION.cff
+Cargo.lock
+Cargo.toml
+benchmarks/gb-comparison/runner/Cargo.lock
+crates/sylvester-cli/Cargo.toml
+crates/sylvester-py/Cargo.toml
+```
