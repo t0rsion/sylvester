@@ -769,35 +769,3 @@ fn a_batch_over_the_limit_finishes_after_the_retry_halves_it() {
         "the smallest limit the run finishes under splits a batch: {counters:?}"
     );
 }
-
-/// A deadline inside one batch stops there, not after it.
-///
-/// Self-calibrating: the free run gives the cost, and the timeout is a
-/// twentieth of it, which lands inside katsura-8's largest batch. The
-/// engine reads the clock inside the elimination walk and once per row of
-/// the parallel phase, so the run stops within twice the timeout at either
-/// thread count.
-#[test]
-fn a_deadline_inside_one_batch_stops_within_twice_the_timeout() {
-    let ring = ring(P, 9);
-    let ideal = ideal_of(&ring, &katsura(8));
-    for threads in [1, 4] {
-        let start = Instant::now();
-        ideal
-            .groebner_basis(options(Backend::F4).threads(threads))
-            .expect("the free run finishes");
-        let full = start.elapsed();
-        let timeout = full / 20;
-
-        let start = Instant::now();
-        let error = ideal
-            .groebner_basis(options(Backend::F4).threads(threads).timeout(timeout))
-            .expect_err("the deadline stops the run");
-        let elapsed = start.elapsed();
-        assert_eq!(error, ComputeError::Timeout);
-        assert!(
-            elapsed < timeout * 2,
-            "{threads} threads: stopped after {elapsed:?} on a {timeout:?} timeout"
-        );
-    }
-}

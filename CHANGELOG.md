@@ -3,7 +3,7 @@
 This file follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions follow [semantic versioning](https://semver.org/).
 
-## 0.4.0 (2026-09-18)
+## 0.4.0 (2026-10-03)
 
 Finite quotient algebras, polynomial arithmetic, budgeted expressions,
 division with quotients, saved computation records, and cancellation.
