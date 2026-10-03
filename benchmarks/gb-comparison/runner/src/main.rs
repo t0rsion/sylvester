@@ -343,7 +343,10 @@ fn run_prime_field(text: &str, mode: &str, threads: usize, modulus: u64) {
                 println!("VERIFY_S {verify_s}");
                 print_peak_rss();
             }
-            Err(sylvester::CertifyError::Engine(ComputeError::Timeout)) => {
+            Err(
+                sylvester::CertifyError::Engine(ComputeError::Timeout)
+                | sylvester::CertifyError::WriterExhausted(ComputeError::Timeout),
+            ) => {
                 println!("STATUS TIMEOUT");
                 println!("TIME_S {elapsed}");
                 print_peak_rss();

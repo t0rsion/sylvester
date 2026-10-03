@@ -124,6 +124,21 @@ impl Ideal<PrimeField> {
 }
 
 impl Ideal<Rationals> {
+    /// Check that a candidate is the reduced basis of this input ideal.
+    ///
+    /// The check tracks exact origin cofactors over `Q` and tests both
+    /// ideal inclusions. It retains the input, basis, and origin witnesses.
+    /// This is a library check, not an independent certificate. It can be
+    /// much more expensive than the multimodular computation; a finite
+    /// budget is appropriate for inputs of unknown cost.
+    pub fn check_basis_equality(
+        &self,
+        basis: &GroebnerBasis<Rationals>,
+        budget: Budget,
+    ) -> Result<crate::RationalEqualityCheck, crate::EqualityCheckError> {
+        crate::rational_check::check_basis(&self.ring, &self.generators, basis, budget)
+    }
+
     /// Compute the reduced Gröbner basis under grevlex.
     ///
     /// The engine is multimodular: it clears the denominators of the

@@ -52,7 +52,12 @@ jobs:
             echo "the raw benchmark record is tracked"
             exit 1
           fi
-          LOCAL_PATHS='(/home/|/Users/)'
+          PRIVATE_DOCS='(^|/)(AGENTS|CLAUDE|PLAN)\.md$'
+          if git ls-files | grep -E "$PRIVATE_DOCS"; then
+            echo "a private planning document is tracked"
+            exit 1
+          fi
+          LOCAL_PATHS='(/home/|/Users/|[A-Za-z]:[/\\]+Users[/\\])'
           EMAIL='[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'
           if git grep -n -I -E "$LOCAL_PATHS" -- \
             ':!Cargo.lock' ':!.github/workflows/ci.yml'; then
@@ -80,6 +85,8 @@ jobs:
           python3 -c 'import json, sys; data = json.load(open(sys.argv[1])); sys.exit(bool(data["results"]))' \
             "$RUNNER_TEMP/detect-secrets.json"
       - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          arguments: --workspace --all-features
 
   test:
     strategy:
@@ -132,7 +139,7 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - uses: dtolnay/rust-toolchain@1.92.0
-      - run: python -m pip install "maturin>=1.11,<2" pytest
+      - run: python -m pip install "maturin>=1.12,<2" pytest
       - run: maturin build --release --locked --out dist
         working-directory: crates/sylvester-py
       - name: Install the wheel
@@ -149,7 +156,7 @@ jobs:
         with:
           python-version: "3.14"
       - uses: dtolnay/rust-toolchain@1.92.0
-      - run: python -m pip install "maturin>=1.11,<2" pytest
+      - run: python -m pip install "maturin>=1.12,<2" pytest
       - name: Build the wheel and source distribution
         working-directory: crates/sylvester-py
         run: |
@@ -158,8 +165,19 @@ jobs:
       - name: Test the installed wheel
         run: |
           python -m venv "$RUNNER_TEMP/wheel-venv"
-          "$RUNNER_TEMP/wheel-venv/bin/python" -m pip install pytest "$RUNNER_TEMP"/dist/*.whl
+          "$RUNNER_TEMP/wheel-venv/bin/python" -m pip install pytest
+          "$RUNNER_TEMP/wheel-venv/bin/python" -m pip install --no-index --no-deps "$RUNNER_TEMP"/dist/*.whl
           cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/wheel-venv/bin/python" - <<'PY'
+          from importlib import metadata
+
+          import sylvester
+
+          assert metadata.version("sylvester") == sylvester.__version__
+          ring = sylvester.PolynomialRing.prime_field(32003, ["x"])
+          basis = ring.ideal([ring.parse("x^2 + 1")]).groebner_basis()
+          assert str(basis[0]) == "x^2 + 1"
+          PY
           "$RUNNER_TEMP/wheel-venv/bin/python" -m pytest "$GITHUB_WORKSPACE/crates/sylvester-py/tests"
       - name: Test the installed source distribution
         run: |
@@ -167,3 +185,18 @@ jobs:
           "$RUNNER_TEMP/sdist-venv/bin/python" -m pip install pytest "$RUNNER_TEMP"/dist/*.tar.gz
           cd "$RUNNER_TEMP"
           "$RUNNER_TEMP/sdist-venv/bin/python" -m pytest "$GITHUB_WORKSPACE/crates/sylvester-py/tests"
+
+  python-sympy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@1.92.0
+      - name: Install the optional extra
+        working-directory: crates/sylvester-py
+        run: python -m pip install ".[sympy]" pytest
+      - name: Test the optional adapter
+        working-directory: crates/sylvester-py
+        run: python -m pytest tests/test_sympy.py

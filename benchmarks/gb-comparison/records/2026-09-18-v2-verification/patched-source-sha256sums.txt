@@ -1,0 +1,5 @@
+37e4176e65fdde9428b6b8bc1aa917e3dc9f6b7917d6fd322a4bc7805bd5b6cc  src/verify/v2/arith.rs
+96b4087cebfc1773eaec453f75e7df476f62b5272f898a4830e00bea26c12b37  src/verify/v2/decode.rs
+90e64540e33bfb356c6d20c8877d1a9e067c1b8e211769ad6fe0f161794af13e  src/verify/v2/replay.rs
+3912e3e7f6adc2e75ce506f83032ebc1247b87429490bdb32b85cd985cd084fe  src/verify/v2/witness.rs
+59ee7684a64e659d7ec956cf792998a76df4408cf40e03bd8f3f017588db5461  tests/verifier_performance.rs

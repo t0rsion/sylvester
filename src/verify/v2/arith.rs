@@ -127,6 +127,7 @@ impl Mono {
     /// [`Exp`] and then tested.
     pub(super) fn mul(&self, other: &Mono) -> Result<Mono, VerifyError> {
         let mut entries = Vec::with_capacity(self.entries.len() + other.entries.len());
+        let mut degree = 0;
         let (mut i, mut j) = (0, 0);
         while i < self.entries.len() || j < other.entries.len() {
             let left = self.entries.get(i).copied();
@@ -154,40 +155,95 @@ impl Mono {
             if u64::from(entry.1) > MAX_EXP {
                 return Err(VerifyError::ExponentOverflow { max: MAX_EXP });
             }
+            degree += u64::from(entry.1);
             entries.push(entry);
         }
-        Ok(Mono::from_support(entries))
+        Ok(Mono { entries, degree })
+    }
+
+    /// Report whether the product equals `target` without allocating it.
+    ///
+    /// The merge visits every product entry before returning, so an
+    /// exponent overflow has the same precedence as [`Mono::mul`].
+    pub(super) fn mul_matches(
+        &self,
+        other: &Mono,
+        target: &Mono,
+    ) -> Result<(bool, usize), VerifyError> {
+        let mut matches = self.degree + other.degree == target.degree;
+        let mut target_index = 0;
+        let mut support = 0;
+        let (mut i, mut j) = (0, 0);
+        while i < self.entries.len() || j < other.entries.len() {
+            let left = self.entries.get(i).copied();
+            let right = other.entries.get(j).copied();
+            let entry = match (left, right) {
+                (Some(a), Some(b)) if a.0 == b.0 => {
+                    i += 1;
+                    j += 1;
+                    (a.0, a.1 + b.1)
+                }
+                (Some(a), Some(b)) if a.0 < b.0 => {
+                    i += 1;
+                    a
+                }
+                (Some(a), None) => {
+                    i += 1;
+                    a
+                }
+                (_, Some(b)) => {
+                    j += 1;
+                    b
+                }
+                (None, None) => unreachable!("the loop runs while one side has entries"),
+            };
+            if u64::from(entry.1) > MAX_EXP {
+                return Err(VerifyError::ExponentOverflow { max: MAX_EXP });
+            }
+            support += 1;
+            match target.entries.get(target_index) {
+                Some(expected) if *expected == entry => target_index += 1,
+                _ => matches = false,
+            }
+        }
+        Ok((matches && target_index == target.entries.len(), support))
     }
 
     /// The least common multiple of the two monomials.
     pub(super) fn lcm(&self, other: &Mono) -> Mono {
         let mut entries = Vec::with_capacity(self.entries.len() + other.entries.len());
+        let mut degree = 0;
         let (mut i, mut j) = (0, 0);
         while i < self.entries.len() || j < other.entries.len() {
             let left = self.entries.get(i).copied();
             let right = other.entries.get(j).copied();
             match (left, right) {
                 (Some(a), Some(b)) if a.0 == b.0 => {
-                    entries.push((a.0, a.1.max(b.1)));
+                    let entry = (a.0, a.1.max(b.1));
+                    degree += u64::from(entry.1);
+                    entries.push(entry);
                     i += 1;
                     j += 1;
                 }
                 (Some(a), Some(b)) if a.0 < b.0 => {
+                    degree += u64::from(a.1);
                     entries.push(a);
                     i += 1;
                 }
                 (Some(a), None) => {
+                    degree += u64::from(a.1);
                     entries.push(a);
                     i += 1;
                 }
                 (_, Some(b)) => {
+                    degree += u64::from(b.1);
                     entries.push(b);
                     j += 1;
                 }
                 (None, None) => unreachable!("the loop runs while one side has entries"),
             }
         }
-        Mono::from_support(entries)
+        Mono { entries, degree }
     }
 
     /// Divide this monomial by one that divides it.
@@ -196,6 +252,7 @@ impl Mono {
     /// go below zero.
     pub(super) fn divide(&self, divisor: &Mono) -> Mono {
         let mut entries = Vec::with_capacity(self.entries.len());
+        let mut degree = 0;
         let mut j = 0;
         for &(var, exp) in &self.entries {
             while j < divisor.entries.len() && divisor.entries[j].0 < var {
@@ -209,10 +266,12 @@ impl Mono {
                 _ => 0,
             };
             if exp > taken {
-                entries.push((var, exp - taken));
+                let entry = (var, exp - taken);
+                degree += u64::from(entry.1);
+                entries.push(entry);
             }
         }
-        Mono::from_support(entries)
+        Mono { entries, degree }
     }
 
     /// The exponent vector, one entry per variable.
@@ -340,6 +399,7 @@ pub(super) fn mono_mul(a: &Poly, mono: &Mono, meter: &mut Meter) -> Result<Poly,
 /// Each comparison charges the support sizes of its two operands, which
 /// section 8.1 requires. A term list of wide monomials therefore costs more
 /// than its term count.
+#[cfg(test)]
 pub(super) fn add(
     a: &Poly,
     b: &Poly,
@@ -381,7 +441,291 @@ pub(super) fn add(
     Ok(Poly::new(terms))
 }
 
+struct OwnedMerger<'a> {
+    left: std::vec::IntoIter<Term>,
+    right: std::vec::IntoIter<Term>,
+    a_term: Option<Term>,
+    b_term: Option<Term>,
+    terms: Vec<Term>,
+    modulus: u64,
+    meter: &'a mut Meter,
+    consumed: usize,
+}
+
+impl<'a> OwnedMerger<'a> {
+    fn new(a: Poly, b: Poly, modulus: u64, meter: &'a mut Meter, room: usize) -> Self {
+        let mut left = a.terms.into_iter();
+        let mut right = b.terms.into_iter();
+        let a_term = left.next();
+        let b_term = right.next();
+        OwnedMerger {
+            left,
+            right,
+            a_term,
+            b_term,
+            terms: Vec::with_capacity(room),
+            modulus,
+            meter,
+            consumed: 0,
+        }
+    }
+
+    fn run(mut self) -> Result<Poly, VerifyError> {
+        while self.a_term.is_some() && self.b_term.is_some() {
+            self.step()?;
+        }
+        self.finish()?;
+        Ok(Poly::new(self.terms))
+    }
+
+    fn step(&mut self) -> Result<(), VerifyError> {
+        poll_terms(self.meter, self.consumed)?;
+        let left = self.a_term.as_ref().expect("the term is present");
+        let right = self.b_term.as_ref().expect("the term is present");
+        charge_monos(self.meter, &left.mono, &right.mono)?;
+        match left.mono.cmp_grevlex(&right.mono) {
+            Ordering::Greater => {
+                self.terms
+                    .push(self.a_term.take().expect("the term is present"));
+                self.consumed += 1;
+            }
+            Ordering::Less => {
+                self.terms
+                    .push(self.b_term.take().expect("the term is present"));
+                self.consumed += 1;
+            }
+            Ordering::Equal => {
+                let left = self.a_term.take().expect("the term is present");
+                let right = self.b_term.take().expect("the term is present");
+                let coeff = add_mod(left.coeff, right.coeff, self.modulus);
+                self.consumed += 2;
+                if coeff != 0 {
+                    self.terms.push(Term {
+                        coeff,
+                        mono: left.mono,
+                    });
+                }
+            }
+        }
+        self.advance();
+        Ok(())
+    }
+
+    fn advance(&mut self) {
+        if self.a_term.is_none() {
+            self.a_term = self.left.next();
+        }
+        if self.b_term.is_none() {
+            self.b_term = self.right.next();
+        }
+    }
+
+    fn finish(&mut self) -> Result<(), VerifyError> {
+        if let Some(term) = self.a_term.take() {
+            poll_terms(self.meter, self.consumed + 1)?;
+            self.terms.push(term);
+        }
+        for (index, term) in self.left.by_ref().enumerate() {
+            poll_terms(self.meter, self.consumed + index + 2)?;
+            self.terms.push(term);
+        }
+        if let Some(term) = self.b_term.take() {
+            poll_terms(self.meter, self.consumed + 1)?;
+            self.terms.push(term);
+        }
+        for (index, term) in self.right.by_ref().enumerate() {
+            poll_terms(self.meter, self.consumed + index + 2)?;
+            self.terms.push(term);
+        }
+        Ok(())
+    }
+}
+
+/// Add two owned polynomials by moving their terms into the result.
+///
+/// The charged capacity and merge order match the borrowed merge. Consuming the
+/// operands avoids cloning their monomials when a caller no longer needs
+/// them.
+pub(super) fn add_owned(
+    a: Poly,
+    b: Poly,
+    modulus: u64,
+    meter: &mut Meter,
+) -> Result<Poly, VerifyError> {
+    let room = a.term_count() + b.term_count();
+    meter.charge((room as u64).max(1))?;
+    meter.check_intermediate(room)?;
+    OwnedMerger::new(a, b, modulus, meter, room).run()
+}
+
+struct ScaledMerger<'a, 'b> {
+    left: std::vec::IntoIter<Term>,
+    right: std::slice::Iter<'b, Term>,
+    a_term: Option<Term>,
+    b_term: Option<&'b Term>,
+    terms: Vec<Term>,
+    factor: u64,
+    modulus: u64,
+    meter: &'a mut Meter,
+    consumed: usize,
+}
+
+impl<'a, 'b> ScaledMerger<'a, 'b> {
+    fn new(
+        a: Poly,
+        b: &'b Poly,
+        factor: u64,
+        modulus: u64,
+        meter: &'a mut Meter,
+        room: usize,
+    ) -> Self {
+        let mut left = a.terms.into_iter();
+        let mut right = b.terms.iter();
+        let a_term = left.next();
+        let b_term = right.next();
+        ScaledMerger {
+            left,
+            right,
+            a_term,
+            b_term,
+            terms: Vec::with_capacity(room),
+            factor,
+            modulus,
+            meter,
+            consumed: 0,
+        }
+    }
+
+    fn run(mut self) -> Result<Poly, VerifyError> {
+        while self.a_term.is_some() && self.b_term.is_some() {
+            self.step()?;
+        }
+        self.finish()?;
+        Ok(Poly::new(self.terms))
+    }
+
+    fn step(&mut self) -> Result<(), VerifyError> {
+        poll_terms(self.meter, self.consumed)?;
+        let left = self.a_term.as_ref().expect("the term is present");
+        let right = self.b_term.expect("the term is present");
+        charge_monos(self.meter, &left.mono, &right.mono)?;
+        match left.mono.cmp_grevlex(&right.mono) {
+            Ordering::Greater => {
+                self.terms
+                    .push(self.a_term.take().expect("the term is present"));
+                self.consumed += 1;
+            }
+            Ordering::Less => {
+                self.terms.push(Term {
+                    coeff: mul_mod(right.coeff, self.factor, self.modulus),
+                    mono: right.mono.clone(),
+                });
+                self.b_term = self.right.next();
+                self.consumed += 1;
+            }
+            Ordering::Equal => {
+                let left = self.a_term.take().expect("the term is present");
+                let coeff = add_mod(
+                    left.coeff,
+                    mul_mod(right.coeff, self.factor, self.modulus),
+                    self.modulus,
+                );
+                if coeff != 0 {
+                    self.terms.push(Term {
+                        coeff,
+                        mono: left.mono,
+                    });
+                }
+                self.b_term = self.right.next();
+                self.consumed += 2;
+            }
+        }
+        if self.a_term.is_none() {
+            self.a_term = self.left.next();
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<(), VerifyError> {
+        if let Some(term) = self.a_term.take() {
+            poll_terms(self.meter, self.consumed + 1)?;
+            self.terms.push(term);
+        }
+        for (index, term) in self.left.by_ref().enumerate() {
+            poll_terms(self.meter, self.consumed + index + 2)?;
+            self.terms.push(term);
+        }
+        if let Some(term) = self.b_term.take() {
+            poll_terms(self.meter, self.consumed + 1)?;
+            self.terms.push(Term {
+                coeff: mul_mod(term.coeff, self.factor, self.modulus),
+                mono: term.mono.clone(),
+            });
+        }
+        for (index, term) in self.right.by_ref().enumerate() {
+            poll_terms(self.meter, self.consumed + index + 2)?;
+            self.terms.push(Term {
+                coeff: mul_mod(term.coeff, self.factor, self.modulus),
+                mono: term.mono.clone(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Add a scaled borrowed polynomial to an owned polynomial.
+///
+/// The scale and add charges and capacity checks run as separate operations.
+/// Their term storage is fused, so the scaled operand is not allocated.
+pub(super) fn add_scaled_owned(
+    a: Poly,
+    b: &Poly,
+    factor: u64,
+    modulus: u64,
+    meter: &mut Meter,
+) -> Result<Poly, VerifyError> {
+    let left_count = a.term_count();
+    let right_count = b.term_count();
+    meter.charge((right_count as u64).max(1))?;
+    meter.check_intermediate(right_count)?;
+    let room = left_count + right_count;
+    meter.charge((room as u64).max(1))?;
+    meter.check_intermediate(room)?;
+    ScaledMerger::new(a, b, factor, modulus, meter, room).run()
+}
+
+/// Scale an owned polynomial in place.
+///
+/// The charge and result cap match [`scale`]. The existing term storage is
+/// reused because the caller transfers ownership of the source.
+pub(super) fn scale_owned(
+    mut a: Poly,
+    factor: u64,
+    modulus: u64,
+    meter: &mut Meter,
+) -> Result<Poly, VerifyError> {
+    meter.charge((a.term_count() as u64).max(1))?;
+    meter.check_intermediate(a.term_count())?;
+    for (index, term) in a.terms.iter_mut().enumerate() {
+        poll_terms(meter, index)?;
+        term.coeff = mul_mod(term.coeff, factor, modulus);
+    }
+    Ok(a)
+}
+
+/// Subtract two owned polynomials with the contract's scale and add steps.
+pub(super) fn sub_owned(
+    a: Poly,
+    b: Poly,
+    modulus: u64,
+    meter: &mut Meter,
+) -> Result<Poly, VerifyError> {
+    let negated = scale_owned(b, modulus - 1, modulus, meter)?;
+    add_owned(a, negated, modulus, meter)
+}
+
 /// Subtract `b` from `a`, by adding `b` scaled by `p - 1`.
+#[cfg(test)]
 pub(super) fn sub(
     a: &Poly,
     b: &Poly,
@@ -526,6 +870,35 @@ mod tests {
     }
 
     #[test]
+    fn a_product_match_checks_overflow_after_a_mismatch() {
+        let left = mono(&[(0, 2), (1, 65535)]);
+        let right = mono(&[(0, 1), (1, 1)]);
+        let target = mono(&[(0, 4)]);
+        assert_eq!(
+            left.mul_matches(&right, &target),
+            Err(VerifyError::ExponentOverflow { max: MAX_EXP })
+        );
+    }
+
+    #[test]
+    fn a_product_match_reports_the_product() {
+        let left = mono(&[(0, 2), (1, 1)]);
+        let right = mono(&[(1, 3)]);
+        let target = mono(&[(0, 2), (1, 4)]);
+        assert!(
+            left.mul_matches(&right, &target)
+                .expect("the exponents fit")
+                .0
+        );
+        assert!(
+            !left
+                .mul_matches(&right, &mono(&[(0, 2), (1, 3)]))
+                .expect("the exponents fit")
+                .0
+        );
+    }
+
+    #[test]
     fn lcm_and_divide_invert_each_other() {
         let a = mono(&[(0, 2), (1, 1)]);
         let b = mono(&[(1, 3)]);
@@ -556,6 +929,70 @@ mod tests {
         ]);
         let mut meter = meter();
         assert!(sub(&f, &f, 7, &mut meter).expect("the caps hold").is_zero());
+    }
+
+    #[test]
+    fn owned_add_matches_the_borrowed_merge() {
+        let a = Poly::new(vec![
+            Term {
+                coeff: 3,
+                mono: mono(&[(0, 2)]),
+            },
+            Term {
+                coeff: 5,
+                mono: mono(&[(0, 1)]),
+            },
+        ]);
+        let b = Poly::new(vec![
+            Term {
+                coeff: 4,
+                mono: mono(&[(0, 1)]),
+            },
+            Term {
+                coeff: 2,
+                mono: Mono::from_support(Vec::new()),
+            },
+        ]);
+        let expected = add(&a, &b, 7, &mut meter()).expect("the caps hold");
+        let actual = add_owned(a, b, 7, &mut meter()).expect("the caps hold");
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn scaled_owned_add_matches_scale_then_add() {
+        let a = Poly::new(vec![Term {
+            coeff: 3,
+            mono: mono(&[(0, 2)]),
+        }]);
+        let b = Poly::new(vec![
+            Term {
+                coeff: 4,
+                mono: mono(&[(0, 2)]),
+            },
+            Term {
+                coeff: 2,
+                mono: Mono::from_support(Vec::new()),
+            },
+        ]);
+        let scaled = scale(&b, 5, 7, &mut meter()).expect("the caps hold");
+        let expected = add(&a, &scaled, 7, &mut meter()).expect("the caps hold");
+        let actual = add_scaled_owned(a, &b, 5, 7, &mut meter()).expect("the caps hold");
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn owned_sub_matches_the_borrowed_subtraction() {
+        let a = Poly::new(vec![Term {
+            coeff: 3,
+            mono: mono(&[(0, 2)]),
+        }]);
+        let b = Poly::new(vec![Term {
+            coeff: 5,
+            mono: mono(&[(0, 2)]),
+        }]);
+        let expected = sub(&a, &b, 7, &mut meter()).expect("the caps hold");
+        let actual = sub_owned(a, b, 7, &mut meter()).expect("the caps hold");
+        assert_eq!(actual, expected);
     }
 
     #[test]

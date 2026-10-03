@@ -72,25 +72,27 @@ pub(crate) enum F4Error {
 /// every [`TICK`] of them.
 const TICK: u32 = 64;
 
-/// The deadline and the cancellation flag of one run, checked at a fixed
+/// The deadline and cancellation flags of one run, checked at a fixed
 /// cadence.
 ///
 /// [`Deadline::tick`] is what a loop calls per item. It reads the clock
 /// once every [`TICK`] calls. [`Deadline::check`] reads it at once and is
 /// what the run loop calls between batches. A cancelled run stops at the
-/// same cadence, so the flag stops it within [`TICK`] items of being set.
+/// same cadence, so either flag stops it within [`TICK`] items of being set.
 pub(crate) struct Deadline {
     at: Option<Instant>,
     cancel: Option<Arc<AtomicBool>>,
+    external_cancel: Option<Arc<AtomicBool>>,
     ticks: u32,
 }
 
 impl Deadline {
-    /// The deadline and the cancellation flag of `limits`.
+    /// The deadline and cancellation flags of `limits`.
     pub(crate) fn of(limits: &ComputeLimits) -> Self {
         Deadline {
             at: limits.deadline,
             cancel: limits.cancel.clone(),
+            external_cancel: limits.external_cancel.clone(),
             ticks: 0,
         }
     }
@@ -101,6 +103,7 @@ impl Deadline {
         Deadline {
             at: None,
             cancel: None,
+            external_cancel: None,
             ticks: 0,
         }
     }
@@ -108,7 +111,7 @@ impl Deadline {
     /// Count one item, and check the clock every [`TICK`] items.
     #[inline]
     pub(crate) fn tick(&mut self) -> Result<(), F4Error> {
-        if self.at.is_none() && self.cancel.is_none() {
+        if self.at.is_none() && self.cancel.is_none() && self.external_cancel.is_none() {
             return Ok(());
         }
         self.ticks += 1;
@@ -119,24 +122,31 @@ impl Deadline {
         self.check()
     }
 
-    /// A deadline at the same instant, with the same cancellation flag.
+    /// A deadline at the same instant, with the same cancellation flags.
     ///
     /// The parallel phase of the kernel builds one per worker, because a
-    /// worker counts its own items. A worker reads the flag, so cancelling
+    /// worker counts its own items. A worker reads both flags, so cancelling
     /// a run stops it inside a parallel batch too.
     pub(crate) fn fork(&self) -> Self {
         Deadline {
             at: self.at,
             cancel: self.cancel.clone(),
+            external_cancel: self.external_cancel.clone(),
             ticks: 0,
         }
     }
 
-    /// Check the flag and the clock now.
+    /// Check the flags and the clock now.
     pub(crate) fn check(&mut self) -> Result<(), F4Error> {
-        if let Some(flag) = &self.cancel
-            && flag.load(Ordering::Relaxed)
-        {
+        let cancelled = self
+            .cancel
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+            || self
+                .external_cancel
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::Relaxed));
+        if cancelled {
             return Err(F4Error::Cancelled);
         }
         match self.at {
@@ -1062,5 +1072,25 @@ mod tests {
         assert_eq!(Width::for_exponent(32767), Width::W16);
         assert_eq!(Width::for_exponent(32768), Width::W32);
         assert_eq!(Width::for_exponent(MAX_EXPONENT), Width::W32);
+    }
+
+    #[test]
+    fn an_external_cancellation_flag_reaches_every_f4_deadline() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let limits = ComputeLimits {
+            external_cancel: Some(Arc::clone(&flag)),
+            ..ComputeLimits::default()
+        };
+        let mut clock = Deadline::of(&limits);
+        for _ in 0..TICK {
+            assert_eq!(clock.tick(), Ok(()));
+        }
+        flag.store(true, Ordering::Relaxed);
+        for _ in 0..TICK - 1 {
+            assert_eq!(clock.tick(), Ok(()));
+        }
+        assert_eq!(clock.tick(), Err(F4Error::Cancelled));
+        let mut fork = clock.fork();
+        assert_eq!(fork.check(), Err(F4Error::Cancelled));
     }
 }

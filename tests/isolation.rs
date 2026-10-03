@@ -2,7 +2,7 @@
 //!
 //! Both verifier trees are code-isolated from the engines. The scan reads
 //! every file under `src/verify` and fails on an import the isolation
-//! rule forbids. `AGENTS.md` states the rule; this test is what holds it.
+//! rule forbids. The certificate specifications state the rule.
 //!
 //! The scan holds two more rules, both from `docs/rational-design.md`. The
 //! verifier gains no dependency (section 10): `crate::ring::rational` and
@@ -23,6 +23,10 @@ fn the_verifier_shares_no_code_with_the_engines() {
         "crate::ideal",
         "crate::normal_form",
         "crate::hilbert",
+        "crate::arithmetic",
+        "crate::quotient",
+        "crate::result",
+        "crate::rational_check",
         "crate::compute::modular",
         "use super::super",
         "serde",

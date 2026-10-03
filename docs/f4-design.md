@@ -24,8 +24,9 @@ most 256 variables. One exponent is at most 65,535.
 F4 is the default. Classic F5 remains the independent engine oracle and
 the v1 certificate producer.
 
-This release does not add rational arithmetic, runtime monomial orders,
-user-defined pair criteria, or new coefficient domains.
+The F4 backend operates over prime fields. It does not provide rational
+arithmetic, runtime monomial orders, user-defined pair criteria, or
+additional coefficient domains.
 
 ## 2. Public contract
 

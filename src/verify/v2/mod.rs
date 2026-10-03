@@ -81,7 +81,7 @@ pub fn verify_with_limits(bytes: &[u8], limits: &Limits) -> Result<VerifiedGb, V
     if !matches!(&outcome, Err(error) if error.is_exhaustion()) {
         limits.check_deadline()?;
     }
-    Ok(crate::verify::from_v2(outcome?))
+    crate::verify::from_v2(outcome?, limits)
 }
 
 /// Run the nine obligations of section 7, in order.

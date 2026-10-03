@@ -4,7 +4,8 @@
 reduced Gröbner bases under grevlex, over a prime field or over the
 rational numbers. It also certifies a prime-field basis, checks certificate
 bytes with the independent verifier, reduces a polynomial modulo a basis,
-and reads the Hilbert series and the Krull dimension of a basis.
+inspects finite quotient algebras, and reads the Hilbert series and the Krull
+dimension of a basis.
 
 Install the binary from crates.io:
 
@@ -30,6 +31,8 @@ sylv normal-form --basis basis.text --poly "x^2*y - 1"
 sylv member --basis basis.text --poly-file f.text
 sylv hilbert system.ms
 sylv dim system.ms --from-basis
+sylv quotient system.text
+sylv quotient system.text --matrix x --characteristic x --minimal x
 ```
 
 `gb` takes `--certified` to run the certified path, and `--certificate
@@ -38,10 +41,20 @@ on. `nf` is the short name of `normal-form`, and `basis` of `gb`.
 Over `Q`, the default stopping rule is `contains-input`. Pass `--stop
 unchanged` only when the weaker claim is sufficient.
 
+Over `Q`, `gb --check-equality` runs the bounded exact check after the
+multimodular computation. It reports `# equality_check: passed` in text
+output and records `equals_input` in JSON. The check is separate from the
+multimodular `Established` claim. A quotient from `--from-basis` can use
+the same option when its JSON record carries the original input.
+
 `normal-form` and `member` take the basis and the polynomial from separate
 sources. The basis goes through the checked constructor, so a list that is
 not a reduced Gröbner basis is rejected with the check that failed. At most
 one source reads standard input.
+
+`normal-form --quotients` prints one labeled quotient for every basis element,
+then the remainder. Parenthesized expressions, unary signs, and exact
+fractions are accepted by `--poly` and by expression fields in input formats.
 
 `hilbert` computes a basis from generators. With `--from-basis` it reads a
 basis instead, and then `--backend`, `--threads`, `--stop`, and
@@ -49,15 +62,26 @@ basis instead, and then `--backend`, `--threads`, `--stop`, and
 any of them is a usage error. `dim` prints the `dimension:` line of the
 same output.
 
+`quotient` computes a basis, or checks one with `--from-basis`, then builds
+its finite quotient algebra. With no operation flag it prints the dimension
+and standard monomials. `--standard-monomials` and `--dimension` select those
+lines independently. `--matrix`, `--characteristic`, and `--minimal` apply a
+polynomial to the quotient. A positive-dimensional quotient returns exit code
+3 with a typed nonfinite error. The output uses labeled text lines.
+
 `--timeout SECS` covers the whole command, not one library call. The binary
 takes an instant when it starts and hands the remaining time to every call
-it makes. `--memory BYTES` is the limit on the live data of each call.
+it makes. `--memory BYTES` limits estimated live working data for the command,
+including retained source and parsed input buffers. Bare decimal integers
+remain valid; binary suffixes such as `512MiB` and decimal suffixes such as
+`2MB` are also accepted. `--progress` writes named phases to standard error
+without changing standard output. `--no-progress` suppresses them.
 
 ## Formats
 
-`--in-format` and `--out-format` name one of three formats. A file with no
-format option takes the format of its extension: `ms`, `syl`, `sylq`,
-`txt`, or `text`. Standard input takes `text`. Any other extension is a
+`--in-format` and `--out-format` name one of four formats. A file with no
+format option takes the format of its extension: `ms`, `syl`, `sylq`, `txt`,
+`text`, or `json`. Standard input takes `text`. Any other extension is a
 usage error rather than a guess.
 
 - `ms`, the msolve input format: a line of comma-separated variable names,
@@ -74,6 +98,11 @@ usage error rather than a guess.
   `# coefficients: rationals` line, then one polynomial per line in the
   syntax `PolynomialRing::parse_polynomial` reads and `Display` writes. It
   is the default output format, and it reads back through `sylv`.
+- `json`, a `sylv-result-v1` computation record. It stores the ring, original
+  input, basis, an untrusted provenance claim, and optional certificate bytes.
+  `gb` writes this format with `--out-format json`; loading it does not trust
+  the claim or certificate. `verify` rechecks an attached prime-field
+  certificate and matches its full input and basis before accepting it.
 
 `hilbert` and `dim` write their own schema: a `series:` line with the
 numerator coefficients low degree first, a `denominator_power:` line, a
@@ -108,7 +137,8 @@ and F4 writes `sylv-gb-cert-v2`. There is no certified path over `Q`, so
 `--max-bytes` applies before the file is read. A certificate carries no
 variable names, so the basis prints under the synthetic names `x1 .. xn`,
 and the notice about that goes to standard error, where it cannot corrupt
-the output for the next tool.
+the output for the next tool. A JSON computation record carries variable names;
+`verify` uses them only after independent certificate verification.
 
 ## Exit codes
 

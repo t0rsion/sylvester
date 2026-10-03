@@ -98,7 +98,10 @@ pub fn verify_with_limits(bytes: &[u8], limits: &Limits) -> Result<VerifiedGb, V
     match bytes.first().copied() {
         Some(V1_FIRST) => verify_v1(bytes, limits),
         Some(v2::MAGIC_FIRST) => v2::verify_with_limits(bytes, limits),
-        first => Err(VerifyError::Format { first }),
+        first => {
+            limits.check_deadline()?;
+            Err(VerifyError::Format { first })
+        }
     }
 }
 
@@ -119,30 +122,59 @@ fn verify_v1(bytes: &[u8], limits: &Limits) -> Result<VerifiedGb, VerifyError> {
 }
 
 /// Convert an accepted v2 value without sharing any verifier arithmetic.
-fn from_v2(accepted: v2::Accepted) -> VerifiedGb {
-    fn polys(raw: Vec<v2::DensePoly>) -> Vec<Poly> {
-        raw.into_iter()
-            .map(|terms| {
-                Poly::new(
-                    terms
-                        .into_iter()
-                        .map(|(coeff, exps)| Term::new(coeff, Mono::new(exps)))
-                        .collect(),
-                )
-            })
-            .collect()
-    }
-    VerifiedGb {
+fn from_v2(accepted: v2::Accepted, limits: &Limits) -> Result<VerifiedGb, VerifyError> {
+    let mut ticker = limits.ticker();
+    ticker.now()?;
+    let verified = VerifiedGb {
         modulus: accepted.modulus,
         nvars: accepted.nvars,
-        input: polys(accepted.input),
-        basis: polys(accepted.basis),
+        input: convert_v2_polynomials(accepted.input, &mut ticker)?,
+        basis: convert_v2_polynomials(accepted.basis, &mut ticker)?,
+    };
+    ticker.now()?;
+    Ok(verified)
+}
+
+fn convert_v2_polynomials(
+    raw: Vec<v2::DensePoly>,
+    ticker: &mut limits::Ticker,
+) -> Result<Vec<Poly>, VerifyError> {
+    let mut polynomials = Vec::with_capacity(raw.len());
+    for terms in raw {
+        ticker.step()?;
+        let mut converted = Vec::with_capacity(terms.len());
+        for (coefficient, exponents) in terms {
+            ticker.step()?;
+            converted.push(Term::new(coefficient, Mono::new(exponents)));
+        }
+        polynomials.push(Poly::new(converted));
     }
+    Ok(polynomials)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn v2_conversion_checks_cancellation_after_the_obligations() {
+        let accepted = v2::Accepted {
+            modulus: 7,
+            nvars: 0,
+            input: Vec::new(),
+            basis: Vec::new(),
+        };
+        let limits = Limits {
+            cancellation: Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                true,
+            ))),
+            ..Limits::default()
+        };
+        assert_eq!(
+            from_v2(accepted, &limits),
+            Err(VerifyError::DeadlineExceeded)
+        );
+    }
 
     const UNIT_IDEAL: &str = concat!(
         r#"{"schema":"sylv-gb-cert-v1","order":"grevlex-v1","modulus":7,"nvars":2,"#,

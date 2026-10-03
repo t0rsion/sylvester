@@ -206,6 +206,16 @@ engine finishes or returns `ComputeError::Timeout` on a 1 MiB worker stack.
 No isolated patch explains the repair. The API rebuild replaced the affected
 control flow before a debugger identified one routine.
 
+### Certified writer deadline classification
+
+The 2026-09-18 benchmark refresh reached the typed
+`CertifyError::WriterExhausted(ComputeError::Timeout)` result on four certified cells.
+The measured runner mapped engine timeouts and verifier exhaustion to DNF, but
+classified a writer-wrapped timeout as `ERROR`. The release runner now maps
+this typed timeout to DNF. The measured record preserves its raw status. These
+cells have no basis output and cause no correctness mismatch. They are resource
+ceilings, not engine defects.
+
 ## Other fixed defects
 
 - `SparseMatrix::image_basis` returned a basis of the row space, not the

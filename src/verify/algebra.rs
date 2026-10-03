@@ -440,8 +440,10 @@ fn merge(
             }
         }
     }
-    out.extend(low.drain(i..));
-    out.extend(high.drain(j..));
+    for term in low.drain(i..).chain(high.drain(j..)) {
+        budget.step()?;
+        out.push(term);
+    }
     Ok(out)
 }
 
@@ -522,6 +524,23 @@ mod tests {
                 .map(|(c, e)| Term::new(*c, mono(e)))
                 .collect::<Vec<_>>(),
         )
+    }
+
+    #[test]
+    fn a_merge_tail_observes_its_deadline() {
+        let mut budget = Limits {
+            deadline: Some(std::time::Instant::now()),
+            ..Limits::default()
+        }
+        .budget(2);
+        let tail = (0..crate::verify::limits::WORK_STRIDE)
+            .rev()
+            .map(|exponent| Term::new(1, mono(&[exponent as u32, 0])))
+            .collect();
+        assert_eq!(
+            merge(Vec::new(), tail, 7, &mut budget, 0),
+            Err(VerifyError::DeadlineExceeded)
+        );
     }
 
     #[test]

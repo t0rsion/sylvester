@@ -702,11 +702,14 @@ fn tail<T>(row: &[T]) -> &[T] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compute::ComputeLimits;
+    use crate::compute::f4::TICK;
     use crate::compute::f4::field::Small31;
     use crate::compute::f4::matrix::build;
     use crate::compute::f4::matrix::fixture::{Case, Row, fixture};
     use crate::compute::f4::trace::NoTrace;
     use crate::compute::f4::trace::{BatchRows, Insertion, Returned};
+    use std::time::Instant;
 
     const SMALL_P: u32 = 101;
     const BENCH_P: u32 = 1073741827;
@@ -1231,5 +1234,114 @@ mod tests {
         assert_eq!(rows[0].vals, [1, SMALL_P - 10]);
         assert_eq!(rows[1].cols, [1, 2]);
         assert_eq!(rows[1].vals, [1, 2]);
+    }
+
+    /// A deadline that has already passed when the clock is first read.
+    fn passed_deadline() -> Deadline {
+        Deadline::of(&ComputeLimits {
+            deadline: Some(Instant::now()),
+            ..ComputeLimits::default()
+        })
+    }
+
+    /// The walk starts one column past a stride boundary, so its first
+    /// read of the clock falls inside the row. A walk that read the clock
+    /// only between rows would finish this one.
+    #[test]
+    fn a_passed_deadline_stops_the_walk_inside_one_row() {
+        let field = Small31::new(SMALL_P);
+        let case = Case {
+            p: SMALL_P,
+            ncols: 1,
+            pivot_cols: vec![0],
+            upper: vec![Row {
+                cols: vec![0],
+                vals: vec![1],
+            }],
+            lower: Vec::new(),
+        };
+        let mut held = fixture(&case, &field);
+        let (_, sources) = held.split();
+        let ncols = 2 * WALK_STRIDE;
+        let mut acc = vec![0u64; ncols];
+        let pivot_at = vec![NO_ROW; ncols];
+        let (mut cols, mut vals) = (Vec::new(), Vec::new());
+        let mut walk_with = |clock: &mut Deadline| {
+            let mut state = WalkState {
+                trace: &mut NoTrace,
+                acc: &mut acc,
+                pivot_at: &pivot_at,
+                cols_out: &mut cols,
+                vals_out: &mut vals,
+                clock,
+            };
+            walk(&Batch::default(), sources, &field, 1, &mut state)
+        };
+        assert_eq!(walk_with(&mut Deadline::none()), Ok(()));
+        assert_eq!(walk_with(&mut passed_deadline()), Err(F4Error::Timeout));
+    }
+
+    /// Every row leads in batch column 1 and the batch has fewer than
+    /// [`WALK_STRIDE`] columns, so no walk reads the clock. Only the
+    /// per-row tick of the parallel phase can stop it inside the batch.
+    #[test]
+    fn a_passed_deadline_stops_the_parallel_phase_inside_one_batch() {
+        let field = Small31::new(SMALL_P);
+        let lower = Row {
+            cols: vec![1, 4],
+            vals: vec![2, 7],
+        };
+        let case = Case {
+            p: SMALL_P,
+            ncols: 8,
+            pivot_cols: vec![0, 1],
+            upper: vec![
+                Row {
+                    cols: vec![0, 2],
+                    vals: vec![1, 3],
+                },
+                Row {
+                    cols: vec![1, 3],
+                    vals: vec![1, 5],
+                },
+            ],
+            lower: vec![lower; 4 * TICK as usize],
+        };
+        let mut held = fixture(&case, &field);
+        let (mut sym, sources) = held.split();
+        let mut batch = Batch::default();
+        let mut ws = Workspace::default();
+        build(
+            &mut sym,
+            sources,
+            &mut batch,
+            &mut ws,
+            &mut Deadline::none(),
+        )
+        .unwrap();
+        let ncols = batch.ncols();
+        prepare(&batch, &mut ws, ncols).unwrap();
+        let mut partials = Vec::new();
+        prepare_partials(&mut partials, batch.lower().len()).unwrap();
+        // One worker keeps rayon from splitting the rows below one tick.
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let mut stops = |template: &Deadline| {
+            pool.install(|| {
+                run_parallel_rows(
+                    &batch,
+                    sources,
+                    &field,
+                    &mut partials,
+                    ncols,
+                    &ws.pivot_at[..ncols],
+                    template,
+                )
+            })
+        };
+        assert!(!stops(&Deadline::none()));
+        assert!(stops(&passed_deadline()));
     }
 }

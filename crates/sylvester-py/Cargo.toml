@@ -1,12 +1,12 @@
 [package]
 name = "sylvester-py"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 publish = false
 repository = "https://github.com/t0rsion/sylvester"
-description = "Python bindings for the sylvester Gröbner engine"
+description = "Python bindings for Sylvester Gröbner bases and finite quotient algebras"
 readme = "README.md"
 
 [lib]
@@ -14,9 +14,10 @@ name = "sylvester_py"
 crate-type = ["cdylib"]
 
 [dependencies]
-sylvester = { version = "0.3.0", path = "../.." }
+sylvester = { version = "0.4.0", path = "../.." }
 num-bigint = "0.4"
 num-rational = "0.4"
+num-traits = "0.2"
 pyo3 = { version = "=0.23.5", features = [
     "abi3-py310",
     "extension-module",

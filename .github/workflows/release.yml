@@ -3,6 +3,8 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -13,15 +15,23 @@ env:
 jobs:
   check-version:
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
-      - name: Assert the tag matches the manifest version
+      - name: Check release versions
+        id: version
         run: |
-          TAG="${GITHUB_REF_NAME#v}"
+          TAG=$(sed -n 's/^version = "\([^"]*\)"$/\1/p' Cargo.toml | head -n 1)
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            test "$GITHUB_REF_NAME" = "v$TAG"
+          fi
           grep -q "^version = \"$TAG\"$" Cargo.toml || { echo "Cargo.toml does not declare version $TAG"; exit 1; }
           grep -q "^version = \"$TAG\"$" crates/sylvester-cli/Cargo.toml || { echo "sylvester-cli does not declare version $TAG"; exit 1; }
           grep -q "^version = \"$TAG\"$" crates/sylvester-py/Cargo.toml || { echo "sylvester-py does not declare version $TAG"; exit 1; }
           grep -q "^version = \"$TAG\"$" crates/sylvester-py/pyproject.toml || { echo "pyproject.toml does not declare version $TAG"; exit 1; }
+          grep -Fqx "version: $TAG" CITATION.cff || { echo "CITATION.cff does not declare version $TAG"; exit 1; }
+          echo "tag=v$TAG" >> "$GITHUB_OUTPUT"
 
   preflight:
     needs: check-version
@@ -38,6 +48,7 @@ jobs:
         with:
           fetch-depth: 0
       - name: Require the tag to be an ancestor of origin/main
+        if: startsWith(github.ref, 'refs/tags/')
         run: |
           git fetch origin main:refs/remotes/origin/main
           git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main
@@ -59,21 +70,72 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            python-version: "3.10"
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            python-version: "3.10"
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            python-version: "3.10"
+          - os: macos-14
+            target: aarch64-apple-darwin
+            python-version: "3.10"
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+            python-version: "3.10"
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            python-version: "3.11"
     runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: ${{ matrix.python-version }}
       - uses: dtolnay/rust-toolchain@1.92.0
-      - run: python -m pip install "maturin>=1.11,<2"
-      - run: maturin build --release --locked --out dist
+        with:
+          targets: ${{ matrix.target }}
+      - run: python -m pip install "maturin>=1.12,<2"
+      - name: Configure remapped Rust paths
+        run: python scripts/release-paths.py github-env >> "$GITHUB_ENV"
+      - run: maturin build --release --strip --locked --out dist
         working-directory: crates/sylvester-py
+      - name: Scan the wheel for build home paths
+        working-directory: crates/sylvester-py
+        run: python ../../scripts/release-paths.py check-wheel dist/*.whl
+      - name: Install and smoke-test the wheel in a clean environment
+        working-directory: crates/sylvester-py
+        run: |
+          TEMP_DIR=$(cygpath -u "$RUNNER_TEMP" 2>/dev/null || printf '%s' "$RUNNER_TEMP")
+          WHEEL_DIR="$TEMP_DIR/wheel-smoke"
+          python -m venv "$WHEEL_DIR/venv"
+          VENV_BIN=$(python -c 'import os; print("Scripts" if os.name == "nt" else "bin")')
+          VENV_EXE=python
+          if [[ "$RUNNER_OS" == "Windows" ]]; then VENV_EXE=python.exe; fi
+          VENV_PY="$WHEEL_DIR/venv/$VENV_BIN/$VENV_EXE"
+          "$VENV_PY" -m pip install --no-index --no-deps dist/*.whl
+          cd "$TEMP_DIR"
+          "$VENV_PY" - <<'PY'
+          from importlib import metadata
+
+          import sylvester
+
+          assert metadata.version("sylvester") == sylvester.__version__
+          ring = sylvester.PolynomialRing.prime_field(32003, ["x"])
+          basis = ring.ideal([ring.parse("x^2 + 1")]).groebner_basis()
+          assert str(basis[0]) == "x^2 + 1"
+          PY
       - uses: actions/upload-artifact@v4
         with:
-          name: python-wheel-${{ matrix.os }}
+          name: python-wheel-${{ matrix.target }}
           path: crates/sylvester-py/dist/*.whl
+          if-no-files-found: error
 
   python-sdist:
     needs: check-version
@@ -84,17 +146,121 @@ jobs:
         with:
           python-version: "3.10"
       - uses: dtolnay/rust-toolchain@1.92.0
-      - run: python -m pip install "maturin>=1.11,<2"
+      - run: python -m pip install "maturin>=1.12,<2"
       - run: maturin sdist --out dist
         working-directory: crates/sylvester-py
+      - name: Install and smoke-test the source distribution in a clean environment
+        working-directory: crates/sylvester-py
+        env:
+          SDIST_DIR: ${{ runner.temp }}/sdist-smoke
+        run: |
+          python -m venv "$SDIST_DIR/venv"
+          "$SDIST_DIR/venv/bin/python" -m pip install dist/*.tar.gz
+          cd "$RUNNER_TEMP"
+          "$SDIST_DIR/venv/bin/python" - <<'PY'
+          from importlib import metadata
+
+          import sylvester
+
+          assert metadata.version("sylvester") == sylvester.__version__
+          ring = sylvester.PolynomialRing.prime_field(32003, ["x"])
+          basis = ring.ideal([ring.parse("x^2 + 1")]).groebner_basis()
+          assert str(basis[0]) == "x^2 + 1"
+          PY
       - uses: actions/upload-artifact@v4
         with:
           name: python-sdist
           path: crates/sylvester-py/dist/*.tar.gz
+          if-no-files-found: error
+
+  cli-binaries:
+    needs: check-version
+    env:
+      RELEASE_TAG: ${{ needs.check-version.outputs.tag }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: dtolnay/rust-toolchain@1.92.0
+        with:
+          targets: ${{ matrix.target }}
+      - name: Configure remapped Rust paths
+        run: python scripts/release-paths.py github-env >> "$GITHUB_ENV"
+      - name: Build the standalone CLI
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo +1.92.0 build --release --locked -p sylvester-cli --target "$TARGET"
+      - name: Scan the CLI for build home paths
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          if [[ "$TARGET" == *-pc-windows-* ]]; then
+            python scripts/release-paths.py check-binary "target/$TARGET/release/sylv.exe"
+          else
+            python scripts/release-paths.py check-binary "target/$TARGET/release/sylv"
+          fi
+      - name: Test the standalone CLI
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          if [[ "$TARGET" == *-pc-windows-* ]]; then
+            "target/$TARGET/release/sylv.exe" --help >/dev/null
+          else
+            "target/$TARGET/release/sylv" --help >/dev/null
+          fi
+      - name: Create the standalone archive
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          RELEASE_DIR=$(cygpath -u "$RUNNER_TEMP" 2>/dev/null || printf '%s' "$RUNNER_TEMP")/release-artifacts
+          bash scripts/package-cli.sh "$RELEASE_TAG" "$TARGET" "$RELEASE_DIR"
+      - name: Check the archive
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          RELEASE_DIR=$(cygpath -u "$RUNNER_TEMP" 2>/dev/null || printf '%s' "$RUNNER_TEMP")/release-artifacts
+          if [[ "$TARGET" == *-pc-windows-* ]]; then
+            ARCHIVE="$RELEASE_DIR/sylv-$RELEASE_TAG-$TARGET.zip"
+          else
+            ARCHIVE="$RELEASE_DIR/sylv-$RELEASE_TAG-$TARGET.tar.gz"
+          fi
+          test -f "$ARCHIVE"
+          if [[ "$TARGET" == *-pc-windows-* ]]; then
+            7z t "$ARCHIVE" >/dev/null
+          else
+            tar tzf "$ARCHIVE" >/dev/null
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cli-${{ matrix.target }}
+          path: ${{ runner.temp }}/release-artifacts/*
+          if-no-files-found: error
 
   crates-io:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     # Every check that does not require the published library runs first.
-    needs: [preflight, python-wheels, python-sdist]
+    needs: [preflight, python-wheels, python-sdist, cli-binaries]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -122,7 +288,8 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
   github-release:
-    needs: crates-io
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [crates-io, cli-binaries]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -132,6 +299,11 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           pattern: python-*
+          path: target/release-artifacts
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: cli-*
           path: target/release-artifacts
           merge-multiple: true
       - name: Build crate archives and checksums

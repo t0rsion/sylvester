@@ -1,0 +1,14 @@
+baseline and patched worktree provenance
+$ git -C <clean-worktree> rev-parse HEAD
+396aa0d6cc581078ce9889c78317264501cc8eb9
+$ git -C <clean-worktree> rev-parse HEAD^{tree}
+3e69cb8a98d5e8ff9ace6884b90ec09ce1674675
+$ git -C <patched-worktree> rev-parse HEAD
+396aa0d6cc581078ce9889c78317264501cc8eb9
+$ git -C <patched-worktree> status --short
+ M src/verify/v2/arith.rs
+ M src/verify/v2/decode.rs
+ M src/verify/v2/replay.rs
+ M src/verify/v2/witness.rs
+?? tests/verifier_performance.rs
+?? tests/verifier_raw.rs

@@ -1,5 +1,7 @@
 //! Resource caps for one verification.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use super::algebra::{Exp, Term};
@@ -74,6 +76,10 @@ pub struct Limits {
     pub max_work_units: u64,
     /// The instant the work must stop at.
     pub deadline: Option<Instant>,
+    /// A shared stop flag. A set flag reports `DeadlineExceeded`.
+    ///
+    /// Cancellation reports exhaustion, not an invalid certificate.
+    pub cancellation: Option<Arc<AtomicBool>>,
 }
 
 impl Default for Limits {
@@ -98,6 +104,7 @@ impl Default for Limits {
             max_live_bytes: 512 << 20,
             max_work_units: 4_000_000_000,
             deadline: None,
+            cancellation: None,
         }
     }
 }
@@ -114,6 +121,7 @@ pub(crate) struct Meter {
     max_intermediate_bytes: usize,
     term_bytes: usize,
     deadline: Option<Instant>,
+    cancellation: Option<Arc<AtomicBool>>,
 }
 
 impl Meter {
@@ -129,6 +137,7 @@ impl Meter {
             max_intermediate_bytes: limits.max_intermediate_bytes,
             term_bytes: term_bytes(256),
             deadline: limits.deadline,
+            cancellation: limits.cancellation.clone(),
         }
     }
 
@@ -159,10 +168,7 @@ impl Meter {
 
     /// Poll the deadline immediately.
     pub(crate) fn poll(&self) -> Result<(), VerifyError> {
-        match self.deadline {
-            Some(deadline) if Instant::now() >= deadline => Err(VerifyError::DeadlineExceeded),
-            _ => Ok(()),
-        }
+        check_stop(self.deadline, self.cancellation.as_deref())
     }
 
     fn bytes(&self, terms: usize) -> Option<usize> {
@@ -182,16 +188,18 @@ impl Meter {
 
     /// Charge a live v2 value after values it replaces have been released.
     pub(crate) fn hold(&mut self, terms: usize) -> Result<(), VerifyError> {
-        let Some(bytes) = self.bytes(terms) else {
+        let total = self
+            .bytes(terms)
+            .and_then(|bytes| self.live_bytes.checked_add(bytes));
+        let Some(total) = total else {
             return Err(VerifyError::CapExceeded {
-                cap: Cap::IntermediateBytes,
+                cap: Cap::LiveBytes,
                 limit: self.max_live_bytes,
             });
         };
-        let total = self.live_bytes.saturating_add(bytes);
         if total > self.max_live_bytes {
             return Err(VerifyError::CapExceeded {
-                cap: Cap::IntermediateBytes,
+                cap: Cap::LiveBytes,
                 limit: self.max_live_bytes,
             });
         }
@@ -237,6 +245,7 @@ impl Limits {
     pub(crate) fn ticker(&self) -> Ticker {
         Ticker {
             deadline: self.deadline,
+            cancellation: self.cancellation.clone(),
             left: WORK_STRIDE,
         }
     }
@@ -246,6 +255,7 @@ impl Limits {
 #[derive(Clone, Debug)]
 pub(crate) struct Ticker {
     deadline: Option<Instant>,
+    cancellation: Option<Arc<AtomicBool>>,
     left: usize,
 }
 
@@ -262,10 +272,20 @@ impl Ticker {
 
     /// Poll the deadline now.
     pub(crate) fn now(&self) -> Result<(), VerifyError> {
-        match self.deadline {
-            Some(deadline) if Instant::now() >= deadline => Err(VerifyError::DeadlineExceeded),
-            _ => Ok(()),
-        }
+        check_stop(self.deadline, self.cancellation.as_deref())
+    }
+}
+
+fn check_stop(
+    deadline: Option<Instant>,
+    cancellation: Option<&AtomicBool>,
+) -> Result<(), VerifyError> {
+    let cancelled = cancellation.is_some_and(|flag| flag.load(Ordering::Relaxed));
+    let expired = deadline.is_some_and(|at| Instant::now() >= at);
+    if cancelled || expired {
+        Err(VerifyError::DeadlineExceeded)
+    } else {
+        Ok(())
     }
 }
 
@@ -428,5 +448,21 @@ mod tests {
         );
         assert_eq!(budget.check_live(&[usize::MAX, 2]), Err(exceeded.clone()));
         assert_eq!(budget.check_live(&[usize::MAX]), Err(exceeded));
+    }
+
+    #[test]
+    fn live_storage_overflow_reports_the_live_cap() {
+        let limits = Limits {
+            max_live_bytes: usize::MAX,
+            ..Limits::default()
+        };
+        let mut meter = Meter::new(&limits);
+        assert_eq!(
+            meter.hold(usize::MAX),
+            Err(VerifyError::CapExceeded {
+                cap: Cap::LiveBytes,
+                limit: usize::MAX,
+            })
+        );
     }
 }

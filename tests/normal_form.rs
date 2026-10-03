@@ -371,37 +371,7 @@ fn an_exhausted_budget_is_typed() {
     );
 }
 
-/// The bytes one term costs the budget of a division.
-///
-/// The meter is `Polynomial::heap_bytes`, which is not public, so the
-/// figure is the smallest memory limit under which a division that holds
-/// one term runs. `f` must hold one term no basis element divides.
-fn one_term_bytes(basis: &GroebnerBasis, f: &Polynomial) -> usize {
-    let fits = |bytes: usize| {
-        basis
-            .normal_form(f, Budget::new().memory_limit(bytes))
-            .is_ok()
-    };
-    let mut low = 0usize;
-    let mut high = 4096usize;
-    assert!(fits(high), "the search starts above what one term needs");
-    while low + 1 < high {
-        let middle = (low + high) / 2;
-        if fits(middle) {
-            high = middle;
-        } else {
-            low = middle;
-        }
-    }
-    high
-}
-
-/// A reduction step charges the polynomial it is about to build.
-///
-/// The step holds the working value and allocates a replacement of at
-/// most the terms of both operands, so it charges three times what the
-/// working value holds. A budget that covers the working value and not
-/// the replacement reports the limit instead of allocating.
+/// A reduction step charges its replacement beside the retained input and work.
 #[test]
 fn a_step_charges_the_replacement_before_it_allocates_it() {
     const TAIL: u16 = 200;
@@ -418,19 +388,16 @@ fn a_step_charges_the_replacement_before_it_allocates_it() {
     let basis =
         GroebnerBasis::<PrimeField>::from_polynomials(&ring, vec![g.clone()], Budget::new())
             .expect("one monic polynomial is a reduced basis");
-    let outside = ring.parse_polynomial("y^300").expect("the syntax holds");
-    let one_term = one_term_bytes(&basis, &outside);
-    let held = usize::from(TAIL + 1) * one_term;
+    let held = g.estimated_heap_bytes();
 
-    // Twice what g holds covers g and not the replacement, which is
-    // three times it.
+    // Input, working storage, and scalar temporaries fit. The replacement does not.
     assert_eq!(
-        basis.normal_form(&g, Budget::new().memory_limit(2 * held)),
+        basis.normal_form(&g, Budget::new().memory_limit(3 * held)),
         Err(NormalFormError::MemoryLimitExceeded)
     );
     assert!(
         basis
-            .normal_form(&g, Budget::new().memory_limit(4 * held))
+            .normal_form(&g, Budget::new().memory_limit(8 * held))
             .is_ok_and(|remainder| remainder.is_zero())
     );
 }
@@ -477,33 +444,33 @@ fn the_constructor_names_the_property_the_list_does_not_have() {
     let budget = Budget::new();
 
     assert_eq!(
-        GroebnerBasis::<PrimeField>::from_polynomials(&ring, vec![ring.zero()], budget),
+        GroebnerBasis::<PrimeField>::from_polynomials(&ring, vec![ring.zero()], budget.clone()),
         Err(BasisError::ZeroPolynomial { index: 0 })
     );
 
     let not_monic = parse_all(&ring, &["2*x + y"]);
     assert_eq!(
-        GroebnerBasis::<PrimeField>::from_polynomials(&ring, not_monic, budget),
+        GroebnerBasis::<PrimeField>::from_polynomials(&ring, not_monic, budget.clone()),
         Err(BasisError::NotMonic { index: 0 })
     );
 
     let mut unsorted = parse_all(&ring, &CYCLIC_3_BASIS);
     unsorted.reverse();
     assert_eq!(
-        GroebnerBasis::<PrimeField>::from_polynomials(&ring, unsorted, budget),
+        GroebnerBasis::<PrimeField>::from_polynomials(&ring, unsorted, budget.clone()),
         Err(BasisError::NotSorted { index: 1 })
     );
 
     let twice = parse_all(&ring, &["x + y + z", "x + y + z"]);
     assert_eq!(
-        GroebnerBasis::<PrimeField>::from_polynomials(&ring, twice, budget),
+        GroebnerBasis::<PrimeField>::from_polynomials(&ring, twice, budget.clone()),
         Err(BasisError::NotSorted { index: 1 })
     );
 
     let plane = prime_ring(&["x", "y"]);
     let not_interreduced = parse_all(&plane, &["x^2", "x"]);
     assert_eq!(
-        GroebnerBasis::<PrimeField>::from_polynomials(&plane, not_interreduced, budget),
+        GroebnerBasis::<PrimeField>::from_polynomials(&plane, not_interreduced, budget.clone()),
         Err(BasisError::NotInterreduced { index: 0 })
     );
 
@@ -522,13 +489,13 @@ fn the_constructor_checks_the_rational_domain_too() {
 
     let not_monic = parse_all(&ring, &["1/2*x + y"]);
     assert_eq!(
-        GroebnerBasis::<Rationals>::from_polynomials(&ring, not_monic, budget),
+        GroebnerBasis::<Rationals>::from_polynomials(&ring, not_monic, budget.clone()),
         Err(BasisError::NotMonic { index: 0 })
     );
 
     let not_groebner = parse_all(&ring, &["x^2 - y", "x*y - 1/3"]);
     assert_eq!(
-        GroebnerBasis::<Rationals>::from_polynomials(&ring, not_groebner, budget),
+        GroebnerBasis::<Rationals>::from_polynomials(&ring, not_groebner, budget.clone()),
         Err(BasisError::NotGroebner { left: 0, right: 1 })
     );
 

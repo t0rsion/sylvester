@@ -307,6 +307,24 @@ impl<D: Domain> Polynomial<D> {
         terms.saturating_add(self.coefficient_bytes())
     }
 
+    /// Estimate the heap bytes retained by this polynomial.
+    ///
+    /// The estimate includes the term vector's capacity, spilled exponent
+    /// vectors, and coefficient payloads. It excludes shared ring storage and
+    /// allocator overhead, so it is not a process memory measurement.
+    pub fn estimated_heap_bytes(&self) -> usize {
+        self.retained_bytes()
+    }
+
+    /// The heap bytes retained by this polynomial, including term capacity.
+    pub(crate) fn retained_bytes(&self) -> usize {
+        let vector = size_of::<Term<D>>().saturating_mul(self.terms.capacity());
+        let exponents = heap_exps_bytes(self.ring.nvars()).saturating_mul(self.terms.len());
+        vector
+            .saturating_add(exponents)
+            .saturating_add(self.coefficient_bytes())
+    }
+
     /// The heap bytes the coefficients of this polynomial hold.
     ///
     /// It is 0 over a prime field, where a coefficient is one `u64`.
@@ -649,9 +667,9 @@ impl<D: Domain> Polynomial<D> {
     ///
     /// The result holds at most one term per term of the two operands.
     /// Over `Q` the coefficient of a term of `other` grows by the size of
-    /// `c`, which is why `c` is read here. The count is an estimate by the
-    /// meter of [`Polynomial::heap_bytes`]: a subtraction that carries can
-    /// add one limb per term.
+    /// `c`, which is why `c` is read here. A scaled coefficient is held while
+    /// the replacement coefficient is stored, so both are included. The
+    /// count is an estimate by the meter of [`Polynomial::heap_bytes`].
     pub(crate) fn sub_scaled_bytes(&self, other: &Self, c: &D::Coeff, ops: &D::Ops) -> usize {
         let per_term = size_of::<Term<D>>() + heap_exps_bytes(self.ring.nvars());
         let terms = self
@@ -660,14 +678,16 @@ impl<D: Domain> Polynomial<D> {
             .saturating_add(other.terms.len())
             .saturating_mul(per_term);
         let scale = ops.heap_bytes(c);
-        other.terms.iter().fold(
-            terms.saturating_add(self.coefficient_bytes()),
-            |bytes, term| {
-                bytes
-                    .saturating_add(ops.heap_bytes(&term.coeff))
-                    .saturating_add(scale)
-            },
-        )
+        let scaled = other.terms.iter().fold(0usize, |bytes, term| {
+            bytes
+                .saturating_add(ops.heap_bytes(&term.coeff))
+                .saturating_add(scale)
+        });
+        terms
+            .saturating_add(self.coefficient_bytes())
+            .saturating_add(scaled)
+            .saturating_add(scaled)
+            .saturating_add(heap_exps_bytes(self.ring.nvars()))
     }
 
     /// Return `self - c * m * other`, or report an exponent past the

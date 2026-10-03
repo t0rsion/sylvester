@@ -1,4 +1,4 @@
-//! The three input formats and the writers that produce them.
+//! The input formats and the writers that produce them.
 //!
 //! A reader turns bytes into a [`Reading`]: what the source says about the
 //! ring, and the polynomials it holds. A polynomial arrives either as an
@@ -11,18 +11,20 @@
 //! exponents. The same rendering covers both coefficient domains and the
 //! polynomials a certificate carries.
 
+mod json;
 mod ms;
 mod syl;
 mod text;
 
+use std::borrow::Cow;
 use std::fmt;
 use std::io::{self, Write};
 use std::path::Path;
 
 use clap::ValueEnum;
-use sylvester::{Domain, Polynomial, verify};
+use sylvester::{Budget, Domain, EnvelopeError, Polynomial, ResultEnvelope, verify};
 
-/// A format `sylv` reads and writes.
+/// A format `sylv` reads. Writers support formats whose output schema fits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum Format {
     /// The msolve input format.
@@ -40,18 +42,39 @@ pub enum Format {
     /// A `# vars:` line, a `# modulus:` or `# coefficients: rationals`
     /// line, then one polynomial per line.
     Text,
+    /// A `sylv-result-v1` computation record.
+    Json,
+}
+
+/// Why a source could not be decoded.
+#[derive(Debug)]
+pub enum ReadError {
+    /// The source does not follow its selected text format.
+    Format(String),
+    /// The source is a computation record with an invalid or exhausted read.
+    Envelope(EnvelopeError),
+}
+
+impl fmt::Display for ReadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Format(message) => f.write_str(message),
+            Self::Envelope(error) => error.fmt(f),
+        }
+    }
 }
 
 impl Format {
     /// The format a file name extension names.
     ///
-    /// `ms`, `syl`, `sylq`, `txt`, and `text` are the extensions. Any other
+    /// `ms`, `syl`, `sylq`, `txt`, `text`, and `json` are the extensions. Any other
     /// one is `None`. The caller reports that as a usage error.
     pub fn of_path(path: &Path) -> Option<Format> {
         match path.extension()?.to_str()? {
             "ms" => Some(Format::Ms),
             "syl" | "sylq" => Some(Format::Syl),
             "txt" | "text" => Some(Format::Text),
+            "json" => Some(Format::Json),
             _ => None,
         }
     }
@@ -63,6 +86,7 @@ impl fmt::Display for Format {
             Format::Ms => "ms",
             Format::Syl => "syl",
             Format::Text => "text",
+            Format::Json => "json",
         })
     }
 }
@@ -100,6 +124,8 @@ pub struct Reading {
     pub nvars: Option<usize>,
     /// The polynomials.
     pub body: Body,
+    /// The untrusted computation record, when the source is JSON.
+    pub record: Option<ResultEnvelope>,
 }
 
 /// The polynomials of a source, in the shape the format writes them.
@@ -122,9 +148,30 @@ pub struct Term {
 }
 
 impl Body {
+    /// Return one polynomial as an expression without cloning expression bodies.
+    pub fn expression(
+        &self,
+        origin: &str,
+        index: usize,
+        names: &[String],
+    ) -> Result<Cow<'_, str>, String> {
+        match self {
+            Body::Expressions(expressions) => expressions
+                .get(index)
+                .map(|expression| Cow::Borrowed(expression.as_str()))
+                .ok_or_else(|| format!("{origin} has no polynomial {}", index + 1)),
+            Body::Terms(polynomials) => polynomials
+                .get(index)
+                .ok_or_else(|| format!("{origin} has no polynomial {}", index + 1))
+                .and_then(|terms| expression_of_terms(origin, index, terms, names))
+                .map(Cow::Owned),
+        }
+    }
+
     /// The polynomials as expressions over `names`.
     ///
     /// A term list whose width is not the number of names is an error.
+    #[cfg(test)]
     pub fn expressions(&self, origin: &str, names: &[String]) -> Result<Vec<String>, String> {
         match self {
             Body::Expressions(expressions) => Ok(expressions.clone()),
@@ -198,11 +245,23 @@ fn expression_of_terms(
 /// Read a source.
 ///
 /// `origin` names the source in every message the reader returns.
+#[cfg(test)]
 pub fn read(format: Format, origin: &str, text: &str) -> Result<Reading, String> {
+    read_with_budget(format, origin, text, Budget::new()).map_err(|error| error.to_string())
+}
+
+/// Read a source under one parse budget.
+pub fn read_with_budget(
+    format: Format,
+    origin: &str,
+    text: &str,
+    budget: Budget,
+) -> Result<Reading, ReadError> {
     match format {
-        Format::Ms => ms::read(origin, text),
-        Format::Syl => syl::read(origin, text),
-        Format::Text => text::read(origin, text),
+        Format::Ms => ms::read(origin, text).map_err(ReadError::Format),
+        Format::Syl => syl::read(origin, text).map_err(ReadError::Format),
+        Format::Text => text::read(origin, text).map_err(ReadError::Format),
+        Format::Json => json::read(origin, text, budget).map_err(ReadError::Envelope),
     }
 }
 
@@ -324,6 +383,10 @@ pub fn write(
         Format::Ms => ms::write(header, polynomials, out),
         Format::Syl => syl::write(header, polynomials, out),
         Format::Text => text::write(header, polynomials, out),
+        Format::Json => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "JSON output requires a computation record",
+        )),
     }
 }
 

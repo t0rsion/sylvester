@@ -234,12 +234,185 @@ fn ms_output_reads_back_as_the_same_basis() {
 }
 
 #[test]
+fn json_output_preserves_the_ring_input_and_basis() {
+    let path = scratch("result.json");
+    let run = sylv(&[
+        "gb",
+        &input("quotient.text"),
+        "--out-format",
+        "json",
+        "-o",
+        &text_of(&path),
+    ]);
+    assert_eq!(run.code, 0, "{}", run.err);
+    let record = fs::read_to_string(&path).expect("the JSON record");
+    assert!(record.contains("sylv-result-v1"));
+    assert!(record.contains("\"input\""));
+    assert!(record.contains("\"basis\""));
+
+    let back = sylv(&[
+        "gb",
+        &text_of(&path),
+        "--in-format",
+        "json",
+        "--out-format",
+        "text",
+    ]);
+    assert_eq!(back.code, 0, "{}", back.err);
+    assert_eq!(back.out, "# vars: x, y\n# modulus: 7\nx^2\ny^2\n");
+}
+
+#[test]
+fn certificate_and_result_paths_cannot_collide() {
+    let path = scratch("same-output-path");
+    let run = sylv(&[
+        "certify",
+        &input("quotient.text"),
+        "--certificate",
+        &text_of(&path),
+        "-o",
+        &text_of(&path),
+    ]);
+    assert_eq!(run.code, 2, "{}", run.err);
+    assert!(run.err.contains("different paths"), "{}", run.err);
+    assert!(!path.exists());
+}
+
+#[test]
+fn rational_equality_check_is_explicit_in_text_and_json() {
+    let text = sylv(&["gb", &input("quotient-q.text"), "--check-equality"]);
+    assert_eq!(text.code, 0, "{}", text.err);
+    assert!(
+        text.out.starts_with("# equality_check: passed\n"),
+        "{}",
+        text.out
+    );
+    assert!(
+        text.out.contains("# coefficients: rationals\n"),
+        "{}",
+        text.out
+    );
+
+    let path = scratch("checked-rational-result.json");
+    let json = sylv(&[
+        "gb",
+        &input("quotient-q.text"),
+        "--check-equality",
+        "--out-format",
+        "json",
+        "-o",
+        &text_of(&path),
+    ]);
+    assert_eq!(json.code, 0, "{}", json.err);
+    let record = fs::read_to_string(path).expect("the JSON record");
+    assert!(record.contains("\"claimed_provenance\": \"equals_input\""));
+}
+
+#[test]
+fn a_rational_record_rechecks_input_before_a_quotient() {
+    let path = scratch("checked-rational-quotient.json");
+    let saved = sylv(&[
+        "gb",
+        &input("quotient-q.text"),
+        "--check-equality",
+        "--out-format",
+        "json",
+        "-o",
+        &text_of(&path),
+    ]);
+    assert_eq!(saved.code, 0, "{}", saved.err);
+
+    let quotient = sylv(&[
+        "quotient",
+        &text_of(&path),
+        "--in-format",
+        "json",
+        "--from-basis",
+        "--check-equality",
+        "--dimension",
+    ]);
+    assert_eq!(quotient.code, 0, "{}", quotient.err);
+    assert!(quotient.out.starts_with("# equality_check: passed\n"));
+    assert!(quotient.out.ends_with("dimension: 4\n"));
+
+    let tampered = scratch("tampered-rational-quotient.json");
+    let record = fs::read_to_string(&path).expect("the JSON record");
+    fs::write(&tampered, record.replacen("\"x^2\"", "\"x\"", 1)).expect("the tampered JSON record");
+    let rejected = sylv(&[
+        "quotient",
+        &text_of(&tampered),
+        "--in-format",
+        "json",
+        "--from-basis",
+        "--check-equality",
+        "--dimension",
+    ]);
+    assert_eq!(rejected.code, 2, "{}", rejected.err);
+    assert!(rejected.err.contains("equality check"), "{}", rejected.err);
+}
+
+#[test]
+fn json_certificates_are_data_until_their_record_is_reverified() {
+    let path = scratch("certified-result.json");
+    let run = sylv(&[
+        "certify",
+        &input("quotient.text"),
+        "--out-format",
+        "json",
+        "-o",
+        &text_of(&path),
+    ]);
+    assert_eq!(run.code, 0, "{}", run.err);
+    let record = fs::read_to_string(&path).expect("the JSON record");
+    assert!(record.contains("\"certificate\""));
+    assert!(record.contains("\"claimed_provenance\": \"certified\""));
+
+    let verified = sylv(&["verify", &text_of(&path)]);
+    assert_eq!(verified.code, 0, "{}", verified.err);
+    assert_eq!(verified.out, "# vars: x, y\n# modulus: 7\nx^2\ny^2\n");
+    assert!(verified.err.is_empty(), "{}", verified.err);
+
+    let tampered = scratch("tampered-result.json");
+    fs::write(&tampered, record.replacen("\"x^2\"", "\"1\"", 1)).expect("the tampered JSON record");
+    let rejected = sylv(&["verify", &text_of(&tampered)]);
+    assert_eq!(rejected.code, 1, "{}", rejected.err);
+    assert!(rejected.err.contains("does not match"), "{}", rejected.err);
+
+    let back = sylv(&[
+        "quotient",
+        &text_of(&path),
+        "--in-format",
+        "json",
+        "--from-basis",
+    ]);
+    assert_eq!(back.code, 0, "{}", back.err);
+    assert!(!back.out.contains("established:"), "{}", back.out);
+}
+
+#[test]
 fn gb_reports_the_counters_on_standard_error() {
     let run = sylv(&["gb", &input("cyclic3.text"), "--report"]);
     assert_eq!(run.code, 0, "{}", run.err);
     assert_eq!(run.out, CYCLIC3);
     assert!(run.err.contains("backend: f4"), "{}", run.err);
     assert!(run.err.contains("pairs_generated: "), "{}", run.err);
+}
+
+#[test]
+fn progress_reports_named_phases_without_percentages() {
+    let run = sylv(&["gb", &input("quotient.text"), "--progress"]);
+    assert_eq!(run.code, 0, "{}", run.err);
+    assert!(run.err.contains("phase: read"), "{}", run.err);
+    assert!(run.err.contains("phase: compute"), "{}", run.err);
+    assert!(run.err.contains("phase: output"), "{}", run.err);
+    assert!(!run.err.contains('%'), "{}", run.err);
+}
+
+#[test]
+fn memory_limits_accept_binary_byte_suffixes() {
+    let run = sylv(&["gb", &input("quotient.text"), "--memory", "512KiB"]);
+    assert_eq!(run.code, 0, "{}", run.err);
+    assert_eq!(run.out, "# vars: x, y\n# modulus: 7\nx^2\ny^2\n");
 }
 
 #[test]
@@ -344,7 +517,7 @@ fn verify_prints_nothing_when_quiet() {
         &text_of(&path),
     ]);
     assert_eq!(run.code, 0, "{}", run.err);
-    let verified = sylv(&["verify", &text_of(&path), "--quiet"]);
+    let verified = sylv(&["verify", &text_of(&path), "--quiet", "--progress"]);
     assert_eq!(verified.code, 0, "{}", verified.err);
     assert!(verified.out.is_empty());
     assert!(verified.err.is_empty());
@@ -395,6 +568,131 @@ fn normal_form_prints_the_remainder_over_the_rationals() {
     ]);
     assert_eq!(run.code, 0, "{}", run.err);
     assert_eq!(run.out, "# vars: x, y, z\n# coefficients: rationals\ny*z\n");
+}
+
+#[test]
+fn normal_form_can_print_quotients_and_remainder() {
+    let run = sylv(&[
+        "normal-form",
+        "--basis",
+        &input("quotient.text"),
+        "--poly",
+        "x^3 + y",
+        "--quotients",
+    ]);
+    assert_eq!(run.code, 0, "{}", run.err);
+    assert_eq!(run.out, "quotient[0]: x\nquotient[1]: 0\nremainder: y\n");
+}
+
+#[test]
+fn normal_form_accepts_parenthesized_polynomials() {
+    let run = sylv(&[
+        "normal-form",
+        "--basis",
+        &input("quotient.text"),
+        "--poly",
+        "(x + y)^2",
+    ]);
+    assert_eq!(run.code, 0, "{}", run.err);
+    assert_eq!(run.out, "# vars: x, y\n# modulus: 7\n2*x*y\n");
+}
+
+#[test]
+fn direct_polynomial_rejects_an_input_format_option() {
+    let run = sylv(&[
+        "member",
+        "--basis",
+        &input("quotient.text"),
+        "--poly",
+        "x",
+        "--in-format",
+        "text",
+    ]);
+    assert_eq!(run.code, 2, "{}", run.err);
+    assert!(run.err.contains("--poly-file"), "{}", run.err);
+}
+
+#[test]
+fn invalid_utf8_is_an_input_failure() {
+    let path = scratch("invalid-utf8.text");
+    fs::write(&path, [0xff]).expect("the invalid source");
+    let run = sylv(&["gb", &text_of(&path)]);
+    assert_eq!(run.code, 2, "{}", run.err);
+    assert!(run.err.contains("UTF-8"), "{}", run.err);
+}
+
+#[test]
+fn a_source_past_the_memory_cap_is_a_limit() {
+    let run = sylv(&["gb", &input("cyclic3.text"), "--memory", "8"]);
+    assert_eq!(run.code, 3, "{}", run.err);
+    assert!(run.err.contains("memory"), "{}", run.err);
+}
+
+#[test]
+fn quotient_reports_standard_monomials_and_dimension() {
+    let run = sylv(&["quotient", &input("quotient.text")]);
+    assert_eq!(run.code, 0, "{}", run.err);
+    assert_eq!(run.out, "dimension: 4\nstandard_monomials: 1, y, x, x*y\n");
+}
+
+#[test]
+fn quotient_reports_matrix_and_element_polynomials() {
+    let run = sylv(&[
+        "quotient",
+        &input("quotient.text"),
+        "--matrix",
+        "x",
+        "--characteristic",
+        "x",
+        "--minimal",
+        "x",
+    ]);
+    assert_eq!(run.code, 0, "{}", run.err);
+    assert_eq!(
+        run.out,
+        "matrix: [[0, 0, 0, 0]; [0, 0, 0, 0]; [1, 0, 0, 0]; [0, 1, 0, 0]]\ncharacteristic_polynomial: t^4\nminimal_polynomial: t^2\n"
+    );
+}
+
+#[test]
+fn quotient_equality_check_qualifies_rational_values() {
+    let run = sylv(&[
+        "quotient",
+        &input("quotient-q.text"),
+        "--check-equality",
+        "--dimension",
+    ]);
+    assert_eq!(run.code, 0, "{}", run.err);
+    assert!(
+        run.out.starts_with("# equality_check: passed\n"),
+        "{}",
+        run.out
+    );
+    assert!(
+        run.out.contains("# established: contains-input\n"),
+        "{}",
+        run.out
+    );
+    assert!(run.out.ends_with("dimension: 4\n"), "{}", run.out);
+}
+
+#[test]
+fn equality_check_requires_original_generators_for_a_supplied_basis() {
+    let run = sylv(&[
+        "quotient",
+        &input("cyclic3-basis-q.text"),
+        "--from-basis",
+        "--check-equality",
+    ]);
+    assert_eq!(run.code, 2, "{}", run.err);
+    assert!(run.err.contains("original input"), "{}", run.err);
+}
+
+#[test]
+fn quotient_rejects_a_positive_dimensional_ideal_as_nonfinite() {
+    let run = sylv(&["quotient", &input("positive-dimensional.text")]);
+    assert_eq!(run.code, 3, "{}", run.err);
+    assert!(run.err.contains("not zero-dimensional"), "{}", run.err);
 }
 
 #[test]
@@ -746,6 +1044,7 @@ fn help_names_every_subcommand() {
         "member",
         "hilbert",
         "dim",
+        "quotient",
         "verify",
     ] {
         assert!(run.out.contains(name), "--help names {name}: {}", run.out);

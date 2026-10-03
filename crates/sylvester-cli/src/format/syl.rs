@@ -74,6 +74,7 @@ pub fn read(origin: &str, text: &str) -> Result<Reading, String> {
         domain: None,
         nvars: Some(nvars),
         body: Body::Terms(polynomials),
+        record: None,
     })
 }
 
